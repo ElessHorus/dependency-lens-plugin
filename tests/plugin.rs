@@ -271,3 +271,37 @@ fn activation_subscribes_to_the_three_events() {
         ])
     );
 }
+
+#[test]
+fn file_of_another_open_project_is_read_through_its_own_project() {
+    let host = host_counting_fetches(Rc::new(Cell::new(0)));
+    host.set_project_root(Some("/p1"));
+    host.add_project("/p2");
+    host.add_file("/p2/Cargo.toml", MANIFEST);
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened("/p2/Cargo.toml".to_owned())],
+        &host.invocation(),
+    );
+    let problems = host
+        .diagnostics()
+        .get("/p2/Cargo.toml")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(problems.len(), 1);
+    assert_eq!(problems[0].code.as_deref(), Some(HIGH_ID));
+}
+
+#[test]
+fn file_outside_the_window_project_is_found_through_project_of() {
+    let host = host_counting_fetches(Rc::new(Cell::new(0)));
+    host.set_project_root(None);
+    host.add_project("/p2");
+    host.add_file("/p2/Cargo.toml", MANIFEST);
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened("/p2/Cargo.toml".to_owned())],
+        &host.invocation(),
+    );
+    assert_eq!(diagnostics_of(&host, "/p2/Cargo.toml").len(), 1);
+}

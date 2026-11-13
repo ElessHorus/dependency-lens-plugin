@@ -53,7 +53,8 @@ impl DependencyLens {
         let Some(eco) = Ecosystem::detect(path) else {
             return;
         };
-        let Some(project) = ctx.project().or_else(|| host::project_of(path)) else {
+        // The deepest open project holding the path wins; the window's project is only a fallback.
+        let Some(project) = host::project_of(path).or_else(|| ctx.project()) else {
             return;
         };
         let text = match project.read_file(path) {
