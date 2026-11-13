@@ -69,7 +69,7 @@ tests/plugin.rs       MockHost integration tests
 **Interfaces:**
 - Produces: a building crate `dependency-lens` exposing `pub mod` placeholders later tasks fill.
 
-- [ ] **Step 1:** In `/home/florian/workspace/dependency-lens-plugin`, scaffold into an empty temp directory, then move the generated files next to the existing `docs/`: `openidea-plugin new /tmp/dl-scaffold --id local.dependency-lens --name "Dependency Lens"`. Do not pass `--sdk` (it must use the tool's git tag). Run `git init -b main`.
+- [ ] **Step 1:** In `/home/florian/workspace/dependency-lens-plugin`, scaffold into an empty temp directory, then move the generated files next to the existing `docs/`: `openidea-plugin new /tmp/dl-scaffold --id local.dependency-lens --name "Dependency Lens"`. Do not pass `--sdk` (it must use the tool's git tag). The repository already exists with one docs commit (ruling R1: the controller ran `git init`); keep the existing `.gitignore` lines when merging the scaffold's.
 - [ ] **Step 2:** Write the failing test in `src/lib.rs`: `fn wasm_smoke()` asserts `taplo::parser::parse("a = 1").errors.is_empty()` and `quick_xml::Reader::from_str("<a/>").read_event().is_ok()` and `semver::Version::parse("1.2.3").is_ok()`. Run `cargo test wasm_smoke` → FAIL (crates missing).
 - [ ] **Step 3:** Add dependencies to `Cargo.toml`: `taplo = "0.14"`, `quick-xml = "0.42"`, `serde = { version = "1", features = ["derive"] }`, `serde_json = "1"`, `semver = "1"`, `json-spanned-value = "0.2"`. Keep `crate-type = ["cdylib", "rlib"]`.
 - [ ] **Step 4:** Run `cargo test wasm_smoke` → PASS, then `openidea-plugin build` → expect `dist/plugin.wasm` and a passing `check`.
@@ -130,6 +130,8 @@ tests/plugin.rs       MockHost integration tests
 
 ### Task 4: HTTP trait and OSV client
 
+> **Execution order (ruling R2):** run Task 5 (Cache) **before** this task, because `query_batch` stores advisory details in the cache. `POST /v1/querybatch` returns only advisory ids (verified live on 2026-11-13: `{"results":[{"vulns":[{"id":…,"modified":…}]}]}`); summaries and severities need `GET https://api.osv.dev/v1/vulns/{id}`.
+
 **Files:**
 - Create: `src/http.rs`, `src/osv.rs`, `tests/fixtures/osv/{batch_response.json,vuln_detail.json}`
 
@@ -144,11 +146,16 @@ tests/plugin.rs       MockHost integration tests
   ```rust
   pub struct OsvQuery { pub ecosystem: Ecosystem, pub name: String, pub version: String }
   pub fn declared_version_for_osv(spec: &str) -> Option<String>;  // None = do not query
-  pub fn query_batch(http: &dyn Http, queries: &[OsvQuery]) -> Result<Vec<Vec<Vulnerability>>, String>; // same order as input
+  pub const MAX_DETAIL_FETCHES_PER_RUN: usize = 100;
+  /// One result per query, same order. Advisory details come from `cache` or `GET /v1/vulns/{id}`
+  /// (stored in `cache`); ids beyond the per-run cap get a placeholder (`severity Medium`,
+  /// `summary "Details not loaded yet"`) that is not cached, so a later run completes them.
+  pub fn query_batch(http: &dyn Http, cache: &mut Cache, queries: &[OsvQuery], now: u64)
+      -> Result<Vec<Vec<Vulnerability>>, String>;
   ```
 
-- [ ] **Step 1: Failing tests.** `declared_version_for_osv` (operators and a `v` before a digit are stripped; only the first comma-separated part is kept; no zero padding, because the live OSV API answers partial versions such as `1.6` for crates.io and Go versions with or without `v`): `"^1.2"`→`Some("1.2")`, `"~1.2.3"`→`"1.2.3"`, `">=2.0, <3"`→`"2.0"`, `"==1.2.3"`→`"1.2.3"`, `"v0.9.1"`→`"0.9.1"`, `"1.2.3"`→same, `"*"`, `"latest"`, `""`, `"workspace:*"`, `"git+https://x"`, `"file:../x"`, `"${spring.version}"`→`None`. `query_batch`: with `FakeHttp` answering `POST https://api.osv.dev/v1/querybatch` from `batch_response.json` (a 3-query response: one package with two advisories, one with none, one with one), results align by index; advisory ids are validated (`[A-Za-z0-9-]{1,64}`, others dropped); severity from CVSS maps `9.0+`→Critical, `7.0–8.9`→High, `4.0–6.9`→Medium, else Low, and from `database_specific.severity` strings when no score; more than 1000 queries are split into several requests; HTTP 429, HTTP 500, invalid JSON and a transport `Err` each return `Err(reason)` mentioning the status or cause. Run → FAIL.
-- [ ] **Step 2: Implement** `Http`, `HostHttp`, `FakeHttp`, `declared_version_for_osv`, `query_batch`. Port the request/response structs, advisory-id check and severity logic from depsy `vulnerabilities/osv.rs` and `normalize_version_for_osv`; replace `reqwest`/`tokio` with `Http`; use the batch endpoint for the version lists and, per distinct advisory id, `GET https://api.osv.dev/v1/vulns/{id}` only when the batch response lacks a summary or severity (cache of details is Task 5's job).
+- [ ] **Step 1: Failing tests.** `declared_version_for_osv` (operators and a `v` before a digit are stripped; only the first comma-separated part is kept; no zero padding, because the live OSV API answers partial versions such as `1.6` for crates.io and Go versions with or without `v`): `"^1.2"`→`Some("1.2")`, `"~1.2.3"`→`"1.2.3"`, `">=2.0, <3"`→`"2.0"`, `"==1.2.3"`→`"1.2.3"`, `"v0.9.1"`→`"0.9.1"`, `"1.2.3"`→same, `"*"`, `"latest"`, `""`, `"workspace:*"`, `"git+https://x"`, `"file:../x"`, `"${spring.version}"`→`None`. `query_batch`: with `FakeHttp` answering `POST https://api.osv.dev/v1/querybatch` from `batch_response.json` (a 3-query response of ids only: one package with two advisories, one with none, one with one) and `GET https://api.osv.dev/v1/vulns/{id}` from `vuln_detail.json`-style bodies, results align by index; a second call makes **zero** detail requests (cache); 101 distinct ids make exactly 100 detail requests and one placeholder that is not cached; advisory ids are validated (`[A-Za-z0-9-]{1,64}`, others dropped); severity from CVSS maps `9.0+`→Critical, `7.0–8.9`→High, `4.0–6.9`→Medium, else Low, and from `database_specific.severity` strings when no score; more than 1000 queries are split into several requests; HTTP 429, HTTP 500, invalid JSON and a transport `Err` each return `Err(reason)` mentioning the status or cause. Run → FAIL.
+- [ ] **Step 2: Implement** `Http`, `HostHttp`, `FakeHttp`, `declared_version_for_osv`, `query_batch`. Port the request/response structs, advisory-id check and severity logic from depsy `vulnerabilities/osv.rs` and `normalize_version_for_osv`; replace `reqwest`/`tokio` with `Http`; use the batch endpoint for the id lists and, per distinct uncached advisory id, `GET https://api.osv.dev/v1/vulns/{id}` for the summary, severity and reference URL.
 - [ ] **Step 3:** `cargo test` → PASS; clippy; commit `feat: add OSV batch client`.
 
 ### Task 5: Cache
@@ -168,12 +175,14 @@ tests/plugin.rs       MockHost integration tests
       pub fn put_vulnerabilities(&mut self, eco: Ecosystem, package: &str, version: &str, vulns: Vec<Vulnerability>, now: u64);
       pub fn put_failure(&mut self, key_kind: FailureKind, eco: Ecosystem, package: &str, reason: String, now: u64); // failures cached 60 s
       pub fn failure(&self, kind: FailureKind, eco: Ecosystem, package: &str, now: u64) -> Option<&str>;
+      pub fn advisory(&self, id: &str, now: u64) -> Option<&Vulnerability>;
+      pub fn put_advisory(&mut self, advisory: Vulnerability, now: u64);   // keyed by `advisory.id`
   }
   pub enum FailureKind { Registry, Osv }
   ```
   Package names are case-sensitive keys except PyPI (normalised by the caller).
 
-- [ ] **Step 1: Failing tests:** an entry is returned at `now = t0 + ttl - 1` and gone at `t0 + ttl`; vulnerabilities are keyed by version (another version misses); a failure expires after 60 s and does not block a later success; `Cache::new(0)` stores nothing.
+- [ ] **Step 1: Failing tests:** an entry is returned at `now = t0 + ttl - 1` and gone at `t0 + ttl`; vulnerabilities are keyed by version (another version misses); a failure expires after 60 s and does not block a later success; an advisory is found by id until the TTL ends; `Cache::new(0)` stores nothing.
 - [ ] **Step 2:** Implement with `HashMap` keyed by `(Ecosystem, String[, String])` holding `(value, stored_at)`. Default TTL 3600 s (Task 15 makes it a setting).
 - [ ] **Step 3:** `cargo test` → PASS; commit `feat: add TTL cache`.
 
@@ -209,7 +218,8 @@ tests/plugin.rs       MockHost integration tests
   - second `analyze` with same inputs makes **zero** requests (cache);
   - a dependency with `version "*"` is never in the OSV request (Review Focus 2);
   - OSV returns 500 → entries get `Status::Unknown("OSV: HTTP 500")`, empty vulnerabilities (Review Focus 3);
-  - 300 dependencies with `Budget::new(2, None)`: OSV is still one batch call (batches do not consume lookups), but a PyPI-style registry stub is called at most 2 times; `pending == remaining uncached`; a second run with a fresh budget fetches only the previous misses (Review Focus 5);
+  - `Budget` unit tests: `Budget::new(2, None)` allows exactly two `take()` calls; a deadline in the past refuses the first;
+  - (The 300-package budgeted-lookup test of Review Focus 5 moves to Task 8, the first task with a registry — ruling R3.)
   - `settings.ignore` containing `"serde"` removes it; `minimum_severity = High` drops Low/Medium advisories; `vulnerabilities = false` makes no OSV request.
 - [ ] **Step 2:** Run → FAIL. **Step 3:** Implement `analyze`: build OSV queries for dependencies whose declared version passes `declared_version_for_osv`, skip cached ones, send one `query_batch`, then per-package registry lookups for `offers_updates()` ecosystems, each consuming one `Budget::take()`; compare with `semver`/ecosystem rules from Task 8+ (until then, `NotChecked`).
 - [ ] **Step 4:** `cargo test` → PASS; clippy; commit `feat: add analysis pipeline`.
@@ -217,7 +227,7 @@ tests/plugin.rs       MockHost integration tests
 ### Task 7: Publishing and plugin wiring (Cargo end to end)
 
 **Files:**
-- Create: `src/publish.rs`, `src/lib.rs` (replace scaffold), `tests/plugin.rs`, `settings.schema.json`
+- Create: `src/publish.rs`, `src/lib.rs` (replace scaffold), `tests/plugin.rs`, `settings.schema.json` (final keys now, ruling R5: `vulnerabilities` bool, `minimumSeverity` enum low|medium|high|critical, `ignore` string array, `ecosystems.<cargo|npm|pypi|go|packagist|pub|nuget|rubygems|maven>.enabled` bool, `cacheTtlSeconds` integer; Task 15 only reads them)
 - Modify: `plugin.toml`
 
 **Interfaces:**
@@ -265,6 +275,9 @@ Each ecosystem task follows these steps; the task lists only what differs. `<eco
   pub enum UpdateKind { Major, Minor, Patch, Prerelease }
   pub fn render_update(eco: Ecosystem, dep: &Dependency, latest: &str) -> Option<String>; // the new text for dep.version_span
   pub fn update_kind(current: &str, latest: &str) -> UpdateKind;
+  /// Shared by `analyze` (Status::Outdated) and the quick fix (R4): true when `latest` is newer than the
+  /// declared version's lower bound under the ecosystem's ordering and `latest` is not a pre-release.
+  pub fn is_outdated(eco: Ecosystem, declared: &str, latest: &str) -> bool;
   ```
   `render_update` returns `None` when `dep.has_additional_version_constraints` or the spec is not rewritable.
 
@@ -272,6 +285,8 @@ Particulars:
 - Parser source: `parsers/python.rs`. Fixture expectations: `requests==2.28.0` → name `requests`, version `2.28.0` (the span covers the version text; the operator stays outside it); `flask>=2.0,<3` → `has_additional_version_constraints = true`; `-r other.txt`, comments, `git+https://…`, `-e .` skipped; `pyproject.toml` `[project] dependencies`, `[project.optional-dependencies]` (`optional = true`), `[tool.poetry.dependencies]` (skips `python`), `[dependency-groups]` (`dev = true`); `hatch.toml` per depsy.
 - Registry URL: `https://pypi.org/pypi/{normalized}/json`, normalised lowercase with `[-_.]+` → `-`.
 - `render_update` tests: `==2.28.0` + latest `2.31.0` → `2.31.0`; `>=2.0` + `2.31.0` → `2.31.0` (keeps `>=`, only the version part is replaced); compound constraint → `None`. `update_kind("2.28.0","3.0.0") == Major`, `("2.28.0","2.31.0") == Minor`, `("2.28.0","2.28.4") == Patch`, `("1.0","2.0b1") == Prerelease`.
+- `is_outdated` tests: `("2.28.0","2.31.0")` true; `("2.31.0","2.31.0")` false; `("2.31.0","2.28.0")` false; `("2.0","2.0b1")` false (pre-release is never "latest").
+- Budgeted lookups (moved from Task 6, ruling R3, Review Focus 5): 300 packages in a generated `requirements.txt` with `Budget::new(2, None)` and a `FakeHttp` registry: at most 2 registry requests (plus one OSV batch), `pending` equals the uncached packages left, and a second run with a fresh budget fetches only the earlier misses.
 - `suggest`: `requirements.txt`, `pyproject.toml`. Commit `feat: support PyPI manifests`.
 
 ### Task 9: Code-action quick fix
@@ -279,7 +294,7 @@ Particulars:
 **Files:** Create `src/actions.rs`; modify `src/lib.rs` (`impl Providers`), `tests/plugin.rs`.
 
 **Interfaces:**
-- Consumes: `Cache`, `Ecosystem::parse`, `render_update`, `update_kind`, `text::to_range`.
+- Consumes: `Cache`, `Ecosystem::parse`, `render_update`, `update_kind`, `is_outdated`, `text::to_range`.
 - Produces: `pub fn code_actions(cache: &Cache, settings: &Settings, doc_path: &str, doc_text: &str, selection: Range, now: u64) -> Vec<openidea_plugin::providers::CodeAction>`. Title `Update {name} to {latest} (major|minor|patch|prerelease)`, `kind = Some("quickfix")`, `preferred = true` only for minor/patch, `edits = vec![(path, vec![TextEdit { range: version range, text: new }])]`. Reads the cache only; never calls `host::fetch`.
 
 - [ ] **Step 1: Failing tests:** with the PyPI `requirements.txt` fixture cached as outdated (`requests 2.28.0`, latest `2.31.0`) and the cursor on that line: one action with the exact title `Update requests to 2.31.0 (minor)` and an edit replacing exactly `2.28.0`; cursor on another line → no action; up-to-date, unknown, pending or `NotChecked` → no action; a major update is not `preferred`; the call makes zero fetches (counter in `on_fetch` stays 0).
