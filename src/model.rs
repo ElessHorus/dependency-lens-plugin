@@ -1,5 +1,7 @@
 //! Shared data model for manifest parsing, registry lookups and advisories.
 
+use crate::parsers;
+
 /// A package registry that a manifest file belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Ecosystem {
@@ -45,6 +47,23 @@ impl Ecosystem {
                 Some(Ecosystem::PyPI)
             }
             _ => None,
+        }
+    }
+
+    /// Parses the dependencies declared in a manifest of this ecosystem.
+    ///
+    /// Ecosystems without a parser yet return an empty vector.
+    pub fn parse(self, text: &str) -> Vec<Dependency> {
+        match self {
+            Ecosystem::Cargo => parsers::cargo::parse(text),
+            Ecosystem::Npm => Vec::new(),
+            Ecosystem::PyPI => Vec::new(),
+            Ecosystem::Go => Vec::new(),
+            Ecosystem::Packagist => Vec::new(),
+            Ecosystem::Pub => Vec::new(),
+            Ecosystem::NuGet => Vec::new(),
+            Ecosystem::RubyGems => Vec::new(),
+            Ecosystem::Maven => Vec::new(),
         }
     }
 
@@ -218,6 +237,13 @@ mod tests {
         assert!(Ecosystem::RubyGems.offers_updates());
         assert!(!Ecosystem::Cargo.offers_updates());
         assert!(!Ecosystem::Npm.offers_updates());
+    }
+
+    #[test]
+    fn parse_dispatches_cargo_and_returns_empty_for_unported_ecosystems() {
+        let manifest = "[dependencies]\nserde = \"1.0\"\n";
+        assert_eq!(Ecosystem::Cargo.parse(manifest).len(), 1);
+        assert!(Ecosystem::Npm.parse(manifest).is_empty());
     }
 
     #[test]

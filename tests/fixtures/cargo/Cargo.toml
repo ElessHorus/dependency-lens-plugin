@@ -1,0 +1,29 @@
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = "1.0"
+tokio = { version = "1", features = ["full"] }
+local = { path = "../local" }
+g = { git = "https://x/y" }
+serde-workspace = { workspace = true }
+"ünï" = "1.0"
+optional-dep = { version = "2.0", optional = true }
+
+[dependencies.reqwest]
+version = "0.12"
+features = ["json"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+cc = "1.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[workspace.dependencies]
+anyhow = "1.0"

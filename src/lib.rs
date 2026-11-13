@@ -1,6 +1,7 @@
 //! Dependency Lens: an OpenIDEA plugin.
 
 pub mod model;
+pub mod parsers;
 pub mod text;
 
 use openidea_plugin::{Error, Invocation, NotificationLevel, Plugin, host, register_plugin};
