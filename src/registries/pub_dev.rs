@@ -1,6 +1,6 @@
 //! pub.dev registry client: request building and response parsing (pub.dev package API).
 
-use super::dotted::DottedVersion;
+use super::dotted::{DottedVersion, rank_versions};
 use crate::model::VersionInfo;
 use openidea_plugin::HttpRequest;
 use serde::Deserialize;
@@ -43,31 +43,21 @@ pub fn request(package: &str) -> HttpRequest {
 pub fn parse(body: &str) -> Result<VersionInfo, String> {
     let response: RegistryResponse =
         serde_json::from_str(body).map_err(|_| INVALID_RESPONSE.to_string())?;
-    // Each version is parsed once and kept beside its text.
-    let mut ranked: Vec<(DottedVersion, String)> = response
-        .versions
-        .into_iter()
-        .filter(|entry| entry.retracted != Some(true))
-        .filter_map(|entry| {
-            DottedVersion::parse(&entry.version).map(|version| (version, entry.version))
-        })
-        .collect();
-    // Newest first. The sort is stable, so equal versions keep the registry order.
-    ranked.sort_by(|(left_version, _), (right_version, _)| right_version.cmp(left_version));
-    let listed_latest = ranked
-        .iter()
-        .find(|(version, _)| !version.is_prerelease())
-        .map(|(_, text)| text.clone());
-    let latest = listed_latest.or_else(|| {
+    let reported_latest = response.latest;
+    let mut info = rank_versions(
         response
-            .latest
+            .versions
+            .into_iter()
+            .filter(|entry| entry.retracted != Some(true))
+            .map(|entry| entry.version),
+    );
+    // The reported latest is used only when no stable release is listed.
+    info.latest = info.latest.or_else(|| {
+        reported_latest
             .map(|entry| entry.version)
             .filter(|text| DottedVersion::parse(text).is_some())
     });
-    Ok(VersionInfo {
-        latest,
-        versions: ranked.into_iter().map(|(_, text)| text).collect(),
-    })
+    Ok(info)
 }
 
 #[cfg(test)]

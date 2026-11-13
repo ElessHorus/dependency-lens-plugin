@@ -1,6 +1,6 @@
 //! NuGet registry client: request building and response parsing (NuGet v3 flat container).
 
-use super::dotted::DottedVersion;
+use super::dotted::rank_versions;
 use crate::model::VersionInfo;
 use openidea_plugin::HttpRequest;
 use serde::Deserialize;
@@ -32,25 +32,13 @@ pub fn request(package: &str) -> HttpRequest {
 pub fn parse(body: &str) -> Result<VersionInfo, String> {
     let response: RegistryResponse =
         serde_json::from_str(body).map_err(|_| INVALID_RESPONSE.to_string())?;
-    // Each version is parsed once and kept beside its text.
-    let mut ranked: Vec<(DottedVersion, String)> = response
-        .versions
-        .into_iter()
-        .filter_map(|entry| match entry {
-            Value::String(text) => DottedVersion::parse(&text).map(|version| (version, text)),
+    // Non-string entries are skipped; the rest is ranked by the shared helper.
+    Ok(rank_versions(response.versions.into_iter().filter_map(
+        |entry| match entry {
+            Value::String(text) => Some(text),
             _ => None,
-        })
-        .collect();
-    // Newest first. The sort is stable, so equal versions keep the registry order.
-    ranked.sort_by(|(left_version, _), (right_version, _)| right_version.cmp(left_version));
-    let latest = ranked
-        .iter()
-        .find(|(version, _)| !version.is_prerelease())
-        .map(|(_, text)| text.clone());
-    Ok(VersionInfo {
-        latest,
-        versions: ranked.into_iter().map(|(_, text)| text).collect(),
-    })
+        },
+    )))
 }
 
 #[cfg(test)]

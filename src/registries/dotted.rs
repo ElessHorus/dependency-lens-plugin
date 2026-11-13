@@ -4,6 +4,7 @@
 //! alphanumeric identifiers. They compare lexically, so `alpha1 < beta1 < rc1`.
 //! Composer's `-p1` and `-patch` stability is treated as a prerelease.
 
+use crate::model::VersionInfo;
 use std::cmp::Ordering;
 
 /// The most release segments that one version may have, such as `1.2.3.4`.
@@ -71,6 +72,27 @@ pub fn is_dev_branch(version: &str) -> bool {
         .and_then(|start| version.get(start..))
         .is_some_and(|suffix| suffix.eq_ignore_ascii_case("-dev"));
     has_dev_prefix || has_dev_suffix
+}
+
+/// Ranks version texts newest first. `latest` is the newest non-prerelease.
+///
+/// Texts that do not parse are dropped. Each text is parsed once and kept beside
+/// its parsed version, so the sort compares stored values without parsing again.
+pub fn rank_versions(texts: impl IntoIterator<Item = String>) -> VersionInfo {
+    let mut ranked: Vec<(DottedVersion, String)> = texts
+        .into_iter()
+        .filter_map(|text| DottedVersion::parse(&text).map(|version| (version, text)))
+        .collect();
+    // Newest first. The sort is stable, so equal versions keep the input order.
+    ranked.sort_by(|(left_version, _), (right_version, _)| right_version.cmp(left_version));
+    let latest = ranked
+        .iter()
+        .find(|(version, _)| !version.is_prerelease())
+        .map(|(_, text)| text.clone());
+    VersionInfo {
+        latest,
+        versions: ranked.into_iter().map(|(_, text)| text).collect(),
+    }
 }
 
 impl Ord for DottedVersion {
@@ -157,6 +179,53 @@ mod tests {
 
     fn version(text: &str) -> DottedVersion {
         DottedVersion::parse(text).unwrap_or_else(|| panic!("{text} must parse"))
+    }
+
+    /// Converts string literals into the owned texts that `rank_versions` takes.
+    fn texts(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_owned()).collect()
+    }
+
+    #[test]
+    fn rank_versions_of_nothing_has_no_latest_and_no_versions() {
+        let info = rank_versions(Vec::new());
+        assert_eq!(info.latest, None);
+        assert!(info.versions.is_empty());
+    }
+
+    #[test]
+    fn rank_versions_lists_newest_first_and_picks_the_newest_stable() {
+        let info = rank_versions(texts(&["1.0.0", "2.0.0", "1.5.0"]));
+        assert_eq!(info.versions, ["2.0.0", "1.5.0", "1.0.0"]);
+        assert_eq!(info.latest.as_deref(), Some("2.0.0"));
+    }
+
+    #[test]
+    fn rank_versions_keeps_prereleases_listed_but_never_latest() {
+        let info = rank_versions(texts(&["1.0.0", "2.0.0-beta"]));
+        assert_eq!(info.versions, ["2.0.0-beta", "1.0.0"]);
+        assert_eq!(info.latest.as_deref(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn rank_versions_has_no_latest_when_only_prereleases_exist() {
+        let info = rank_versions(texts(&["2.0.0-beta1", "2.0.0-rc1"]));
+        assert_eq!(info.latest, None);
+        assert_eq!(info.versions, ["2.0.0-rc1", "2.0.0-beta1"]);
+    }
+
+    #[test]
+    fn rank_versions_drops_texts_that_do_not_parse() {
+        let info = rank_versions(texts(&["not-a-version", "1.0.0", ""]));
+        assert_eq!(info.versions, ["1.0.0"]);
+    }
+
+    #[test]
+    fn rank_versions_keeps_the_input_order_of_equal_versions() {
+        let info = rank_versions(texts(&["1.0", "1.0.0"]));
+        assert_eq!(info.versions, ["1.0", "1.0.0"]);
+        let reversed = rank_versions(texts(&["1.0.0", "1.0"]));
+        assert_eq!(reversed.versions, ["1.0.0", "1.0"]);
     }
 
     #[test]

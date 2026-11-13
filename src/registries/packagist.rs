@@ -1,6 +1,6 @@
 //! Packagist registry client: request building and response parsing (Composer p2 API).
 
-use super::dotted::{DottedVersion, is_dev_branch};
+use super::dotted::{is_dev_branch, rank_versions};
 use crate::model::VersionInfo;
 use openidea_plugin::HttpRequest;
 use serde::Deserialize;
@@ -40,24 +40,13 @@ pub fn parse(body: &str) -> Result<VersionInfo, String> {
         .into_values()
         .next()
         .ok_or_else(|| INVALID_RESPONSE.to_string())?;
-    // Each version is parsed once and kept beside its text. Dev branches never reach the list.
-    let mut ranked: Vec<(DottedVersion, String)> = entries
-        .into_iter()
-        .filter(|entry| !is_dev_branch(&entry.version))
-        .filter_map(|entry| {
-            DottedVersion::parse(&entry.version).map(|version| (version, entry.version))
-        })
-        .collect();
-    // Newest first. The sort is stable, so equal versions keep the registry order.
-    ranked.sort_by(|(left_version, _), (right_version, _)| right_version.cmp(left_version));
-    let latest = ranked
-        .iter()
-        .find(|(version, _)| !version.is_prerelease())
-        .map(|(_, text)| text.clone());
-    Ok(VersionInfo {
-        latest,
-        versions: ranked.into_iter().map(|(_, text)| text).collect(),
-    })
+    // Dev branches never reach the list.
+    Ok(rank_versions(
+        entries
+            .into_iter()
+            .map(|entry| entry.version)
+            .filter(|version| !is_dev_branch(version)),
+    ))
 }
 
 #[cfg(test)]
