@@ -6,17 +6,124 @@ pub mod http;
 pub mod model;
 pub mod osv;
 pub mod parsers;
+pub mod publish;
 pub mod settings;
 pub mod text;
 
-use openidea_plugin::{Error, Invocation, NotificationLevel, Plugin, host, register_plugin};
+use crate::analysis::{Budget, analyze};
+use crate::cache::Cache;
+use crate::http::HostHttp;
+use crate::model::Ecosystem;
+use crate::settings::Settings;
+use openidea_plugin::{
+    Context, Decoration, Diagnostic, Error, Event, EventKind, Invocation, LogLevel, Plugin, host,
+    register_plugin,
+};
+use std::collections::HashSet;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[derive(Default)]
-pub struct Main {
-    greetings: u32,
+/// Folders whose manifests belong to dependencies or build output, not to the project.
+const SKIPPED_DIRECTORIES: [&str; 4] = ["node_modules", "target", "vendor", ".git"];
+/// Wall-clock limit of one lookup run, kept below the host's 60 s task limit.
+const LOOKUP_DEADLINE: Duration = Duration::from_secs(50);
+/// Title of the background task shown while a manifest is analyzed.
+const TASK_TITLE: &str = "Dependency Lens";
+
+/// Dependency Lens plugin state: the analysis cache and the settings it runs with.
+pub struct DependencyLens {
+    cache: Cache,
+    settings: Settings,
 }
 
-impl Plugin for Main {
+impl Default for DependencyLens {
+    fn default() -> Self {
+        let settings = Settings::default();
+        Self {
+            cache: Cache::new(settings.cache_ttl_secs),
+            settings,
+        }
+    }
+}
+
+impl DependencyLens {
+    /// Analyzes the manifest at `path` and publishes its decorations and problems.
+    ///
+    /// Publishes once, after the analysis. A cancelled task publishes nothing.
+    fn refresh(&mut self, path: &str, ctx: &Invocation) {
+        let Some(eco) = Ecosystem::detect(path) else {
+            return;
+        };
+        let Some(project) = ctx.project().or_else(|| host::project_of(path)) else {
+            return;
+        };
+        let text = match project.read_file(path) {
+            Ok(text) => text,
+            Err(error) => {
+                host::log(LogLevel::Warn, &format!("cannot read {path}: {error}"));
+                return;
+            }
+        };
+        let deps = eco.parse(&text);
+        let task = host::begin_task(TASK_TITLE, true);
+        let mut budget = Budget::new(usize::MAX, Some(Instant::now() + LOOKUP_DEADLINE));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or_default();
+        let analysis = analyze(
+            eco,
+            deps,
+            &mut self.cache,
+            &HostHttp,
+            &self.settings,
+            now,
+            &mut budget,
+        );
+        if task.is_cancelled() {
+            return;
+        }
+        let editor_decorations = publish::decorations(&text, &analysis);
+        let problems = publish::diagnostics(&text, &analysis);
+        publish_results(path, &editor_decorations, &problems);
+    }
+}
+
+/// Replaces what the editor shows for `path`; empty lists clear the previous results.
+fn publish_results(path: &str, editor_decorations: &[Decoration], problems: &[Diagnostic]) {
+    log_failure(
+        path,
+        "decorations",
+        host::set_decorations(path, publish::DECORATION_SET, editor_decorations),
+    );
+    log_failure(
+        path,
+        "diagnostics",
+        host::publish_diagnostics(path, problems),
+    );
+}
+
+/// Logs a failed host call. A failed publication must not stop the plugin.
+fn log_failure(path: &str, what: &str, result: Result<(), Error>) {
+    if let Err(error) = result {
+        host::log(LogLevel::Warn, &format!("{what} for {path}: {error}"));
+    }
+}
+
+/// Whether `path` is a manifest the plugin analyzes, outside dependency and build folders.
+fn is_manifest(path: &str) -> bool {
+    Ecosystem::detect(path).is_some()
+        && !path
+            .split(['/', '\\'])
+            .any(|part| SKIPPED_DIRECTORIES.contains(&part))
+}
+
+impl Plugin for DependencyLens {
+    fn activate(&mut self, _ctx: &Context) -> Result<(), Error> {
+        host::subscribe(EventKind::FileOpened)?;
+        host::subscribe(EventKind::FileSaved)?;
+        host::subscribe(EventKind::FilesChanged)
+    }
+
     fn run_command(
         &mut self,
         id: &str,
@@ -24,66 +131,52 @@ impl Plugin for Main {
         _arg: Option<&str>,
     ) -> Result<Option<String>, Error> {
         match id {
-            "say-hello" => {
-                // Instance state lasts until the plugin is idle for a while;
-                // keep what must survive in `host::storage`.
-                self.greetings += 1;
-                let body = format!("Hello #{} from Dependency Lens!", self.greetings);
-                host::notify(NotificationLevel::Info, "Dependency Lens", &body);
-                Ok(None)
+            "refresh" => {
+                let editor = ctx
+                    .editor()
+                    .ok_or_else(|| Error::Invalid("no file is open".to_owned()))?;
+                let path = editor.path();
+                if !is_manifest(&path) {
+                    return Ok(Some("Dependency Lens: not a supported manifest".to_owned()));
+                }
+                self.refresh(&path, ctx);
+                Ok(Some("Dependency Lens: refreshed".to_owned()))
             }
-            "line-count" => {
-                let editor = ctx.editor().ok_or("no file is open")?;
-                let text = editor.document()?.text;
-                Ok(Some(format!(
-                    "{} lines in {}",
-                    text.lines().count(),
-                    editor.path()
-                )))
+            _ => Err(Error::NotFound(format!("command {id}"))),
+        }
+    }
+
+    fn handle_events(&mut self, events: &[Event], ctx: &Invocation) {
+        // Borrowed paths: the batch is read once and no path is copied.
+        let mut changed_paths: Vec<&str> = Vec::new();
+        let mut removed_paths: Vec<&str> = Vec::new();
+        for event in events {
+            match event {
+                Event::FileOpened(path) | Event::FileSaved(path) => changed_paths.push(path),
+                Event::FilesChanged(changes) => {
+                    changed_paths.extend(
+                        changes
+                            .created
+                            .iter()
+                            .chain(&changes.modified)
+                            .map(String::as_str),
+                    );
+                    removed_paths.extend(changes.removed.iter().map(String::as_str));
+                }
+                _ => {}
             }
-            _ => Err(format!("unknown command {id}").into()),
+        }
+        for path in removed_paths.into_iter().filter(|path| is_manifest(path)) {
+            publish_results(path, &[], &[]);
+        }
+        // A set skips a path that appears twice in one batch; the first occurrence keeps its place.
+        let mut refreshed: HashSet<&str> = HashSet::new();
+        for path in changed_paths.into_iter().filter(|path| is_manifest(path)) {
+            if refreshed.insert(path) {
+                self.refresh(path, ctx);
+            }
         }
     }
 }
 
-register_plugin!(Main);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use openidea_plugin::mock::MockHost;
-
-    #[test]
-    fn says_hello() {
-        let host = MockHost::install();
-        let mut plugin = Main::default();
-        plugin
-            .run_command("say-hello", &host.invocation(), None)
-            .unwrap();
-        plugin
-            .run_command("say-hello", &host.invocation(), None)
-            .unwrap();
-        assert_eq!(
-            host.notifications()[1].body,
-            "Hello #2 from Dependency Lens!"
-        );
-    }
-
-    // Proves that the parser crates compile and run on wasm32-wasip2.
-    #[test]
-    fn wasm_smoke() {
-        assert!(taplo::parser::parse("a = 1").errors.is_empty());
-        assert!(quick_xml::Reader::from_str("<a/>").read_event().is_ok());
-        assert!(semver::Version::parse("1.2.3").is_ok());
-    }
-
-    #[test]
-    fn counts_lines() {
-        let host = MockHost::install();
-        host.open_editor("/project/src/main.rs", "rust", "fn main() {\n}\n", &[]);
-        let out = Main::default()
-            .run_command("line-count", &host.invocation(), None)
-            .unwrap();
-        assert_eq!(out.as_deref(), Some("2 lines in /project/src/main.rs"));
-    }
-}
+register_plugin!(DependencyLens);

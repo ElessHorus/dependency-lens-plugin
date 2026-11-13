@@ -10,17 +10,22 @@ engines.openidea = "^1.3"
 # Built by `openidea-plugin build`. The code is loaded the first time one of
 # its commands runs; the commands below show in Find Action before that.
 wasm = "dist/plugin.wasm"
+activation = [
+  "on-event:file-opened",
+  "on-event:file-saved",
+  "on-event:files-changed",
+  "on-command:*",
+]
 
 # What the code may do. The user approves these when installing.
 [capabilities]
-required = ["editor.read"]
+required = ["events", "project.read", "editor.read", "net:api.osv.dev"]
 
 [[contributes.commands]]
-id = "say-hello"
-title = "Dependency Lens: Say Hello"
+id = "refresh"
+title = "Dependency Lens: Refresh"
 category = "Dependency Lens"
 
-[[contributes.commands]]
-id = "line-count"
-title = "Dependency Lens: Line Count of Active File"
-category = "Dependency Lens"
+[contributes.settings]
+title = "Dependency Lens"
+schema = "settings.schema.json"
