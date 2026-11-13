@@ -305,3 +305,62 @@ fn file_outside_the_window_project_is_found_through_project_of() {
     );
     assert_eq!(diagnostics_of(&host, "/p2/Cargo.toml").len(), 1);
 }
+
+const REQUIREMENTS_PATH: &str = "/p/requirements.txt";
+const REQUIREMENTS: &str = "requests==2.28.0\nflask==2.31.0\n";
+/// `requests==2.28.0` sits on line 0; its version text is columns 10..16.
+const REQUESTS_VERSION_RANGE: Range = Range::new(Position::new(0, 10), Position::new(0, 16));
+/// `flask==2.31.0` sits on line 1; its version text is columns 7..13.
+const FLASK_VERSION_RANGE: Range = Range::new(Position::new(1, 7), Position::new(1, 13));
+const PYPI_PAGE_BODY: &str =
+    r#"{"info":{"version":"2.31.0"},"releases":{"2.31.0":[{"yanked":false}]}}"#;
+
+/// Answers PyPI project pages with one release, and everything else as OSV does.
+fn host_with_pypi() -> MockHost {
+    let host = MockHost::install().with_capabilities(&[
+        "events",
+        "project.read",
+        "editor.read",
+        "net:api.osv.dev",
+        "net:pypi.org",
+    ]);
+    host.set_project_root(Some("/p"));
+    host.on_fetch(|request| {
+        if request.url.starts_with("https://pypi.org/pypi/") {
+            Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: PYPI_PAGE_BODY.as_bytes().to_vec(),
+            })
+        } else {
+            answer_osv(request)
+        }
+    });
+    host
+}
+
+#[test]
+fn requirements_show_registry_versions_and_no_problems() {
+    let host = host_with_pypi();
+    host.add_file("requirements.txt", REQUIREMENTS);
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(REQUIREMENTS_PATH.to_owned())],
+        &host.invocation(),
+    );
+
+    let decorations = decorations_of(&host, REQUIREMENTS_PATH);
+    let requests = decorations
+        .iter()
+        .find(|decoration| decoration.range == REQUESTS_VERSION_RANGE)
+        .expect("decoration on requests");
+    assert_eq!(requests.after, Some("→ 2.31.0".to_string()));
+    assert_eq!(requests.style, "info");
+    let flask = decorations
+        .iter()
+        .find(|decoration| decoration.range == FLASK_VERSION_RANGE)
+        .expect("decoration on flask");
+    assert_eq!(flask.after, Some("✓".to_string()));
+    assert_eq!(flask.style, "muted");
+    assert!(diagnostics_of(&host, REQUIREMENTS_PATH).is_empty());
+}

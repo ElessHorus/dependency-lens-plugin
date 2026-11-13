@@ -10,6 +10,7 @@ pub mod publish;
 pub mod registries;
 pub mod settings;
 pub mod text;
+pub mod update;
 
 use crate::analysis::{Budget, analyze};
 use crate::cache::Cache;

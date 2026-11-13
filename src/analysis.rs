@@ -2,10 +2,11 @@
 
 use crate::cache::{Cache, FailureKind};
 use crate::http::Http;
-use crate::model::{Dependency, Ecosystem, Vulnerability};
+use crate::model::{Dependency, Ecosystem, VersionInfo, Vulnerability};
 use crate::osv::{OsvQuery, declared_version_for_osv, query_batch};
 use crate::settings::Settings;
-use std::collections::HashSet;
+use crate::update::is_outdated;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 /// Result of checking one dependency.
@@ -83,8 +84,9 @@ impl Budget {
 /// Analyzes the dependencies of one manifest of ecosystem `eco`.
 ///
 /// Queries OSV.dev once for every uncached `(name, version)` pair and stores the
-/// answers and failures in `cache`. `_budget` is not used yet: Task 8 starts
-/// consuming it for registry lookups.
+/// answers and failures in `cache`. For ecosystems that offer updates, looks up
+/// the registry for every checked dependency. Each registry lookup takes one unit
+/// of `budget`; entries past the budget stay [`Status::Pending`].
 pub fn analyze(
     eco: Ecosystem,
     deps: Vec<Dependency>,
@@ -92,7 +94,7 @@ pub fn analyze(
     http: &dyn Http,
     settings: &Settings,
     now: u64,
-    _budget: &mut Budget,
+    budget: &mut Budget,
 ) -> Analysis {
     if !settings.is_enabled(eco) {
         return Analysis {
@@ -113,18 +115,128 @@ pub fn analyze(
     if settings.vulnerabilities {
         query_missing_vulnerabilities(eco, &kept, &checked_versions, cache, http, now);
     }
-    let cache: &Cache = cache;
-    let entries = kept
-        .into_iter()
-        .zip(checked_versions)
-        .map(|(dependency, checked_version)| {
-            build_entry(eco, dependency, checked_version, cache, settings, now)
-        })
-        .collect();
-    Analysis {
-        entries,
-        pending: 0,
+    let mut entries: Vec<Entry> = {
+        let cache_view: &Cache = cache;
+        kept.into_iter()
+            .zip(checked_versions)
+            .map(|(dependency, checked_version)| {
+                build_entry(eco, dependency, checked_version, cache_view, settings, now)
+            })
+            .collect()
+    };
+    let pending = if eco.offers_updates() {
+        resolve_registry(eco, &mut entries, cache, http, budget, now)
+    } else {
+        0
+    };
+    Analysis { entries, pending }
+}
+
+/// Registry outcome of one package name: the newest release, or the failure reason.
+type Lookup = Result<Option<String>, String>;
+
+/// Sets the registry status of every entry with a checked version. Returns how many stay pending.
+///
+/// Each entry reads the cache first. A name that is missing from the cache gets one request
+/// per call, and the call-local map answers its duplicates even when the cache keeps nothing.
+fn resolve_registry(
+    eco: Ecosystem,
+    entries: &mut [Entry],
+    cache: &mut Cache,
+    http: &dyn Http,
+    budget: &mut Budget,
+    now: u64,
+) -> usize {
+    let mut fresh: HashMap<String, Lookup> = HashMap::new();
+    let mut pending_count = 0;
+    for entry in entries
+        .iter_mut()
+        .filter(|entry| entry.checked_version.is_some())
+    {
+        let name = eco.normalize_package(&entry.dependency.name);
+        let declared = entry.dependency.version.as_str();
+        let status = if let Some(info) = cache.version_info(eco, &name, now) {
+            status_from_lookup(eco, declared, Ok(info.latest.as_deref()))
+        } else if let Some(reason) = cache.failure(FailureKind::Registry, eco, &name, now) {
+            status_from_lookup(eco, declared, Err(reason))
+        } else if let Some(lookup) = fresh.get(&*name) {
+            status_from_lookup(eco, declared, lookup_view(lookup))
+        } else if budget.take() {
+            let lookup = lookup_registry(eco, &entry.dependency.name, &name, http, cache, now);
+            let status = status_from_lookup(eco, declared, lookup_view(&lookup));
+            fresh.insert(name.into_owned(), lookup);
+            status
+        } else {
+            pending_count += 1;
+            Status::Pending
+        };
+        entry.status = status;
     }
+    pending_count
+}
+
+/// Borrows the parts of a lookup that the status needs.
+fn lookup_view(lookup: &Lookup) -> Result<Option<&str>, &str> {
+    lookup
+        .as_ref()
+        .map(|latest| latest.as_deref())
+        .map_err(String::as_str)
+}
+
+/// Builds the registry status of one entry from its lookup outcome.
+fn status_from_lookup(
+    eco: Ecosystem,
+    declared: &str,
+    lookup: Result<Option<&str>, &str>,
+) -> Status {
+    match lookup {
+        Err(reason) => Status::Unknown(reason.to_owned()),
+        Ok(None) => Status::Unknown("registry: no version found".to_owned()),
+        Ok(Some(latest)) if is_outdated(eco, declared, latest) => Status::Outdated {
+            latest: latest.to_owned(),
+        },
+        Ok(Some(_)) => Status::UpToDate,
+    }
+}
+
+/// Asks the registry for `package`, stores the answer or the failure under `name`, and returns the outcome.
+fn lookup_registry(
+    eco: Ecosystem,
+    package: &str,
+    name: &str,
+    http: &dyn Http,
+    cache: &mut Cache,
+    now: u64,
+) -> Lookup {
+    match request_version_info(eco, package, http) {
+        Ok(info) => {
+            let latest = info.latest.clone();
+            cache.put_version_info(eco, name, info, now);
+            Ok(latest)
+        }
+        Err(reason) => {
+            cache.put_failure(FailureKind::Registry, eco, name, reason.clone(), now);
+            Err(reason)
+        }
+    }
+}
+
+/// Sends the registry request for `package` and reads the answer. Errors carry the `registry:` prefix.
+fn request_version_info(
+    eco: Ecosystem,
+    package: &str,
+    http: &dyn Http,
+) -> Result<VersionInfo, String> {
+    let Some(request) = eco.registry_request(package) else {
+        return Err("registry: no request".to_owned());
+    };
+    let response = http
+        .send(&request)
+        .map_err(|message| format!("registry: {message}"))?;
+    if !(200..=299).contains(&response.status) {
+        return Err(format!("registry: HTTP {}", response.status));
+    }
+    eco.parse_registry(&String::from_utf8_lossy(&response.body))
 }
 
 /// Sends one OSV batch for the checked pairs that have neither a cached answer nor a recent failure.
@@ -515,5 +627,250 @@ mod tests {
         let mut budget = Budget::new(1, Some(future));
         assert!(budget.take());
         assert!(!budget.take());
+    }
+
+    const PYPI_PREFIX: &str = "https://pypi.org/pypi/";
+    const REQUESTS_URL: &str = "https://pypi.org/pypi/requests/json";
+    const FLASK_URL: &str = "https://pypi.org/pypi/flask/json";
+    const FLASK_LOGIN_URL: &str = "https://pypi.org/pypi/flask-login/json";
+    const REQUESTS_BODY: &str = r#"{"info":{"version":"2.31.0"},"releases":{"2.28.0":[{"yanked":false}],"2.31.0":[{"yanked":false}]}}"#;
+    const FLASK_BODY: &str =
+        r#"{"info":{"version":"2.31.0"},"releases":{"2.31.0":[{"yanked":false}]}}"#;
+    const LOGIN_BODY: &str =
+        r#"{"info":{"version":"0.6.0"},"releases":{"0.6.0":[{"yanked":false}]}}"#;
+    const PACKAGE_BODY: &str = r#"{"info":{"version":"2.0"},"releases":{"1.0":[{"yanked":false}],"2.0":[{"yanked":false}]}}"#;
+
+    /// Builds an OSV batch answer with `query_count` empty results.
+    fn batch_body(query_count: usize) -> String {
+        let results = vec!["{}"; query_count].join(",");
+        format!(r#"{{"results":[{results}]}}"#)
+    }
+
+    /// Parses a requirements text and runs `analyze` for PyPI.
+    fn analyze_python(
+        cache: &mut Cache,
+        http: &dyn Http,
+        now: u64,
+        text: &str,
+        budget: &mut Budget,
+    ) -> Analysis {
+        analyze(
+            Ecosystem::PyPI,
+            parsers::python::parse(text),
+            cache,
+            http,
+            &Settings::default(),
+            now,
+            budget,
+        )
+    }
+
+    #[test]
+    fn pypi_pins_are_outdated_or_up_to_date_from_the_registry() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("GET", REQUESTS_URL, 200, REQUESTS_BODY)
+            .route("GET", FLASK_URL, 200, FLASK_BODY);
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            "requests==2.28.0\nflask==2.31.0\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(analysis.pending, 0);
+        assert_eq!(
+            entry(&analysis, "requests").status,
+            Status::Outdated {
+                latest: "2.31.0".to_owned()
+            }
+        );
+        assert_eq!(entry(&analysis, "flask").status, Status::UpToDate);
+    }
+
+    #[test]
+    fn registry_http_error_is_cached_for_60_seconds() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", REQUESTS_URL, 404, "");
+        let text = "requests==2.28.0\n";
+        let first = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            text,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(
+            entry(&first, "requests").status,
+            Status::Unknown("registry: HTTP 404".to_owned())
+        );
+
+        analyze_python(
+            &mut cache,
+            &http,
+            NOW + 59,
+            text,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(http.count(REQUESTS_URL), 1);
+
+        let after = analyze_python(
+            &mut cache,
+            &http,
+            NOW + 60,
+            text,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(http.count(REQUESTS_URL), 2);
+        assert_eq!(
+            entry(&after, "requests").status,
+            Status::Unknown("registry: HTTP 404".to_owned())
+        );
+    }
+
+    #[test]
+    fn registry_body_that_is_not_json_is_an_invalid_response() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", REQUESTS_URL, 200, "not json");
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            "requests==2.28.0\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(
+            entry(&analysis, "requests").status,
+            Status::Unknown("registry: invalid response".to_owned())
+        );
+    }
+
+    #[test]
+    fn registry_transport_error_is_reported_with_its_message() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .transport_error("GET", REQUESTS_URL, "connection refused");
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            "requests==2.28.0\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(
+            entry(&analysis, "requests").status,
+            Status::Unknown("registry: connection refused".to_owned())
+        );
+    }
+
+    #[test]
+    fn package_names_are_normalised_and_looked_up_once_per_call() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("GET", FLASK_LOGIN_URL, 200, LOGIN_BODY);
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            "Flask_Login==0.6.0\nflask-login==0.6.0\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(http.count(FLASK_LOGIN_URL), 1);
+        assert_eq!(entry(&analysis, "Flask_Login").status, Status::UpToDate);
+        assert_eq!(entry(&analysis, "flask-login").status, Status::UpToDate);
+    }
+
+    #[test]
+    fn duplicate_lookups_stay_once_per_call_even_without_cache_storage() {
+        let mut cache = Cache::new(0);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("GET", FLASK_LOGIN_URL, 200, LOGIN_BODY);
+        analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            "Flask_Login==0.6.0\nflask-login==0.6.0\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(http.count(FLASK_LOGIN_URL), 1);
+    }
+
+    #[test]
+    fn dependency_without_a_checked_version_makes_no_registry_request() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new();
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            "[tool.poetry.dependencies]\nrequests = \"*\"\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert!(http.requests().is_empty());
+        let requests = entry(&analysis, "requests");
+        assert_eq!(requests.checked_version, None);
+        assert_eq!(requests.status, Status::NotChecked);
+    }
+
+    #[test]
+    fn budget_caps_registry_lookups_and_leaves_the_rest_pending() {
+        let text: String = (0..300).map(|index| format!("pkg{index}==1.0\n")).collect();
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(300))
+            .route("GET", PYPI_PREFIX, 200, PACKAGE_BODY);
+
+        let first = analyze_python(&mut cache, &http, NOW, &text, &mut Budget::new(2, None));
+        assert_eq!(http.count(PYPI_PREFIX), 2);
+        assert_eq!(first.pending, 298);
+        let outdated_count = first
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.status
+                    == Status::Outdated {
+                        latest: "2.0".to_owned(),
+                    }
+            })
+            .count();
+        let pending_count = first
+            .entries
+            .iter()
+            .filter(|entry| entry.status == Status::Pending)
+            .count();
+        assert_eq!(outdated_count, 2);
+        assert_eq!(pending_count, 298);
+        assert_eq!(http.count(BATCH_URL), 1);
+
+        let second = analyze_python(&mut cache, &http, NOW, &text, &mut Budget::new(2, None));
+        assert_eq!(http.count(PYPI_PREFIX), 4);
+        assert_eq!(http.count(BATCH_URL), 1);
+        assert_eq!(second.pending, 296);
+    }
+
+    #[test]
+    fn unlimited_budget_completes_every_registry_lookup() {
+        let text: String = (0..300).map(|index| format!("pkg{index}==1.0\n")).collect();
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(300))
+            .route("GET", PYPI_PREFIX, 200, PACKAGE_BODY);
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            &text,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(analysis.pending, 0);
+        assert_eq!(http.count(PYPI_PREFIX), 300);
     }
 }
