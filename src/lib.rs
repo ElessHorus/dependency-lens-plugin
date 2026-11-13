@@ -1,5 +1,6 @@
 //! Dependency Lens: an OpenIDEA plugin.
 
+pub mod cache;
 pub mod model;
 pub mod parsers;
 pub mod text;
