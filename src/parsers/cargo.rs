@@ -9,7 +9,8 @@ use taplo::dom::node::{Bool, DomNode, Key, Str};
 use taplo::rowan::{TextRange, TextSize};
 use taplo::syntax::SyntaxElement;
 
-use crate::model::{Dependency, Span};
+use super::spans::LineIndex;
+use crate::model::Dependency;
 
 /// Dependency tables that Cargo reads under the root or under a `[target.<cfg>]`, with a dev flag.
 const DEPENDENCY_SECTIONS: [(&str, bool); 3] = [
@@ -27,17 +28,17 @@ pub fn parse(text: &str) -> Vec<Dependency> {
     if !parsed.errors.is_empty() {
         return Vec::new();
     }
-    let line_ranges = line_ranges(text);
+    let index = LineIndex::new(text);
     let dom = parsed.into_dom();
     let mut dependencies = Vec::new();
 
-    collect_section_deps(&dom, &line_ranges, &mut dependencies);
+    collect_section_deps(&dom, &index, &mut dependencies);
 
     let target_node = dom.get("target");
     if let Some(target_table) = target_node.as_table() {
         let targets = target_table.entries().read();
         for (_, cfg_node) in targets.iter() {
-            collect_section_deps(cfg_node, &line_ranges, &mut dependencies);
+            collect_section_deps(cfg_node, &index, &mut dependencies);
         }
     }
 
@@ -45,35 +46,17 @@ pub fn parse(text: &str) -> Vec<Dependency> {
     collect_table_deps(
         &workspace_node.get("dependencies"),
         false,
-        &line_ranges,
+        &index,
         &mut dependencies,
     );
 
     dependencies
 }
 
-/// Returns the byte range of each line, excluding its `\n` or `\r\n` terminator.
-///
-/// Built once per parse so that every span lookup is a binary search.
-fn line_ranges(text: &str) -> Box<[TextRange]> {
-    let mut line_start: usize = 0;
-    text.split_inclusive('\n')
-        .map(|line| {
-            let content_len = line.trim_end_matches(['\r', '\n']).len();
-            let range = TextRange::at(
-                TextSize::from(line_start as u32),
-                TextSize::from(content_len as u32),
-            );
-            line_start += line.len();
-            range
-        })
-        .collect()
-}
-
 /// Parses every [`DEPENDENCY_SECTIONS`] table that sits directly under `container`.
-fn collect_section_deps(container: &Node, line_ranges: &[TextRange], out: &mut Vec<Dependency>) {
+fn collect_section_deps(container: &Node, index: &LineIndex<'_>, out: &mut Vec<Dependency>) {
     for (section_name, is_dev) in DEPENDENCY_SECTIONS {
-        collect_table_deps(&container.get(section_name), is_dev, line_ranges, out);
+        collect_table_deps(&container.get(section_name), is_dev, index, out);
     }
 }
 
@@ -81,7 +64,7 @@ fn collect_section_deps(container: &Node, line_ranges: &[TextRange], out: &mut V
 fn collect_table_deps(
     section: &Node,
     is_dev: bool,
-    line_ranges: &[TextRange],
+    index: &LineIndex<'_>,
     out: &mut Vec<Dependency>,
 ) {
     let Some(table) = section.as_table() else {
@@ -91,7 +74,7 @@ fn collect_table_deps(
     out.extend(
         entries
             .iter()
-            .filter_map(|(key, value)| parse_dependency(key, value, line_ranges, is_dev)),
+            .filter_map(|(key, value)| parse_dependency(key, value, index, is_dev)),
     );
 }
 
@@ -99,12 +82,12 @@ fn collect_table_deps(
 fn parse_dependency(
     key: &Key,
     node: &Node,
-    line_ranges: &[TextRange],
+    index: &LineIndex<'_>,
     is_dev: bool,
 ) -> Option<Dependency> {
     match node {
         // Simple form: `name = "1.0"`.
-        Node::Str(version) => build_dependency(key, None, version, false, line_ranges, is_dev),
+        Node::Str(version) => build_dependency(key, None, version, false, index, is_dev),
         // Inline table `name = { version = "1.0" }` or sub-table `[dependencies.name]`.
         Node::Table(table) => {
             // A path or git source has no registry version to check.
@@ -120,7 +103,7 @@ fn parse_dependency(
                 .as_ref()
                 .and_then(Node::as_bool)
                 .is_some_and(Bool::value);
-            build_dependency(key, package, version, optional, line_ranges, is_dev)
+            build_dependency(key, package, version, optional, index, is_dev)
         }
         _ => None,
     }
@@ -134,7 +117,7 @@ fn build_dependency(
     package: Option<&Str>,
     version: &Str,
     optional: bool,
-    line_ranges: &[TextRange],
+    index: &LineIndex<'_>,
     is_dev: bool,
 ) -> Option<Dependency> {
     let name_range = match package {
@@ -145,8 +128,14 @@ fn build_dependency(
     Some(Dependency {
         name: package.map_or_else(|| key.value(), Str::value).to_owned(),
         version: version.value().to_owned(),
-        name_span: find_span(line_ranges, name_range)?,
-        version_span: find_span(line_ranges, version_range)?,
+        name_span: index.span(
+            usize::from(name_range.start()),
+            usize::from(name_range.end()),
+        )?,
+        version_span: index.span(
+            usize::from(version_range.start()),
+            usize::from(version_range.end()),
+        )?,
         dev: is_dev,
         optional,
         has_additional_version_constraints: false,
@@ -176,25 +165,6 @@ fn strip_one_byte_each_side(range: TextRange) -> Option<TextRange> {
     let inner_start = range.start().checked_add(one)?;
     let inner_end = range.end().checked_sub(one)?;
     (inner_start <= inner_end).then(|| TextRange::new(inner_start, inner_end))
-}
-
-/// Finds the line that holds `needle` and returns its span.
-///
-/// Returns `None` when `needle` crosses a line break.
-fn find_span(line_ranges: &[TextRange], needle: TextRange) -> Option<Span> {
-    let line_index = line_ranges
-        .binary_search_by(|line_range| line_range.ordering(needle))
-        .ok()?;
-    let line_range = line_ranges[line_index];
-    if needle.start() < line_range.start() || needle.end() > line_range.end() {
-        return None;
-    }
-    let base = line_range.start();
-    Some(Span {
-        line: u32::try_from(line_index).ok()?,
-        line_start: (needle.start() - base).into(),
-        line_end: (needle.end() - base).into(),
-    })
 }
 
 #[cfg(test)]

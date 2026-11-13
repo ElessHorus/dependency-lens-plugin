@@ -4,13 +4,13 @@
 //! text, because the model passes only the text. Text that parses as TOML
 //! with a handled key is a TOML manifest. Anything else is a requirements file.
 
-use std::iter::once;
 use std::ops::Range;
 
 use taplo::dom::Node;
 use taplo::dom::node::{Bool, DomNode, Key, Str};
 use taplo::syntax::SyntaxElement;
 
+use super::spans::LineIndex;
 use crate::model::{Dependency, Span};
 
 /// PEP 440 operators that may start a version constraint.
@@ -68,33 +68,6 @@ fn parse_requirements(text: &str) -> Vec<Dependency> {
         .collect()
 }
 
-/// Source text with the byte offset of each line start, built once per TOML parse.
-struct Source<'a> {
-    text: &'a str,
-    line_starts: Vec<usize>,
-}
-
-impl<'a> Source<'a> {
-    fn new(text: &'a str) -> Self {
-        let line_starts = once(0)
-            .chain(text.match_indices('\n').map(|(index, _)| index + 1))
-            .collect();
-        Self { text, line_starts }
-    }
-
-    /// Returns the line and column of a byte offset, using a binary search over the line starts.
-    fn anchor(&self, offset: usize) -> Option<Anchor> {
-        let line_index = self
-            .line_starts
-            .partition_point(|&start| start <= offset)
-            .checked_sub(1)?;
-        Some(Anchor {
-            line: u32::try_from(line_index).ok()?,
-            column: offset - self.line_starts[line_index],
-        })
-    }
-}
-
 /// The 0-based line and the byte column where a text starts.
 ///
 /// Ranges that are relative to that text become spans with [`Anchor::span`].
@@ -105,6 +78,12 @@ struct Anchor {
 }
 
 impl Anchor {
+    /// Anchors the text that starts at `offset` of the indexed source.
+    fn at(index: &LineIndex<'_>, offset: usize) -> Option<Self> {
+        let (line, column) = index.locate(offset)?;
+        Some(Self { line, column })
+    }
+
     /// Converts a range relative to the anchored text into a span on its line.
     fn span(self, range: Range<usize>) -> Option<Span> {
         Some(Span {
@@ -246,25 +225,25 @@ fn dependency_from_pep508(
 
 /// Parses a TOML manifest: PEP 621, PEP 735, Poetry and Hatch environments.
 fn parse_toml(text: &str, dom: &Node) -> Vec<Dependency> {
-    let source = Source::new(text);
+    let index = LineIndex::new(text);
     let mut dependencies = Vec::new();
     let project = dom.get("project");
     collect_requirement_array(
-        &source,
+        &index,
         &project.get("dependencies"),
         false,
         false,
         &mut dependencies,
     );
     collect_requirement_tables(
-        &source,
+        &index,
         &project.get("optional-dependencies"),
         false,
         true,
         &mut dependencies,
     );
     collect_requirement_tables(
-        &source,
+        &index,
         &dom.get("dependency-groups"),
         true,
         false,
@@ -272,25 +251,25 @@ fn parse_toml(text: &str, dom: &Node) -> Vec<Dependency> {
     );
     let poetry = dom.get("tool").get("poetry");
     collect_poetry_table(
-        &source,
+        &index,
         &poetry.get("dependencies"),
         false,
         &mut dependencies,
     );
     collect_poetry_table(
-        &source,
+        &index,
         &poetry.get("dev-dependencies"),
         true,
         &mut dependencies,
     );
-    collect_poetry_groups(&source, &poetry.get("group"), &mut dependencies);
-    collect_hatch_envs(&source, &dom.get("envs"), &mut dependencies);
+    collect_poetry_groups(&index, &poetry.get("group"), &mut dependencies);
+    collect_hatch_envs(&index, &dom.get("envs"), &mut dependencies);
     dependencies
 }
 
 /// Appends the dependencies of a PEP 508 string array. Ignores other nodes.
 fn collect_requirement_array(
-    source: &Source<'_>,
+    index: &LineIndex<'_>,
     node: &Node,
     is_dev: bool,
     is_optional: bool,
@@ -304,10 +283,10 @@ fn collect_requirement_array(
         let Some(string) = item.as_str() else {
             continue;
         };
-        let Some((content_start, raw)) = raw_content(source, string.syntax()) else {
+        let Some((content_start, raw)) = raw_content(index, string.syntax()) else {
             continue;
         };
-        let Some(anchor) = source.anchor(content_start) else {
+        let Some(anchor) = Anchor::at(index, content_start) else {
             continue;
         };
         if let Some(dependency) =
@@ -320,7 +299,7 @@ fn collect_requirement_array(
 
 /// Appends the dependencies of every group array in a table of groups.
 fn collect_requirement_tables(
-    source: &Source<'_>,
+    index: &LineIndex<'_>,
     node: &Node,
     is_dev: bool,
     is_optional: bool,
@@ -331,14 +310,19 @@ fn collect_requirement_tables(
     };
     let entries = table.entries().read();
     for (_, group) in entries.iter() {
-        collect_requirement_array(source, group, is_dev, is_optional, out);
+        collect_requirement_array(index, group, is_dev, is_optional, out);
     }
 }
 
 /// Appends the dependencies of a Poetry dependency table. Every entry is dev when `is_dev` is set.
 ///
 /// The `python` key is the interpreter constraint, so it is skipped.
-fn collect_poetry_table(source: &Source<'_>, node: &Node, is_dev: bool, out: &mut Vec<Dependency>) {
+fn collect_poetry_table(
+    index: &LineIndex<'_>,
+    node: &Node,
+    is_dev: bool,
+    out: &mut Vec<Dependency>,
+) {
     let Some(table) = node.as_table() else {
         return;
     };
@@ -347,32 +331,32 @@ fn collect_poetry_table(source: &Source<'_>, node: &Node, is_dev: bool, out: &mu
         if key.value() == "python" {
             continue;
         }
-        if let Some(dependency) = poetry_dependency(source, key, value, is_dev) {
+        if let Some(dependency) = poetry_dependency(index, key, value, is_dev) {
             out.push(dependency);
         }
     }
 }
 
 /// Appends the dependencies of every `[tool.poetry.group.<name>]` table. All groups are dev.
-fn collect_poetry_groups(source: &Source<'_>, node: &Node, out: &mut Vec<Dependency>) {
+fn collect_poetry_groups(index: &LineIndex<'_>, node: &Node, out: &mut Vec<Dependency>) {
     let Some(groups) = node.as_table() else {
         return;
     };
     let entries = groups.entries().read();
     for (_, group) in entries.iter() {
-        collect_poetry_table(source, &group.get("dependencies"), true, out);
+        collect_poetry_table(index, &group.get("dependencies"), true, out);
     }
 }
 
 /// Appends the `dependencies` and `extra-dependencies` of every `[envs.<name>]` table. All are dev.
-fn collect_hatch_envs(source: &Source<'_>, node: &Node, out: &mut Vec<Dependency>) {
+fn collect_hatch_envs(index: &LineIndex<'_>, node: &Node, out: &mut Vec<Dependency>) {
     let Some(envs) = node.as_table() else {
         return;
     };
     let entries = envs.entries().read();
     for (_, env) in entries.iter() {
         for key in ["dependencies", "extra-dependencies"] {
-            collect_requirement_array(source, &env.get(key), true, false, out);
+            collect_requirement_array(index, &env.get(key), true, false, out);
         }
     }
 }
@@ -381,13 +365,13 @@ fn collect_hatch_envs(source: &Source<'_>, node: &Node, out: &mut Vec<Dependency
 ///
 /// Entries with a `path`, `git` or `url` source have no registry version and yield `None`.
 fn poetry_dependency(
-    source: &Source<'_>,
+    index: &LineIndex<'_>,
     key: &Key,
     value: &Node,
     is_dev: bool,
 ) -> Option<Dependency> {
     match value {
-        Node::Str(version) => build_poetry_dependency(source, key, version, false, is_dev),
+        Node::Str(version) => build_poetry_dependency(index, key, version, false, is_dev),
         Node::Table(table) => {
             if POETRY_SOURCE_KEYS
                 .iter()
@@ -402,7 +386,7 @@ fn poetry_dependency(
                 .as_ref()
                 .and_then(Node::as_bool)
                 .is_some_and(Bool::value);
-            build_poetry_dependency(source, key, version, is_optional, is_dev)
+            build_poetry_dependency(index, key, version, is_optional, is_dev)
         }
         _ => None,
     }
@@ -410,16 +394,16 @@ fn poetry_dependency(
 
 /// Builds a Poetry dependency. Its name span is the key, and its version span is the whole string content.
 fn build_poetry_dependency(
-    source: &Source<'_>,
+    index: &LineIndex<'_>,
     key: &Key,
     version: &Str,
     is_optional: bool,
     is_dev: bool,
 ) -> Option<Dependency> {
     let name = key.value();
-    let name_anchor = exact_anchor(source, key.syntax(), name)?;
+    let name_anchor = exact_anchor(index, key.syntax(), name)?;
     let version_text = version.value();
-    let version_anchor = exact_anchor(source, version.syntax(), version_text)?;
+    let version_anchor = exact_anchor(index, version.syntax(), version_text)?;
     Some(Dependency {
         name: name.to_owned(),
         version: version_text.to_owned(),
@@ -435,27 +419,27 @@ fn build_poetry_dependency(
 ///
 /// Escaped text has a different raw form, so its offsets would not map onto the source.
 fn exact_anchor(
-    source: &Source<'_>,
+    index: &LineIndex<'_>,
     element: Option<&SyntaxElement>,
     value: &str,
 ) -> Option<Anchor> {
-    let (content_start, raw) = raw_content(source, element)?;
+    let (content_start, raw) = raw_content(index, element)?;
     if raw != value {
         return None;
     }
-    source.anchor(content_start)
+    Anchor::at(index, content_start)
 }
 
 /// Returns the start offset and raw text of a single-line TOML string or key, without its quotes.
 ///
 /// The raw text keeps escapes, so it can differ from the decoded value.
 fn raw_content<'a>(
-    source: &Source<'a>,
+    index: &LineIndex<'a>,
     element: Option<&SyntaxElement>,
 ) -> Option<(usize, &'a str)> {
     let range = element?.text_range();
     let (start, end) = (usize::from(range.start()), usize::from(range.end()));
-    let raw = source.text.get(start..end)?;
+    let raw = index.text().get(start..end)?;
     if raw.contains('\n') {
         return None;
     }
@@ -468,7 +452,7 @@ fn raw_content<'a>(
     } else {
         (start, end)
     };
-    Some((content_start, source.text.get(content_start..content_end)?))
+    Some((content_start, index.text().get(content_start..content_end)?))
 }
 
 #[cfg(test)]
