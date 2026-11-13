@@ -64,7 +64,7 @@ impl UpdateVersion for DottedVersion {
 pub fn update_kind(eco: Ecosystem, current: &str, latest: &str) -> Option<UpdateKind> {
     match eco {
         Ecosystem::PyPI => update_kind_of::<Pep440>(current, latest),
-        Ecosystem::Packagist => update_kind_of::<DottedVersion>(current, latest),
+        Ecosystem::Packagist | Ecosystem::Pub => update_kind_of::<DottedVersion>(current, latest),
         _ => None,
     }
 }
@@ -73,7 +73,7 @@ pub fn update_kind(eco: Ecosystem, current: &str, latest: &str) -> Option<Update
 pub fn is_outdated(eco: Ecosystem, declared: &str, latest: &str) -> bool {
     match eco {
         Ecosystem::PyPI => is_outdated_of::<Pep440>(declared, latest),
-        Ecosystem::Packagist => is_outdated_of::<DottedVersion>(declared, latest),
+        Ecosystem::Packagist | Ecosystem::Pub => is_outdated_of::<DottedVersion>(declared, latest),
         _ => false,
     }
 }
@@ -82,7 +82,7 @@ pub fn is_outdated(eco: Ecosystem, declared: &str, latest: &str) -> bool {
 pub fn render_update(eco: Ecosystem, dep: &Dependency, latest: &str) -> Option<String> {
     match eco {
         Ecosystem::PyPI => pep440_render_update(dep, latest),
-        Ecosystem::Packagist => dotted_render_update(dep, latest),
+        Ecosystem::Packagist | Ecosystem::Pub => dotted_render_update(dep, latest),
         _ => None,
     }
 }
@@ -142,8 +142,9 @@ fn pep440_render_update(dep: &Dependency, latest: &str) -> Option<String> {
     Some(format!("{operator}{latest}"))
 }
 
-/// Rewrites a Composer requirement to `latest`. It keeps the operator and writes as many
-/// release segments as the declared text has, so `^8.1` takes `8.2` from `8.2.3`.
+/// Rewrites a Composer or pub.dev requirement to `latest`. It keeps the operator and
+/// writes as many release segments as the declared text has, so `^8.1` takes `8.2`
+/// from `8.2.3`.
 fn dotted_render_update(dep: &Dependency, latest: &str) -> Option<String> {
     if dep.version.is_empty()
         || dep.version.contains(char::is_whitespace)
@@ -323,6 +324,54 @@ mod tests {
         assert_eq!(render(">=1.2 <2.0", "3.0.0"), None);
         assert_eq!(render("", "3.0.0"), None);
         assert_eq!(render("^3.0", "4.0.0-RC1"), None);
+    }
+
+    /// Parses a `pubspec.yaml` with one `http` entry and returns that dependency.
+    fn pubspec_dependency(requirement: &str) -> Dependency {
+        let text = format!("dependencies:\n  http: {requirement}\n");
+        parsers::dart::parse(&text)
+            .into_iter()
+            .next()
+            .expect("one dependency")
+    }
+
+    #[test]
+    fn pub_is_outdated_compares_the_declared_lower_bound() {
+        assert!(is_outdated(Ecosystem::Pub, "^1.0.0", "1.2.0"));
+        assert!(!is_outdated(Ecosystem::Pub, "^1.2.0", "1.2.0"));
+        assert!(!is_outdated(Ecosystem::Pub, "any", "2.0.0"));
+        // The first lower bound decides; range-awareness is deferred.
+        assert!(is_outdated(Ecosystem::Pub, ">=1.0.0 <2.0.0", "3.0.0"));
+        assert!(!is_outdated(Ecosystem::Pub, "^1.0.0", "2.0.0-dev.1"));
+    }
+
+    #[test]
+    fn pub_update_kind_names_the_first_changed_segment() {
+        assert_eq!(
+            update_kind(Ecosystem::Pub, "1.0.0", "2.0.0"),
+            Some(UpdateKind::Major)
+        );
+        assert_eq!(
+            update_kind(Ecosystem::Pub, "1.0.0", "1.2.0"),
+            Some(UpdateKind::Minor)
+        );
+        assert_eq!(
+            update_kind(Ecosystem::Pub, "1.2.0", "1.2.3"),
+            Some(UpdateKind::Patch)
+        );
+    }
+
+    #[test]
+    fn pub_render_keeps_the_operator_and_the_declared_precision() {
+        let render = |requirement: &str, latest: &str| {
+            render_update(Ecosystem::Pub, &pubspec_dependency(requirement), latest)
+        };
+        assert_eq!(render("^1.0.0", "1.2.0").as_deref(), Some("^1.2.0"));
+        assert_eq!(render("^1.0", "1.2.3").as_deref(), Some("^1.2"));
+        assert_eq!(render("^1.2.0", "1.2.0"), None);
+        assert_eq!(render("any", "1.2.0"), None);
+        assert_eq!(render(">=1.0.0 <2.0.0", "3.0.0"), None);
+        assert_eq!(render("^1.0.0", "2.0.0-dev.1"), None);
     }
 
     #[test]

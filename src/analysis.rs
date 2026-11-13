@@ -717,6 +717,90 @@ mod tests {
         ));
     }
 
+    const PUB_HTTP_URL: &str = "https://pub.dev/api/packages/http";
+    const PUB_CURRENT_URL: &str = "https://pub.dev/api/packages/current";
+    const PUB_INTL_PREFIX: &str = "https://pub.dev/api/packages/intl";
+    const PUB_HTTP_BODY: &str = r#"{"name":"http","latest":{"version":"1.2.0"},"versions":[{"version":"1.0.0"},{"version":"1.2.0"}]}"#;
+    const PUB_CURRENT_BODY: &str =
+        r#"{"name":"current","latest":{"version":"1.2.0"},"versions":[{"version":"1.2.0"}]}"#;
+
+    /// Parses a `pubspec.yaml` text and runs `analyze` for Pub.
+    fn analyze_pubspec(
+        cache: &mut Cache,
+        http: &dyn Http,
+        text: &str,
+        budget: &mut Budget,
+    ) -> Analysis {
+        analyze(
+            Ecosystem::Pub,
+            parsers::dart::parse(text),
+            cache,
+            http,
+            &Settings::default(),
+            NOW,
+            budget,
+        )
+    }
+
+    #[test]
+    fn pub_requirements_are_outdated_or_up_to_date_from_the_registry() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("GET", PUB_HTTP_URL, 200, PUB_HTTP_BODY)
+            .route("GET", PUB_CURRENT_URL, 200, PUB_CURRENT_BODY);
+        let analysis = analyze_pubspec(
+            &mut cache,
+            &http,
+            "dependencies:\n  http: ^1.0.0\n  current: ^1.2.0\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(analysis.pending, 0);
+        assert_eq!(
+            entry(&analysis, "http").status,
+            Status::Outdated {
+                latest: "1.2.0".to_owned()
+            }
+        );
+        assert_eq!(entry(&analysis, "current").status, Status::UpToDate);
+    }
+
+    #[test]
+    fn pub_http_404_is_reported_as_unknown() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", PUB_HTTP_URL, 404, "");
+        let analysis = analyze_pubspec(
+            &mut cache,
+            &http,
+            "dependencies:\n  http: ^1.0.0\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(
+            entry(&analysis, "http").status,
+            Status::Unknown("registry: HTTP 404".to_owned())
+        );
+    }
+
+    #[test]
+    fn pub_any_requirement_is_not_checked_and_makes_no_registry_request() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", PUB_HTTP_URL, 200, PUB_HTTP_BODY);
+        let analysis = analyze_pubspec(
+            &mut cache,
+            &http,
+            "dependencies:\n  http: ^1.0.0\n  intl: any\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        let intl = entry(&analysis, "intl");
+        assert_eq!(intl.status, Status::NotChecked);
+        assert_eq!(intl.checked_version, None);
+        assert_eq!(http.count(PUB_INTL_PREFIX), 0);
+    }
+
     const PYPI_PREFIX: &str = "https://pypi.org/pypi/";
     const REQUESTS_URL: &str = "https://pypi.org/pypi/requests/json";
     const FLASK_URL: &str = "https://pypi.org/pypi/flask/json";

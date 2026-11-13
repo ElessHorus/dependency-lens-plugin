@@ -1,0 +1,38 @@
+name: demo
+description: A demo app used by the parser tests.
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.0.0
+  provider: '^6.1.0'  # state
+  intl: any
+  local_pkg:
+    path: ../local_pkg
+  git_pkg:
+    git:
+      url: https://github.com/x/y.git
+  hosted_pkg:
+    hosted:
+      name: hosted_pkg
+      url: https://pub.example.com
+    version: ^2.3.4
+
+  # A comment and a blank line inside the block.
+
+  old: ">=1.0.0 <2.0.0"
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  lints: ^3.0.0
+
+dependency_overrides:
+  http: 0.13.0
+
+flutter:
+  uses-material-design: true

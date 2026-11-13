@@ -403,30 +403,45 @@ const COMPOSER: &str = "{\n    \"require\": {\n        \"monolog/monolog\": \"^3
 const MONOLOG_VERSION_RANGE: Range = Range::new(Position::new(2, 28), Position::new(2, 32));
 const PACKAGIST_PAGE_BODY: &str = r#"{"minified":"composer/2.0","packages":{"monolog/monolog":[{"version":"3.12.1"},{"version":"3.0.0"}]}}"#;
 
-/// Answers Packagist p2 pages with one package, and everything else as OSV does.
-/// Every request increments `fetches`.
-fn host_with_packagist(fetches: Rc<Cell<u32>>) -> MockHost {
+/// Answers requests under `registry_prefix` with `registry_body`, and everything else as OSV does.
+/// Every request increments `fetches`. `registry_capability` is the `net:` grant of the registry host.
+fn host_with_registry(
+    fetches: Rc<Cell<u32>>,
+    registry_capability: &'static str,
+    registry_prefix: &'static str,
+    registry_body: &'static str,
+) -> MockHost {
     let host = MockHost::install().with_capabilities(&[
         "events",
         "project.read",
         "editor.read",
         "net:api.osv.dev",
-        "net:repo.packagist.org",
+        registry_capability,
     ]);
     host.set_project_root(Some("/p"));
     host.on_fetch(move |request| {
         fetches.set(fetches.get() + 1);
-        if request.url.starts_with("https://repo.packagist.org/p2/") {
+        if request.url.starts_with(registry_prefix) {
             Ok(HttpResponse {
                 status: 200,
                 headers: Vec::new(),
-                body: PACKAGIST_PAGE_BODY.as_bytes().to_vec(),
+                body: registry_body.as_bytes().to_vec(),
             })
         } else {
             answer_osv(request)
         }
     });
     host
+}
+
+/// A mock that answers Packagist p2 pages and OSV, counting every request.
+fn host_with_packagist(fetches: Rc<Cell<u32>>) -> MockHost {
+    host_with_registry(
+        fetches,
+        "net:repo.packagist.org",
+        "https://repo.packagist.org/p2/",
+        PACKAGIST_PAGE_BODY,
+    )
 }
 
 #[test]
@@ -479,5 +494,73 @@ fn composer_quick_fix_rewrites_the_range_and_is_served_from_the_cache() {
     assert_eq!(edit_path, COMPOSER_PATH);
     assert_eq!(edits[0].range, MONOLOG_VERSION_RANGE);
     assert_eq!(edits[0].text, "^3.12");
+    assert_eq!(fetches.get(), fetches_after_refresh);
+}
+
+const PUBSPEC_PATH: &str = "/p/pubspec.yaml";
+const PUBSPEC: &str = "name: demo\ndependencies:\n  http: ^1.0.0\n";
+/// `  http: ^1.0.0` sits on line 2; its version text is columns 8..14.
+const HTTP_VERSION_RANGE: Range = Range::new(Position::new(2, 8), Position::new(2, 14));
+const PUB_HTTP_BODY: &str = r#"{"name":"http","latest":{"version":"1.2.0"},"versions":[{"version":"1.0.0"},{"version":"1.2.0"}]}"#;
+
+/// A mock that answers pub.dev package pages and OSV, counting every request.
+fn host_with_pub(fetches: Rc<Cell<u32>>) -> MockHost {
+    host_with_registry(
+        fetches,
+        "net:pub.dev",
+        "https://pub.dev/api/packages/",
+        PUB_HTTP_BODY,
+    )
+}
+
+#[test]
+fn pubspec_requirement_shows_the_registry_version() {
+    let host = host_with_pub(Rc::new(Cell::new(0)));
+    host.add_file("pubspec.yaml", PUBSPEC);
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(PUBSPEC_PATH.to_owned())],
+        &host.invocation(),
+    );
+
+    let decorations = decorations_of(&host, PUBSPEC_PATH);
+    let http = decorations
+        .iter()
+        .find(|decoration| decoration.range == HTTP_VERSION_RANGE)
+        .expect("decoration on http");
+    assert_eq!(http.after, Some("→ 1.2.0".to_string()));
+    assert_eq!(http.style, "info");
+    assert!(diagnostics_of(&host, PUBSPEC_PATH).is_empty());
+}
+
+#[test]
+fn pubspec_quick_fix_rewrites_the_range() {
+    let fetches = Rc::new(Cell::new(0));
+    let host = host_with_pub(fetches.clone());
+    host.add_file("pubspec.yaml", PUBSPEC);
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(PUBSPEC_PATH.to_owned())],
+        &host.invocation(),
+    );
+    let fetches_after_refresh = fetches.get();
+
+    let document = Document {
+        path: PUBSPEC_PATH.to_owned(),
+        language: "yaml".to_owned(),
+        version: 1,
+        text: PUBSPEC.to_owned(),
+    };
+    let actions = Providers::code_actions(
+        &mut plugin,
+        &document,
+        Range::new(Position::new(2, 3), Position::new(2, 3)),
+    );
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].title, "Update http to 1.2.0 (minor)");
+    let (edit_path, edits) = &actions[0].edits[0];
+    assert_eq!(edit_path, PUBSPEC_PATH);
+    assert_eq!(edits[0].range, HTTP_VERSION_RANGE);
+    assert_eq!(edits[0].text, "^1.2.0");
     assert_eq!(fetches.get(), fetches_after_refresh);
 }

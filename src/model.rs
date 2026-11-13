@@ -90,7 +90,7 @@ impl Ecosystem {
             Ecosystem::PyPI => parsers::python::parse(text),
             Ecosystem::Go => parsers::go::parse(text),
             Ecosystem::Packagist => parsers::php::parse(text),
-            Ecosystem::Pub => Vec::new(),
+            Ecosystem::Pub => parsers::dart::parse(text),
             Ecosystem::NuGet => Vec::new(),
             Ecosystem::RubyGems => Vec::new(),
             Ecosystem::Maven => parsers::maven::parse(text),
@@ -273,7 +273,15 @@ mod tests {
     fn parse_dispatches_cargo_and_returns_empty_for_unported_ecosystems() {
         let manifest = "[dependencies]\nserde = \"1.0\"\n";
         assert_eq!(Ecosystem::Cargo.parse(manifest).len(), 1);
-        assert!(Ecosystem::Pub.parse(manifest).is_empty());
+        assert!(Ecosystem::NuGet.parse(manifest).is_empty());
+    }
+
+    #[test]
+    fn parse_dispatches_pub_to_the_dart_parser() {
+        let manifest = include_str!("../tests/fixtures/dart/pubspec.yaml");
+        let dependencies = Ecosystem::Pub.parse(manifest);
+        assert_eq!(dependencies.len(), 6);
+        assert_eq!(dependencies, parsers::dart::parse(manifest));
     }
 
     #[test]
@@ -325,6 +333,7 @@ mod byte_order_mark_tests {
     const PYPI: &str = include_str!("../tests/fixtures/python/requirements.txt");
     const GO: &str = include_str!("../tests/fixtures/go/go.mod");
     const MAVEN: &str = include_str!("../tests/fixtures/maven/pom.xml");
+    const PUBSPEC: &str = include_str!("../tests/fixtures/dart/pubspec.yaml");
 
     /// Returns the fields that a byte order mark must not change.
     fn summary(dependencies: &[Dependency]) -> Vec<(&str, &str, bool, bool, bool)> {
@@ -371,6 +380,7 @@ mod byte_order_mark_tests {
         assert_byte_order_mark_is_transparent(Ecosystem::PyPI, PYPI);
         assert_byte_order_mark_is_transparent(Ecosystem::Go, GO);
         assert_byte_order_mark_is_transparent(Ecosystem::Maven, MAVEN);
+        assert_byte_order_mark_is_transparent(Ecosystem::Pub, PUBSPEC);
     }
 
     #[test]

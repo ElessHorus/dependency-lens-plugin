@@ -3,6 +3,7 @@
 pub mod dotted;
 pub mod packagist;
 pub mod pep440;
+pub mod pub_dev;
 pub mod pypi;
 
 use crate::model::{Ecosystem, VersionInfo};
@@ -34,6 +35,7 @@ impl Ecosystem {
         match self {
             Ecosystem::PyPI => Some(pypi::request(package)),
             Ecosystem::Packagist => Some(packagist::request(package)),
+            Ecosystem::Pub => Some(pub_dev::request(package)),
             _ => None,
         }
     }
@@ -43,6 +45,7 @@ impl Ecosystem {
         match self {
             Ecosystem::PyPI => pypi::parse(body),
             Ecosystem::Packagist => packagist::parse(body),
+            Ecosystem::Pub => pub_dev::parse(body),
             _ => Err("no registry for this ecosystem".to_string()),
         }
     }
@@ -111,6 +114,25 @@ mod tests {
         assert_eq!(
             Ecosystem::Packagist.parse_registry(fixture),
             packagist::parse(fixture)
+        );
+    }
+
+    #[test]
+    fn pub_has_a_registry_and_keeps_package_names() {
+        let fixture = include_str!("../../tests/fixtures/dart/registry.json");
+        assert_eq!(
+            Ecosystem::Pub.parse_registry(fixture),
+            pub_dev::parse(fixture)
+        );
+        assert!(matches!(
+            Ecosystem::Pub.normalize_package("http"),
+            Cow::Borrowed("http")
+        ));
+        assert_eq!(
+            Ecosystem::Pub
+                .registry_request("http")
+                .map(|request| request.url),
+            Some("https://pub.dev/api/packages/http".to_owned())
         );
     }
 
