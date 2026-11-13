@@ -16,6 +16,9 @@ use crate::model::{Dependency, Span};
 /// PEP 440 operators that may start a version constraint.
 const OPERATORS: [&str; 8] = ["===", "==", ">=", "<=", "!=", "~=", ">", "<"];
 
+/// Operators whose version is the declared version of a requirement. `!=`, `<` and `<=` never pin a version.
+const PIN_OPERATORS: [&str; 5] = ["===", "==", "~=", ">=", ">"];
+
 /// Source names that a Poetry dependency table can use instead of a registry version.
 const POETRY_SOURCE_KEYS: [&str; 3] = ["path", "git", "url"];
 
@@ -115,15 +118,23 @@ impl Anchor {
 /// Byte ranges of a PEP 508 requirement, relative to the parsed text.
 struct Pep508 {
     name: Range<usize>,
+    /// Version of the first pin constraint.
     version: Range<usize>,
-    /// Whether a comma follows the first constraint, so more constraints exist.
+    /// Whether the requirement has more than one constraint.
     has_additional_version_constraints: bool,
 }
 
-/// Reads the name and the first constraint of a PEP 508 requirement.
+/// One `operator version` pair of a requirement.
+struct Constraint<'a> {
+    operator: &'a str,
+    version: Range<usize>,
+}
+
+/// Reads the name and the declared version of a PEP 508 requirement.
 ///
-/// Extras, markers and comments are skipped, not validated. Returns `None` when
-/// the text has no name, no known operator or no version. This also rejects
+/// The declared version is the version of the first pin constraint. Exclusions
+/// and upper bounds never pin one, so a requirement without a pin returns `None`.
+/// Extras, markers and comments are skipped, not validated. This also rejects
 /// URL, path and option lines.
 fn parse_pep508(input: &str) -> Option<Pep508> {
     let bytes = input.as_bytes();
@@ -139,10 +150,36 @@ fn parse_pep508(input: &str) -> Option<Pep508> {
             byte.is_ascii_whitespace()
         });
     }
-    let operator_end = scan_while(bytes, cursor, is_operator_byte);
-    if !OPERATORS.contains(&input.get(cursor..operator_end)?) {
-        return None;
+    let mut constraints = Vec::new();
+    let mut next_from = Some(cursor);
+    // A malformed constraint after the first ends the list. The ones read so far still count.
+    while let Some(from) = next_from {
+        let Some((constraint, next)) = parse_constraint(input, from) else {
+            break;
+        };
+        constraints.push(constraint);
+        next_from = next;
     }
+    let pin = constraints
+        .iter()
+        .find(|constraint| PIN_OPERATORS.contains(&constraint.operator))?;
+    Some(Pep508 {
+        name: name_start..name_end,
+        version: pin.version.clone(),
+        has_additional_version_constraints: constraints.len() > 1,
+    })
+}
+
+/// Reads one `operator version` pair that starts at `from`.
+///
+/// Returns the pair and the offset of the next pair after a comma, if one follows.
+fn parse_constraint(input: &str, from: usize) -> Option<(Constraint<'_>, Option<usize>)> {
+    let bytes = input.as_bytes();
+    let operator_start = scan_while(bytes, from, |byte| byte.is_ascii_whitespace());
+    let operator_end = scan_while(bytes, operator_start, is_operator_byte);
+    let operator = input
+        .get(operator_start..operator_end)
+        .filter(|operator| OPERATORS.contains(operator))?;
     let version_start = scan_while(bytes, operator_end, |byte| byte.is_ascii_whitespace());
     // A version stops at a space, a constraint or marker separator, a comment or a line continuation.
     let version_end = scan_while(bytes, version_start, |byte| !ends_version(byte));
@@ -150,11 +187,14 @@ fn parse_pep508(input: &str) -> Option<Pep508> {
         return None;
     }
     let after_version = scan_while(bytes, version_end, |byte| byte.is_ascii_whitespace());
-    Some(Pep508 {
-        name: name_start..name_end,
-        version: version_start..version_end,
-        has_additional_version_constraints: bytes.get(after_version) == Some(&b','),
-    })
+    let next = (bytes.get(after_version) == Some(&b',')).then_some(after_version + 1);
+    Some((
+        Constraint {
+            operator,
+            version: version_start..version_end,
+        },
+        next,
+    ))
 }
 
 /// Returns the index of the first byte from `from` that fails `keep`, or the length of `bytes`.
@@ -668,6 +708,74 @@ mod tests {
         assert!(pytest.dev);
         assert_eq!(find(&dependencies, "ruff").version, "0.4.1");
         assert_eq!(find(&dependencies, "mypy").version, "1.5");
+    }
+
+    /// Returns `(name, version, has_additional_version_constraints)` of each dependency.
+    fn summary(text: &str) -> Vec<(String, String, bool)> {
+        parse(text)
+            .into_iter()
+            .map(|dependency| {
+                (
+                    dependency.name,
+                    dependency.version,
+                    dependency.has_additional_version_constraints,
+                )
+            })
+            .collect()
+    }
+
+    fn one(name: &str, version: &str, has_additional: bool) -> Vec<(String, String, bool)> {
+        vec![(name.to_owned(), version.to_owned(), has_additional)]
+    }
+
+    #[test]
+    fn exclusion_and_upper_bound_alone_are_not_pins() {
+        for line in ["foo!=1.0\n", "flask<3\n", "bar<=2,!=1.5\n"] {
+            assert!(summary(line).is_empty(), "{line:?} must not be returned");
+        }
+    }
+
+    #[test]
+    fn exclusion_before_a_pin_is_not_the_version() {
+        assert_eq!(summary("foo!=1.5,>=1.0\n"), one("foo", "1.0", true));
+        assert_eq!(
+            summary("urllib3!=1.25.0,>=1.21\n"),
+            one("urllib3", "1.21", true)
+        );
+    }
+
+    #[test]
+    fn exclusion_after_a_pin_keeps_the_pin() {
+        assert_eq!(summary("foo>=1.0,!=1.5\n"), one("foo", "1.0", true));
+    }
+
+    #[test]
+    fn upper_bound_before_a_pin_is_not_the_version() {
+        assert_eq!(summary("flask<3,>=2\n"), one("flask", "2", true));
+    }
+
+    #[test]
+    fn single_pin_has_no_additional_constraints() {
+        assert_eq!(summary("baz>2.0\n"), one("baz", "2.0", false));
+    }
+
+    #[test]
+    fn pin_span_points_at_the_pinned_version() {
+        let text = "urllib3!=1.25.0,>=1.21\n";
+        let dependencies = parse(text);
+        let urllib3 = find(&dependencies, "urllib3");
+        assert_eq!(version_text(text, urllib3).as_deref(), Some("1.21"));
+    }
+
+    #[test]
+    fn pyproject_uses_the_same_pin_rule() {
+        let text = "[project]\ndependencies = [\"urllib3!=1.25.0,>=1.21\", \"foo!=1.0\"]\n";
+        let dependencies = parse(text);
+        assert_eq!(summary(text), one("urllib3", "1.21", true));
+        assert_eq!(
+            version_text(text, find(&dependencies, "urllib3")).as_deref(),
+            Some("1.21")
+        );
     }
 
     #[test]
