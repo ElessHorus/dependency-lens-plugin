@@ -1,0 +1,93 @@
+{
+  "info": {
+    "version": "2.34.2"
+  },
+  "releases": {
+    "2.34.2": [
+      {
+        "yanked": false
+      },
+      {
+        "yanked": false
+      }
+    ],
+    "2.34.1": [
+      {
+        "yanked": false
+      },
+      {
+        "yanked": false
+      }
+    ],
+    "2.34.0": [
+      {
+        "yanked": false
+      },
+      {
+        "yanked": false
+      }
+    ],
+    "2.34.0.dev1": [
+      {
+        "yanked": false
+      },
+      {
+        "yanked": false
+      }
+    ],
+    "2.33.1": [
+      {
+        "yanked": false
+      },
+      {
+        "yanked": false
+      }
+    ],
+    "2.32.2": [
+      {
+        "yanked": false
+      },
+      {
+        "yanked": false
+      }
+    ],
+    "2.32.1": [
+      {
+        "yanked": true
+      },
+      {
+        "yanked": true
+      }
+    ],
+    "2.32.0": [
+      {
+        "yanked": true
+      },
+      {
+        "yanked": true
+      }
+    ],
+    "2.31.0": [
+      {
+        "yanked": false
+      },
+      {
+        "yanked": false
+      }
+    ],
+    "2.9.2": [
+      {
+        "yanked": false
+      },
+      {
+        "yanked": false
+      }
+    ],
+    "0.0.1": [],
+    "2.31.0.final": [
+      {
+        "yanked": false
+      }
+    ]
+  }
+}

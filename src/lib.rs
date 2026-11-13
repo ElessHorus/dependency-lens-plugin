@@ -7,6 +7,7 @@ pub mod model;
 pub mod osv;
 pub mod parsers;
 pub mod publish;
+pub mod registries;
 pub mod settings;
 pub mod text;
 
