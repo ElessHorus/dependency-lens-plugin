@@ -1,0 +1,11 @@
+Dependency Lens
+
+This project adapts code from the following open-source project:
+
+zed-depsy
+  Repository: https://github.com/mpiton/zed-depsy
+  License: MIT
+  Copyright (c) 2025 Mathieu
+
+The adapted code keeps the MIT license terms of zed-depsy. The full MIT
+license text is in the LICENSE file of this project.

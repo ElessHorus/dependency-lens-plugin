@@ -1,0 +1,26 @@
+id = "local.dependency-lens"
+name = "Dependency Lens"
+version = "0.1.0"
+description = "Adds two sample commands."
+authors = []
+# Marketplace categories (up to 3): languages, themes, icon-themes, linters,
+# vcs, ai, frameworks, tools, other.
+categories = ["tools"]
+engines.openidea = "^1.0"
+# Built by `openidea-plugin build`. The code is loaded the first time one of
+# its commands runs; the commands below show in Find Action before that.
+wasm = "dist/plugin.wasm"
+
+# What the code may do. The user approves these when installing.
+[capabilities]
+required = ["editor.read"]
+
+[[contributes.commands]]
+id = "say-hello"
+title = "Dependency Lens: Say Hello"
+category = "Dependency Lens"
+
+[[contributes.commands]]
+id = "line-count"
+title = "Dependency Lens: Line Count of Active File"
+category = "Dependency Lens"
