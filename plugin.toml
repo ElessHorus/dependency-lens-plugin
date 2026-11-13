@@ -26,6 +26,10 @@ id = "refresh"
 title = "Dependency Lens: Refresh"
 category = "Dependency Lens"
 
+[[contributes.providers]]
+kinds = ["code-actions"]
+languages = ["*"]
+
 [contributes.settings]
 title = "Dependency Lens"
 schema = "settings.schema.json"

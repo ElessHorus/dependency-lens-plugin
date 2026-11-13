@@ -1,5 +1,6 @@
 //! Dependency Lens: an OpenIDEA plugin.
 
+pub mod actions;
 pub mod analysis;
 pub mod cache;
 pub mod http;
@@ -17,9 +18,10 @@ use crate::cache::Cache;
 use crate::http::HostHttp;
 use crate::model::Ecosystem;
 use crate::settings::Settings;
+use openidea_plugin::providers::{CodeAction, Document, Providers};
 use openidea_plugin::{
-    Context, Decoration, Diagnostic, Error, Event, EventKind, Invocation, LogLevel, Plugin, host,
-    register_plugin,
+    Context, Decoration, Diagnostic, Error, Event, EventKind, Invocation, LogLevel, Plugin, Range,
+    host, register_plugin,
 };
 use std::collections::HashSet;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -69,17 +71,13 @@ impl DependencyLens {
         let deps = eco.parse(&text);
         let task = host::begin_task(TASK_TITLE, true);
         let mut budget = Budget::new(usize::MAX, Some(Instant::now() + LOOKUP_DEADLINE));
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_secs())
-            .unwrap_or_default();
         let analysis = analyze(
             eco,
             deps,
             &mut self.cache,
             &HostHttp,
             &self.settings,
-            now,
+            now_secs(),
             &mut budget,
         );
         if task.is_cancelled() {
@@ -112,8 +110,16 @@ fn log_failure(path: &str, what: &str, result: Result<(), Error>) {
     }
 }
 
+/// Seconds since the UNIX epoch; zero when the clock is before it.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
 /// Whether `path` is a manifest the plugin analyzes, outside dependency and build folders.
-fn is_manifest(path: &str) -> bool {
+pub(crate) fn is_manifest(path: &str) -> bool {
     Ecosystem::detect(path).is_some()
         && !path
             .split(['/', '\\'])
@@ -182,4 +188,17 @@ impl Plugin for DependencyLens {
     }
 }
 
-register_plugin!(DependencyLens);
+impl Providers for DependencyLens {
+    fn code_actions(&mut self, doc: &Document, selection: Range) -> Vec<CodeAction> {
+        actions::code_actions(
+            &self.cache,
+            &self.settings,
+            &doc.path,
+            &doc.text,
+            selection,
+            now_secs(),
+        )
+    }
+}
+
+register_plugin!(DependencyLens, providers);

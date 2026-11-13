@@ -3,6 +3,7 @@
 use dependency_lens::DependencyLens;
 use dependency_lens::publish::DECORATION_SET;
 use openidea_plugin::mock::MockHost;
+use openidea_plugin::providers::{Document, Providers};
 use openidea_plugin::{
     Context, Decoration, Diagnostic, Error, Event, EventKind, FilesChanged, HttpRequest,
     HttpResponse, Plugin, Position, Range, Severity,
@@ -316,7 +317,8 @@ const PYPI_PAGE_BODY: &str =
     r#"{"info":{"version":"2.31.0"},"releases":{"2.31.0":[{"yanked":false}]}}"#;
 
 /// Answers PyPI project pages with one release, and everything else as OSV does.
-fn host_with_pypi() -> MockHost {
+/// Every request increments `fetches`.
+fn host_with_pypi(fetches: Rc<Cell<u32>>) -> MockHost {
     let host = MockHost::install().with_capabilities(&[
         "events",
         "project.read",
@@ -325,7 +327,8 @@ fn host_with_pypi() -> MockHost {
         "net:pypi.org",
     ]);
     host.set_project_root(Some("/p"));
-    host.on_fetch(|request| {
+    host.on_fetch(move |request| {
+        fetches.set(fetches.get() + 1);
         if request.url.starts_with("https://pypi.org/pypi/") {
             Ok(HttpResponse {
                 status: 200,
@@ -341,7 +344,7 @@ fn host_with_pypi() -> MockHost {
 
 #[test]
 fn requirements_show_registry_versions_and_no_problems() {
-    let host = host_with_pypi();
+    let host = host_with_pypi(Rc::new(Cell::new(0)));
     host.add_file("requirements.txt", REQUIREMENTS);
     let mut plugin = DependencyLens::default();
     plugin.handle_events(
@@ -363,4 +366,33 @@ fn requirements_show_registry_versions_and_no_problems() {
     assert_eq!(flask.after, Some("✓".to_string()));
     assert_eq!(flask.style, "muted");
     assert!(diagnostics_of(&host, REQUIREMENTS_PATH).is_empty());
+}
+
+#[test]
+fn quick_fix_on_a_pinned_requirement_is_served_from_the_cache() {
+    let fetches = Rc::new(Cell::new(0));
+    let host = host_with_pypi(fetches.clone());
+    host.add_file("requirements.txt", REQUIREMENTS);
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(REQUIREMENTS_PATH.to_owned())],
+        &host.invocation(),
+    );
+    let fetches_after_refresh = fetches.get();
+    assert!(fetches_after_refresh > 0);
+
+    let document = Document {
+        path: REQUIREMENTS_PATH.to_owned(),
+        language: "pip-requirements".to_owned(),
+        version: 1,
+        text: REQUIREMENTS.to_owned(),
+    };
+    let actions = Providers::code_actions(
+        &mut plugin,
+        &document,
+        Range::new(Position::new(0, 3), Position::new(0, 3)),
+    );
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].title, "Update requests to 2.31.0 (minor)");
+    assert_eq!(fetches.get(), fetches_after_refresh);
 }
