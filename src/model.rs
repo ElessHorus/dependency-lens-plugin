@@ -56,7 +56,7 @@ impl Ecosystem {
     pub fn parse(self, text: &str) -> Vec<Dependency> {
         match self {
             Ecosystem::Cargo => parsers::cargo::parse(text),
-            Ecosystem::Npm => Vec::new(),
+            Ecosystem::Npm => parsers::npm::parse(text),
             Ecosystem::PyPI => parsers::python::parse(text),
             Ecosystem::Go => Vec::new(),
             Ecosystem::Packagist => Vec::new(),
@@ -243,7 +243,15 @@ mod tests {
     fn parse_dispatches_cargo_and_returns_empty_for_unported_ecosystems() {
         let manifest = "[dependencies]\nserde = \"1.0\"\n";
         assert_eq!(Ecosystem::Cargo.parse(manifest).len(), 1);
-        assert!(Ecosystem::Npm.parse(manifest).is_empty());
+        assert!(Ecosystem::Go.parse(manifest).is_empty());
+    }
+
+    #[test]
+    fn parse_dispatches_npm_to_the_npm_parser() {
+        let manifest = include_str!("../tests/fixtures/npm/package.json");
+        let dependencies = Ecosystem::Npm.parse(manifest);
+        assert_eq!(dependencies.len(), 10);
+        assert_eq!(dependencies, parsers::npm::parse(manifest));
     }
 
     #[test]

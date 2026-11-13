@@ -34,6 +34,17 @@ fn utf16_units(segment: &str) -> Option<u32> {
     u32::try_from(segment.encode_utf16().count()).ok()
 }
 
+/// Returns the text that `span` covers in `text`, read through the same UTF-16 conversion.
+#[cfg(test)]
+pub fn text_of_span(text: &str, span: Span) -> Option<String> {
+    use openidea_plugin::Document;
+    let document = Document {
+        version: 1,
+        text: text.to_owned(),
+    };
+    document.text_in(to_range(text, span)?).map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

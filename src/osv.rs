@@ -76,10 +76,16 @@ pub fn declared_version_for_osv(spec: &str) -> Option<String> {
     let version = without_v.split_whitespace().next()?;
     let has_digit = version.bytes().any(|byte| byte.is_ascii_digit());
     // `:` marks URLs and `workspace:`/`file:` sources, `$` marks unresolved properties.
-    // `*` marks a wildcard, which names no single version.
-    let names_source =
-        version.contains([':', '$']) || version.starts_with("git") || version.starts_with("path");
-    (has_digit && !names_source && !version.contains('*')).then(|| version.to_owned())
+    // `/` marks a GitHub shorthand such as `user/repo`.
+    let names_source = version.contains([':', '$', '/'])
+        || version.starts_with("git")
+        || version.starts_with("path");
+    // `*` and an `x` component mark a wildcard, which names no single version.
+    let has_wildcard = version.contains('*')
+        || version
+            .split('.')
+            .any(|component| component == "x" || component == "X");
+    (has_digit && !names_source && !has_wildcard).then(|| version.to_owned())
 }
 
 /// Returns the CVSS v3.x base score of `vector`, or `None` for other versions or invalid vectors.
@@ -592,6 +598,40 @@ mod tests {
             declared_version_for_osv(">=2.0, <3").as_deref(),
             Some("2.0")
         );
+    }
+
+    #[test]
+    fn keeps_caret_tilde_prerelease_and_range_forms() {
+        assert_eq!(declared_version_for_osv("^1.2.3").as_deref(), Some("1.2.3"));
+        assert_eq!(declared_version_for_osv("~0.9.0").as_deref(), Some("0.9.0"));
+        assert_eq!(
+            declared_version_for_osv("1.2.3-beta.1").as_deref(),
+            Some("1.2.3-beta.1")
+        );
+        assert_eq!(
+            declared_version_for_osv(">=1.0.0 <2.0.0").as_deref(),
+            Some("1.0.0")
+        );
+        assert_eq!(
+            declared_version_for_osv("^1.0.0 || ^2.0.0").as_deref(),
+            Some("1.0.0")
+        );
+        assert_eq!(
+            declared_version_for_osv("1.0.0 - 2.0.0").as_deref(),
+            Some("1.0.0")
+        );
+    }
+
+    #[test]
+    fn skips_specs_without_a_single_version() {
+        assert_eq!(declared_version_for_osv("user/repo2"), None);
+        assert_eq!(declared_version_for_osv("github:user/repo"), None);
+        assert_eq!(declared_version_for_osv("1.x"), None);
+        assert_eq!(declared_version_for_osv("1.2.X"), None);
+        assert_eq!(declared_version_for_osv("1.2.x"), None);
+        assert_eq!(declared_version_for_osv("x"), None);
+        assert_eq!(declared_version_for_osv("beta"), None);
+        assert_eq!(declared_version_for_osv("next"), None);
     }
 
     #[test]
