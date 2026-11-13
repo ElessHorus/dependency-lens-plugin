@@ -1,5 +1,7 @@
 //! Registry clients: one module per ecosystem, reached through `Ecosystem` hooks.
 
+pub mod dotted;
+pub mod packagist;
 pub mod pep440;
 pub mod pypi;
 
@@ -19,6 +21,10 @@ impl Ecosystem {
                     Cow::Owned(normalized)
                 }
             }
+            // Packagist stores names in lowercase. Only names with an uppercase letter need a copy.
+            Ecosystem::Packagist if name.chars().any(char::is_uppercase) => {
+                Cow::Owned(name.to_lowercase())
+            }
             _ => Cow::Borrowed(name),
         }
     }
@@ -27,6 +33,7 @@ impl Ecosystem {
     pub fn registry_request(self, package: &str) -> Option<HttpRequest> {
         match self {
             Ecosystem::PyPI => Some(pypi::request(package)),
+            Ecosystem::Packagist => Some(packagist::request(package)),
             _ => None,
         }
     }
@@ -35,6 +42,7 @@ impl Ecosystem {
     pub fn parse_registry(self, body: &str) -> Result<VersionInfo, String> {
         match self {
             Ecosystem::PyPI => pypi::parse(body),
+            Ecosystem::Packagist => packagist::parse(body),
             _ => Err("no registry for this ecosystem".to_string()),
         }
     }
@@ -77,6 +85,32 @@ mod tests {
         assert_eq!(
             Ecosystem::PyPI.parse_registry(PYPI_FIXTURE),
             pypi::parse(PYPI_FIXTURE)
+        );
+    }
+
+    #[test]
+    fn packagist_lowercases_names_and_has_a_registry() {
+        assert_eq!(
+            Ecosystem::Packagist.normalize_package("Monolog/Monolog"),
+            "monolog/monolog"
+        );
+        assert!(matches!(
+            Ecosystem::Packagist.normalize_package("monolog/monolog"),
+            Cow::Borrowed(_)
+        ));
+        assert!(
+            Ecosystem::Packagist
+                .registry_request("monolog/monolog")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn packagist_parses_registry_bodies_like_the_packagist_module() {
+        let fixture = include_str!("../../tests/fixtures/php/registry.json");
+        assert_eq!(
+            Ecosystem::Packagist.parse_registry(fixture),
+            packagist::parse(fixture)
         );
     }
 

@@ -3,6 +3,7 @@
 use crate::cache::Cache;
 use crate::http::Http;
 use crate::model::{AdvisorySeverity, Ecosystem, Vulnerability};
+use crate::registries::dotted::is_dev_branch;
 use openidea_plugin::{HttpRequest, HttpResponse};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -74,12 +75,18 @@ pub fn declared_version_for_osv(spec: &str) -> Option<String> {
     };
     // A range such as `>=1.0 <2.0` names its first version only, so the text stops at a space.
     let first_word = without_v.split_whitespace().next()?;
+    // Composer stability flags such as `^1.0@dev` follow the version and are cut here.
+    let without_flag = first_word
+        .split_once('@')
+        .map_or(first_word, |(version_part, _)| version_part);
     // Maven ranges keep one bracket per side after the comma cut, e.g. `[1.0` or `2.0)`.
-    let without_open = first_word.strip_prefix(['[', '(']).unwrap_or(first_word);
+    let without_open = without_flag
+        .strip_prefix(['[', '('])
+        .unwrap_or(without_flag);
     let version = without_open
         .strip_suffix([']', ')'])
         .unwrap_or(without_open);
-    if version.is_empty() {
+    if version.is_empty() || is_dev_branch(version) {
         return None;
     }
     let has_digit = version.bytes().any(|byte| byte.is_ascii_digit());
@@ -702,6 +709,29 @@ mod tests {
         ] {
             assert_eq!(declared_version_for_osv(spec), None, "spec {spec:?}");
         }
+    }
+
+    #[test]
+    fn composer_stability_flags_and_dev_branches() {
+        assert_eq!(declared_version_for_osv("^1.0@dev").as_deref(), Some("1.0"));
+        assert_eq!(declared_version_for_osv("dev-main"), None);
+        assert_eq!(declared_version_for_osv("dev-main as 1.0.x-dev"), None);
+        assert_eq!(declared_version_for_osv("1.0.x-dev"), None);
+        assert_eq!(declared_version_for_osv("1.2.*"), None);
+        assert_eq!(declared_version_for_osv("~6.2").as_deref(), Some("6.2"));
+        assert_eq!(declared_version_for_osv("^3.0").as_deref(), Some("3.0"));
+        assert_eq!(
+            declared_version_for_osv(">=1.2 <2.0").as_deref(),
+            Some("1.2")
+        );
+        assert_eq!(
+            declared_version_for_osv("^1.0 || ^2.0").as_deref(),
+            Some("1.0")
+        );
+        assert_eq!(
+            declared_version_for_osv("3.0.0-RC1").as_deref(),
+            Some("3.0.0-RC1")
+        );
     }
 
     // cvss3_base_score

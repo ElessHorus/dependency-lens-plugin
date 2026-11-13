@@ -629,6 +629,94 @@ mod tests {
         assert!(!budget.take());
     }
 
+    const MONOLOG_URL: &str = "https://repo.packagist.org/p2/monolog/monolog.json";
+    const CURRENT_URL: &str = "https://repo.packagist.org/p2/acme/current.json";
+    const MONOLOG_BODY: &str = r#"{"minified":"composer/2.0","packages":{"monolog/monolog":[{"version":"3.12.1"},{"version":"3.0.0-RC1"}]}}"#;
+    const CURRENT_BODY: &str =
+        r#"{"minified":"composer/2.0","packages":{"acme/current":[{"version":"3.12.1"}]}}"#;
+
+    /// Parses a `composer.json` text and runs `analyze` for Packagist.
+    fn analyze_composer(
+        cache: &mut Cache,
+        http: &dyn Http,
+        text: &str,
+        budget: &mut Budget,
+    ) -> Analysis {
+        analyze(
+            Ecosystem::Packagist,
+            parsers::php::parse(text),
+            cache,
+            http,
+            &Settings::default(),
+            NOW,
+            budget,
+        )
+    }
+
+    #[test]
+    fn packagist_requirements_are_outdated_or_up_to_date_from_the_registry() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("GET", MONOLOG_URL, 200, MONOLOG_BODY)
+            .route("GET", CURRENT_URL, 200, CURRENT_BODY);
+        let analysis = analyze_composer(
+            &mut cache,
+            &http,
+            r#"{"require":{"monolog/monolog":"^3.0","acme/current":"^3.12.1"}}"#,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(analysis.pending, 0);
+        assert_eq!(
+            entry(&analysis, "monolog/monolog").status,
+            Status::Outdated {
+                latest: "3.12.1".to_owned()
+            }
+        );
+        assert_eq!(entry(&analysis, "acme/current").status, Status::UpToDate);
+    }
+
+    #[test]
+    fn packagist_http_404_is_reported_as_unknown() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", MONOLOG_URL, 404, "");
+        let analysis = analyze_composer(
+            &mut cache,
+            &http,
+            r#"{"require":{"monolog/monolog":"^3.0"}}"#,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(
+            entry(&analysis, "monolog/monolog").status,
+            Status::Unknown("registry: HTTP 404".to_owned())
+        );
+    }
+
+    #[test]
+    fn packagist_names_are_lowercased_and_looked_up_once_per_call() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("GET", MONOLOG_URL, 200, MONOLOG_BODY);
+        let analysis = analyze_composer(
+            &mut cache,
+            &http,
+            r#"{"require":{"Monolog/Monolog":"^3.0","monolog/monolog":"^3.0"}}"#,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(http.count(MONOLOG_URL), 1);
+        assert!(matches!(
+            entry(&analysis, "Monolog/Monolog").status,
+            Status::Outdated { .. }
+        ));
+        assert!(matches!(
+            entry(&analysis, "monolog/monolog").status,
+            Status::Outdated { .. }
+        ));
+    }
+
     const PYPI_PREFIX: &str = "https://pypi.org/pypi/";
     const REQUESTS_URL: &str = "https://pypi.org/pypi/requests/json";
     const FLASK_URL: &str = "https://pypi.org/pypi/flask/json";

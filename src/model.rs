@@ -89,7 +89,7 @@ impl Ecosystem {
             Ecosystem::Npm => parsers::npm::parse(text),
             Ecosystem::PyPI => parsers::python::parse(text),
             Ecosystem::Go => parsers::go::parse(text),
-            Ecosystem::Packagist => Vec::new(),
+            Ecosystem::Packagist => parsers::php::parse(text),
             Ecosystem::Pub => Vec::new(),
             Ecosystem::NuGet => Vec::new(),
             Ecosystem::RubyGems => Vec::new(),
@@ -290,6 +290,14 @@ mod tests {
         let dependencies = Ecosystem::Npm.parse(manifest);
         assert_eq!(dependencies.len(), 10);
         assert_eq!(dependencies, parsers::npm::parse(manifest));
+    }
+
+    #[test]
+    fn parse_dispatches_packagist_to_the_php_parser() {
+        let manifest = include_str!("../tests/fixtures/php/composer.json");
+        let dependencies = Ecosystem::Packagist.parse(manifest);
+        assert_eq!(dependencies.len(), 7);
+        assert_eq!(dependencies, parsers::php::parse(manifest));
     }
 
     #[test]

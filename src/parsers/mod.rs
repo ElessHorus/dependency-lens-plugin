@@ -5,5 +5,6 @@ pub mod go;
 pub mod json_spans;
 pub mod maven;
 pub mod npm;
+pub mod php;
 pub mod python;
 pub mod spans;

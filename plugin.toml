@@ -19,7 +19,7 @@ activation = [
 
 # What the code may do. The user approves these when installing.
 [capabilities]
-required = ["events", "project.read", "editor.read", "net:api.osv.dev", "net:pypi.org"]
+required = ["events", "project.read", "editor.read", "net:api.osv.dev", "net:pypi.org", "net:repo.packagist.org"]
 
 [[contributes.commands]]
 id = "refresh"

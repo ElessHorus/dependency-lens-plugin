@@ -396,3 +396,88 @@ fn quick_fix_on_a_pinned_requirement_is_served_from_the_cache() {
     assert_eq!(actions[0].title, "Update requests to 2.31.0 (minor)");
     assert_eq!(fetches.get(), fetches_after_refresh);
 }
+
+const COMPOSER_PATH: &str = "/p/composer.json";
+const COMPOSER: &str = "{\n    \"require\": {\n        \"monolog/monolog\": \"^3.0\"\n    }\n}\n";
+/// `"monolog/monolog": "^3.0"` sits on line 2; its version text is columns 28..32.
+const MONOLOG_VERSION_RANGE: Range = Range::new(Position::new(2, 28), Position::new(2, 32));
+const PACKAGIST_PAGE_BODY: &str = r#"{"minified":"composer/2.0","packages":{"monolog/monolog":[{"version":"3.12.1"},{"version":"3.0.0"}]}}"#;
+
+/// Answers Packagist p2 pages with one package, and everything else as OSV does.
+/// Every request increments `fetches`.
+fn host_with_packagist(fetches: Rc<Cell<u32>>) -> MockHost {
+    let host = MockHost::install().with_capabilities(&[
+        "events",
+        "project.read",
+        "editor.read",
+        "net:api.osv.dev",
+        "net:repo.packagist.org",
+    ]);
+    host.set_project_root(Some("/p"));
+    host.on_fetch(move |request| {
+        fetches.set(fetches.get() + 1);
+        if request.url.starts_with("https://repo.packagist.org/p2/") {
+            Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: PACKAGIST_PAGE_BODY.as_bytes().to_vec(),
+            })
+        } else {
+            answer_osv(request)
+        }
+    });
+    host
+}
+
+#[test]
+fn composer_requirement_shows_the_registry_version() {
+    let host = host_with_packagist(Rc::new(Cell::new(0)));
+    host.add_file("composer.json", COMPOSER);
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(COMPOSER_PATH.to_owned())],
+        &host.invocation(),
+    );
+
+    let decorations = decorations_of(&host, COMPOSER_PATH);
+    let monolog = decorations
+        .iter()
+        .find(|decoration| decoration.range == MONOLOG_VERSION_RANGE)
+        .expect("decoration on monolog");
+    assert_eq!(monolog.after, Some("→ 3.12.1".to_string()));
+    assert_eq!(monolog.style, "info");
+    assert!(diagnostics_of(&host, COMPOSER_PATH).is_empty());
+}
+
+#[test]
+fn composer_quick_fix_rewrites_the_range_and_is_served_from_the_cache() {
+    let fetches = Rc::new(Cell::new(0));
+    let host = host_with_packagist(fetches.clone());
+    host.add_file("composer.json", COMPOSER);
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(COMPOSER_PATH.to_owned())],
+        &host.invocation(),
+    );
+    let fetches_after_refresh = fetches.get();
+    assert!(fetches_after_refresh > 0);
+
+    let document = Document {
+        path: COMPOSER_PATH.to_owned(),
+        language: "json".to_owned(),
+        version: 1,
+        text: COMPOSER.to_owned(),
+    };
+    let actions = Providers::code_actions(
+        &mut plugin,
+        &document,
+        Range::new(Position::new(2, 3), Position::new(2, 3)),
+    );
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].title, "Update monolog/monolog to 3.12.1 (minor)");
+    let (edit_path, edits) = &actions[0].edits[0];
+    assert_eq!(edit_path, COMPOSER_PATH);
+    assert_eq!(edits[0].range, MONOLOG_VERSION_RANGE);
+    assert_eq!(edits[0].text, "^3.12");
+    assert_eq!(fetches.get(), fetches_after_refresh);
+}

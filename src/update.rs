@@ -2,6 +2,7 @@
 
 use crate::model::{Dependency, Ecosystem};
 use crate::osv::declared_version_for_osv;
+use crate::registries::dotted::{DottedVersion, is_dev_branch, segment};
 use crate::registries::pep440::Pep440;
 
 /// Operator characters that may start a Poetry-style requirement such as `^2.28`.
@@ -20,10 +21,50 @@ pub enum UpdateKind {
     Prerelease,
 }
 
+/// Version operations that the update rules need. PEP 440 and dotted versions implement it,
+/// so each ecosystem adds one match arm and no new rule code.
+trait UpdateVersion: Ord + Sized {
+    /// Parses version text, or returns `None` when the text is not a version of this ecosystem.
+    fn parse_version(text: &str) -> Option<Self>;
+    /// Returns `true` for a prerelease version.
+    fn is_prerelease_version(&self) -> bool;
+    /// Returns the release segments, such as `[2, 31, 0]`.
+    fn release_segments(&self) -> &[u64];
+}
+
+impl UpdateVersion for Pep440 {
+    fn parse_version(text: &str) -> Option<Self> {
+        Pep440::parse(text)
+    }
+
+    fn is_prerelease_version(&self) -> bool {
+        self.is_prerelease()
+    }
+
+    fn release_segments(&self) -> &[u64] {
+        self.release()
+    }
+}
+
+impl UpdateVersion for DottedVersion {
+    fn parse_version(text: &str) -> Option<Self> {
+        DottedVersion::parse(text)
+    }
+
+    fn is_prerelease_version(&self) -> bool {
+        self.is_prerelease()
+    }
+
+    fn release_segments(&self) -> &[u64] {
+        self.release()
+    }
+}
+
 /// `None` when either version cannot be parsed for this ecosystem or `latest` is not newer than `current`.
 pub fn update_kind(eco: Ecosystem, current: &str, latest: &str) -> Option<UpdateKind> {
     match eco {
-        Ecosystem::PyPI => pep440_update_kind(current, latest),
+        Ecosystem::PyPI => update_kind_of::<Pep440>(current, latest),
+        Ecosystem::Packagist => update_kind_of::<DottedVersion>(current, latest),
         _ => None,
     }
 }
@@ -31,7 +72,8 @@ pub fn update_kind(eco: Ecosystem, current: &str, latest: &str) -> Option<Update
 /// True when `latest` is a stable version newer than the lower bound of `declared`.
 pub fn is_outdated(eco: Ecosystem, declared: &str, latest: &str) -> bool {
     match eco {
-        Ecosystem::PyPI => pep440_is_outdated(declared, latest),
+        Ecosystem::PyPI => is_outdated_of::<Pep440>(declared, latest),
+        Ecosystem::Packagist => is_outdated_of::<DottedVersion>(declared, latest),
         _ => false,
     }
 }
@@ -40,23 +82,23 @@ pub fn is_outdated(eco: Ecosystem, declared: &str, latest: &str) -> bool {
 pub fn render_update(eco: Ecosystem, dep: &Dependency, latest: &str) -> Option<String> {
     match eco {
         Ecosystem::PyPI => pep440_render_update(dep, latest),
+        Ecosystem::Packagist => dotted_render_update(dep, latest),
         _ => None,
     }
 }
 
 /// Classifies the step from `current` to `latest` by the first release segment that differs.
-fn pep440_update_kind(current: &str, latest: &str) -> Option<UpdateKind> {
-    let current = Pep440::parse(current)?;
-    let latest = Pep440::parse(latest)?;
+fn update_kind_of<V: UpdateVersion>(current: &str, latest: &str) -> Option<UpdateKind> {
+    let current = V::parse_version(current)?;
+    let latest = V::parse_version(latest)?;
     if latest <= current {
         return None;
     }
-    if latest.is_prerelease() {
+    if latest.is_prerelease_version() {
         return Some(UpdateKind::Prerelease);
     }
     // A missing segment reads as 0, so `2` and `2.0` compare equal.
-    let segment = |release: &[u64], index: usize| release.get(index).copied().unwrap_or(0);
-    let (current_release, latest_release) = (current.release(), latest.release());
+    let (current_release, latest_release) = (current.release_segments(), latest.release_segments());
     if segment(current_release, 0) != segment(latest_release, 0) {
         Some(UpdateKind::Major)
     } else if segment(current_release, 1) != segment(latest_release, 1) {
@@ -67,14 +109,25 @@ fn pep440_update_kind(current: &str, latest: &str) -> Option<UpdateKind> {
 }
 
 /// Compares the lower bound of the declared requirement with a stable `latest`.
-fn pep440_is_outdated(declared: &str, latest: &str) -> bool {
+fn is_outdated_of<V: UpdateVersion>(declared: &str, latest: &str) -> bool {
     let Some(bound_text) = declared_version_for_osv(declared) else {
         return false;
     };
-    let (Some(bound), Some(latest)) = (Pep440::parse(&bound_text), Pep440::parse(latest)) else {
+    let (Some(bound), Some(latest)) = (V::parse_version(&bound_text), V::parse_version(latest))
+    else {
         return false;
     };
-    !latest.is_prerelease() && latest > bound
+    !latest.is_prerelease_version() && latest > bound
+}
+
+/// Splits a requirement into its leading operator run and the version text after it.
+fn split_operator(requirement: &str) -> (&str, &str) {
+    // The operator bytes are ASCII, so the split always falls on a character boundary.
+    let operator_len = requirement
+        .bytes()
+        .take_while(|byte| OPERATOR_BYTES.contains(byte))
+        .count();
+    requirement.split_at(operator_len)
 }
 
 /// Keeps the operator run of the requirement and appends `latest`.
@@ -85,14 +138,37 @@ fn pep440_render_update(dep: &Dependency, latest: &str) -> Option<String> {
     {
         return None;
     }
-    // The operator bytes are ASCII, so the split always falls on a character boundary.
-    let operator_len = dep
-        .version
-        .bytes()
-        .take_while(|byte| OPERATOR_BYTES.contains(byte))
-        .count();
-    let (operator, _) = dep.version.split_at(operator_len);
+    let (operator, _) = split_operator(&dep.version);
     Some(format!("{operator}{latest}"))
+}
+
+/// Rewrites a Composer requirement to `latest`. It keeps the operator and writes as many
+/// release segments as the declared text has, so `^8.1` takes `8.2` from `8.2.3`.
+fn dotted_render_update(dep: &Dependency, latest: &str) -> Option<String> {
+    if dep.version.is_empty()
+        || dep.version.contains(char::is_whitespace)
+        || dep.version.contains(['*', '@', '|'])
+        || is_dev_branch(&dep.version)
+    {
+        return None;
+    }
+    let (operator, declared_text) = split_operator(&dep.version);
+    let declared = DottedVersion::parse(declared_text)?;
+    let latest_version = DottedVersion::parse(latest)?;
+    if latest_version.is_prerelease() {
+        return None;
+    }
+    // A latest version with fewer segments than declared is written in full.
+    let precision = declared.release().len();
+    let rendered_release = latest_version
+        .release()
+        .iter()
+        .take(precision)
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(".");
+    let rendered = format!("{operator}{rendered_release}");
+    (rendered != dep.version).then_some(rendered)
 }
 
 #[cfg(test)]
@@ -185,6 +261,68 @@ mod tests {
             render_update(Ecosystem::PyPI, &dependency, "2.31.0"),
             Some("^2.31.0".to_owned())
         );
+    }
+
+    /// Parses a `composer.json` with one `require` entry and returns that dependency.
+    fn composer_dependency(requirement: &str) -> Dependency {
+        let text = format!(r#"{{"require":{{"acme/lib":"{requirement}"}}}}"#);
+        parsers::php::parse(&text)
+            .into_iter()
+            .next()
+            .expect("one dependency")
+    }
+
+    #[test]
+    fn packagist_is_outdated_compares_the_declared_lower_bound() {
+        assert!(is_outdated(Ecosystem::Packagist, "^3.0", "3.12.1"));
+        assert!(is_outdated(Ecosystem::Packagist, "^3.12", "3.12.1"));
+        assert!(!is_outdated(Ecosystem::Packagist, "3.12.1", "3.12.1"));
+        assert!(!is_outdated(Ecosystem::Packagist, "^3.0", "4.0.0-RC1"));
+        assert!(!is_outdated(Ecosystem::Packagist, "dev-main", "3.0"));
+        assert!(!is_outdated(Ecosystem::Packagist, "1.2.*", "3.0"));
+        assert!(is_outdated(Ecosystem::Packagist, "^1.0@dev", "2.0.0"));
+    }
+
+    #[test]
+    fn packagist_update_kind_names_the_first_changed_segment() {
+        assert_eq!(
+            update_kind(Ecosystem::Packagist, "1.0", "2.0"),
+            Some(UpdateKind::Major)
+        );
+        assert_eq!(
+            update_kind(Ecosystem::Packagist, "3.0", "3.12.1"),
+            Some(UpdateKind::Minor)
+        );
+        assert_eq!(
+            update_kind(Ecosystem::Packagist, "3.12.0", "3.12.1"),
+            Some(UpdateKind::Patch)
+        );
+        assert_eq!(
+            update_kind(Ecosystem::Packagist, "1.0", "2.0.0-RC1"),
+            Some(UpdateKind::Prerelease)
+        );
+        assert_eq!(update_kind(Ecosystem::Packagist, "3.12.1", "3.12.1"), None);
+    }
+
+    #[test]
+    fn packagist_render_keeps_the_operator_and_the_declared_precision() {
+        let render = |requirement: &str, latest: &str| {
+            render_update(
+                Ecosystem::Packagist,
+                &composer_dependency(requirement),
+                latest,
+            )
+        };
+        assert_eq!(render("^8.1", "8.2.3").as_deref(), Some("^8.2"));
+        assert_eq!(render("~6.2.1", "6.4.1").as_deref(), Some("~6.4.1"));
+        assert_eq!(render("1.0", "2.5.7").as_deref(), Some("2.5"));
+        assert_eq!(render("^3.12", "3.12.1"), None);
+        assert_eq!(render("1.2.*", "3.0.0"), None);
+        assert_eq!(render("dev-main", "3.0.0"), None);
+        assert_eq!(render("^1.0@dev", "2.0.0"), None);
+        assert_eq!(render(">=1.2 <2.0", "3.0.0"), None);
+        assert_eq!(render("", "3.0.0"), None);
+        assert_eq!(render("^3.0", "4.0.0-RC1"), None);
     }
 
     #[test]
