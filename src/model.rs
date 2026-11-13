@@ -63,7 +63,7 @@ impl Ecosystem {
             Ecosystem::Pub => Vec::new(),
             Ecosystem::NuGet => Vec::new(),
             Ecosystem::RubyGems => Vec::new(),
-            Ecosystem::Maven => Vec::new(),
+            Ecosystem::Maven => parsers::maven::parse(text),
         }
     }
 
@@ -260,6 +260,14 @@ mod tests {
         let dependencies = Ecosystem::Npm.parse(manifest);
         assert_eq!(dependencies.len(), 10);
         assert_eq!(dependencies, parsers::npm::parse(manifest));
+    }
+
+    #[test]
+    fn parse_dispatches_maven_to_the_maven_parser() {
+        let manifest = include_str!("../tests/fixtures/maven/pom.xml");
+        let dependencies = Ecosystem::Maven.parse(manifest);
+        assert_eq!(dependencies.len(), 7);
+        assert_eq!(dependencies, parsers::maven::parse(manifest));
     }
 
     #[test]

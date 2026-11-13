@@ -73,7 +73,15 @@ pub fn declared_version_for_osv(spec: &str) -> Option<String> {
         _ => without_operator,
     };
     // A range such as `>=1.0 <2.0` names its first version only, so the text stops at a space.
-    let version = without_v.split_whitespace().next()?;
+    let first_word = without_v.split_whitespace().next()?;
+    // Maven ranges keep one bracket per side after the comma cut, e.g. `[1.0` or `2.0)`.
+    let without_open = first_word.strip_prefix(['[', '(']).unwrap_or(first_word);
+    let version = without_open
+        .strip_suffix([']', ')'])
+        .unwrap_or(without_open);
+    if version.is_empty() {
+        return None;
+    }
     let has_digit = version.bytes().any(|byte| byte.is_ascii_digit());
     // `:` marks URLs and `workspace:`/`file:` sources, `$` marks unresolved properties.
     // `/` marks a GitHub shorthand such as `user/repo`.
@@ -654,6 +662,31 @@ mod tests {
     fn rejects_wildcard_versions() {
         assert_eq!(declared_version_for_osv("2.*"), None);
         assert_eq!(declared_version_for_osv("==2.*"), None);
+    }
+
+    #[test]
+    fn keeps_the_first_bound_of_maven_ranges() {
+        assert_eq!(
+            declared_version_for_osv("[1.0,2.0)").as_deref(),
+            Some("1.0")
+        );
+        assert_eq!(declared_version_for_osv("[1.5]").as_deref(), Some("1.5"));
+        assert_eq!(
+            declared_version_for_osv("(1.0,2.0]").as_deref(),
+            Some("1.0")
+        );
+        assert_eq!(declared_version_for_osv("(,1.0]"), None);
+    }
+
+    #[test]
+    fn skips_maven_keywords_and_keeps_release_suffixes() {
+        assert_eq!(declared_version_for_osv("LATEST"), None);
+        assert_eq!(declared_version_for_osv("RELEASE"), None);
+        assert_eq!(
+            declared_version_for_osv("1.2.3.RELEASE").as_deref(),
+            Some("1.2.3.RELEASE")
+        );
+        assert_eq!(declared_version_for_osv("5.9.2").as_deref(), Some("5.9.2"));
     }
 
     #[test]
