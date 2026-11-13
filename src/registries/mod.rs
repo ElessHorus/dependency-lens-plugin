@@ -1,6 +1,7 @@
 //! Registry clients: one module per ecosystem, reached through `Ecosystem` hooks.
 
 pub mod dotted;
+pub mod nuget;
 pub mod packagist;
 pub mod pep440;
 pub mod pub_dev;
@@ -22,8 +23,8 @@ impl Ecosystem {
                     Cow::Owned(normalized)
                 }
             }
-            // Packagist stores names in lowercase. Only names with an uppercase letter need a copy.
-            Ecosystem::Packagist if name.chars().any(char::is_uppercase) => {
+            // Packagist and the NuGet flat container store names in lowercase. Only names with an uppercase letter need a copy.
+            Ecosystem::Packagist | Ecosystem::NuGet if name.chars().any(char::is_uppercase) => {
                 Cow::Owned(name.to_lowercase())
             }
             _ => Cow::Borrowed(name),
@@ -36,6 +37,7 @@ impl Ecosystem {
             Ecosystem::PyPI => Some(pypi::request(package)),
             Ecosystem::Packagist => Some(packagist::request(package)),
             Ecosystem::Pub => Some(pub_dev::request(package)),
+            Ecosystem::NuGet => Some(nuget::request(package)),
             _ => None,
         }
     }
@@ -46,6 +48,7 @@ impl Ecosystem {
             Ecosystem::PyPI => pypi::parse(body),
             Ecosystem::Packagist => packagist::parse(body),
             Ecosystem::Pub => pub_dev::parse(body),
+            Ecosystem::NuGet => nuget::parse(body),
             _ => Err("no registry for this ecosystem".to_string()),
         }
     }
@@ -133,6 +136,28 @@ mod tests {
                 .registry_request("http")
                 .map(|request| request.url),
             Some("https://pub.dev/api/packages/http".to_owned())
+        );
+    }
+
+    #[test]
+    fn nuget_lowercases_ids_and_has_a_registry() {
+        assert_eq!(
+            Ecosystem::NuGet.normalize_package("Newtonsoft.Json"),
+            "newtonsoft.json"
+        );
+        assert!(matches!(
+            Ecosystem::NuGet.normalize_package("newtonsoft.json"),
+            Cow::Borrowed(_)
+        ));
+        let fixture = include_str!("../../tests/fixtures/csharp/registry.json");
+        assert_eq!(
+            Ecosystem::NuGet.parse_registry(fixture),
+            nuget::parse(fixture)
+        );
+        assert!(
+            Ecosystem::NuGet
+                .registry_request("Newtonsoft.Json")
+                .is_some()
         );
     }
 

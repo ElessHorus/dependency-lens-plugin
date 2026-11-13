@@ -564,3 +564,71 @@ fn pubspec_quick_fix_rewrites_the_range() {
     assert_eq!(edits[0].text, "^1.2.0");
     assert_eq!(fetches.get(), fetches_after_refresh);
 }
+
+const CSPROJ_PATH: &str = "/p/app.csproj";
+const CSPROJ: &str = "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <ItemGroup>\n    <PackageReference Include=\"Newtonsoft.Json\" Version=\"13.0.3\" />\n  </ItemGroup>\n</Project>\n";
+/// The version of `Newtonsoft.Json` sits on line 2; its version text is columns 57..63.
+const NEWTONSOFT_VERSION_RANGE: Range = Range::new(Position::new(2, 57), Position::new(2, 63));
+const NUGET_NEWTONSOFT_BODY: &str = r#"{"versions":["13.0.3","13.0.4"]}"#;
+
+/// A mock that answers NuGet flat container indexes and OSV, counting every request.
+fn host_with_nuget(fetches: Rc<Cell<u32>>) -> MockHost {
+    host_with_registry(
+        fetches,
+        "net:api.nuget.org",
+        "https://api.nuget.org/v3-flatcontainer/",
+        NUGET_NEWTONSOFT_BODY,
+    )
+}
+
+#[test]
+fn csproj_requirement_shows_the_registry_version() {
+    let host = host_with_nuget(Rc::new(Cell::new(0)));
+    host.add_file("app.csproj", CSPROJ);
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(CSPROJ_PATH.to_owned())],
+        &host.invocation(),
+    );
+
+    let decorations = decorations_of(&host, CSPROJ_PATH);
+    let newtonsoft = decorations
+        .iter()
+        .find(|decoration| decoration.range == NEWTONSOFT_VERSION_RANGE)
+        .expect("decoration on Newtonsoft.Json");
+    assert_eq!(newtonsoft.after, Some("→ 13.0.4".to_string()));
+    assert_eq!(newtonsoft.style, "info");
+    assert!(diagnostics_of(&host, CSPROJ_PATH).is_empty());
+}
+
+#[test]
+fn csproj_quick_fix_replaces_the_version_and_is_served_from_the_cache() {
+    let fetches = Rc::new(Cell::new(0));
+    let host = host_with_nuget(fetches.clone());
+    host.add_file("app.csproj", CSPROJ);
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(CSPROJ_PATH.to_owned())],
+        &host.invocation(),
+    );
+    let fetches_after_refresh = fetches.get();
+
+    let document = Document {
+        path: CSPROJ_PATH.to_owned(),
+        language: "xml".to_owned(),
+        version: 1,
+        text: CSPROJ.to_owned(),
+    };
+    let actions = Providers::code_actions(
+        &mut plugin,
+        &document,
+        Range::new(Position::new(2, 3), Position::new(2, 3)),
+    );
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].title, "Update Newtonsoft.Json to 13.0.4 (patch)");
+    let (edit_path, edits) = &actions[0].edits[0];
+    assert_eq!(edit_path, CSPROJ_PATH);
+    assert_eq!(edits[0].range, NEWTONSOFT_VERSION_RANGE);
+    assert_eq!(edits[0].text, "13.0.4");
+    assert_eq!(fetches.get(), fetches_after_refresh);
+}

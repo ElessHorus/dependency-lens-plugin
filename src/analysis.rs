@@ -801,6 +801,124 @@ mod tests {
         assert_eq!(http.count(PUB_INTL_PREFIX), 0);
     }
 
+    const NUGET_PREFIX: &str = "https://api.nuget.org/v3-flatcontainer/";
+    const NEWTONSOFT_URL: &str =
+        "https://api.nuget.org/v3-flatcontainer/newtonsoft.json/index.json";
+    const SERILOG_URL: &str = "https://api.nuget.org/v3-flatcontainer/serilog/index.json";
+    const NEWTONSOFT_BODY: &str = r#"{"versions":["13.0.3","13.0.4"]}"#;
+    const SERILOG_BODY: &str = r#"{"versions":["3.1.1"]}"#;
+
+    /// Parses a `.csproj` text and runs `analyze` for NuGet.
+    fn analyze_csproj(
+        cache: &mut Cache,
+        http: &dyn Http,
+        text: &str,
+        budget: &mut Budget,
+    ) -> Analysis {
+        analyze(
+            Ecosystem::NuGet,
+            parsers::csharp::parse(text),
+            cache,
+            http,
+            &Settings::default(),
+            NOW,
+            budget,
+        )
+    }
+
+    /// Builds a `.csproj` text with one `PackageReference` per `(name, version)` pair.
+    fn csproj_with(references: &[(&str, &str)]) -> String {
+        let items: String = references
+            .iter()
+            .map(|(name, version)| {
+                format!(r#"<PackageReference Include="{name}" Version="{version}" />"#)
+            })
+            .collect();
+        format!("<Project><ItemGroup>{items}</ItemGroup></Project>")
+    }
+
+    #[test]
+    fn nuget_packages_are_outdated_or_up_to_date_from_the_registry() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("GET", NEWTONSOFT_URL, 200, NEWTONSOFT_BODY)
+            .route("GET", SERILOG_URL, 200, SERILOG_BODY);
+        let analysis = analyze_csproj(
+            &mut cache,
+            &http,
+            &csproj_with(&[("Newtonsoft.Json", "13.0.3"), ("Serilog", "3.1.1")]),
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(analysis.pending, 0);
+        assert_eq!(
+            entry(&analysis, "Newtonsoft.Json").status,
+            Status::Outdated {
+                latest: "13.0.4".to_owned()
+            }
+        );
+        assert_eq!(entry(&analysis, "Serilog").status, Status::UpToDate);
+    }
+
+    #[test]
+    fn nuget_http_404_is_reported_as_unknown() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", NEWTONSOFT_URL, 404, "");
+        let analysis = analyze_csproj(
+            &mut cache,
+            &http,
+            &csproj_with(&[("Newtonsoft.Json", "13.0.3")]),
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(
+            entry(&analysis, "Newtonsoft.Json").status,
+            Status::Unknown("registry: HTTP 404".to_owned())
+        );
+    }
+
+    #[test]
+    fn nuget_names_are_lowercased_and_looked_up_once_per_call() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("GET", NEWTONSOFT_URL, 200, NEWTONSOFT_BODY);
+        let analysis = analyze_csproj(
+            &mut cache,
+            &http,
+            &csproj_with(&[("Newtonsoft.Json", "13.0.3"), ("newtonsoft.json", "13.0.3")]),
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(http.count(NEWTONSOFT_URL), 1);
+        assert!(matches!(
+            entry(&analysis, "Newtonsoft.Json").status,
+            Status::Outdated { .. }
+        ));
+        assert!(matches!(
+            entry(&analysis, "newtonsoft.json").status,
+            Status::Outdated { .. }
+        ));
+    }
+
+    #[test]
+    fn nuget_floating_version_is_not_checked_and_makes_no_registry_request() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", NEWTONSOFT_URL, 200, NEWTONSOFT_BODY);
+        let analysis = analyze_csproj(
+            &mut cache,
+            &http,
+            &csproj_with(&[("Floating", "1.*")]),
+            &mut Budget::new(usize::MAX, None),
+        );
+        let floating = entry(&analysis, "Floating");
+        assert_eq!(floating.status, Status::NotChecked);
+        assert_eq!(floating.checked_version, None);
+        assert_eq!(http.count(NUGET_PREFIX), 0);
+    }
+
     const PYPI_PREFIX: &str = "https://pypi.org/pypi/";
     const REQUESTS_URL: &str = "https://pypi.org/pypi/requests/json";
     const FLASK_URL: &str = "https://pypi.org/pypi/flask/json";

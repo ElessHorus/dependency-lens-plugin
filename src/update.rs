@@ -64,7 +64,9 @@ impl UpdateVersion for DottedVersion {
 pub fn update_kind(eco: Ecosystem, current: &str, latest: &str) -> Option<UpdateKind> {
     match eco {
         Ecosystem::PyPI => update_kind_of::<Pep440>(current, latest),
-        Ecosystem::Packagist | Ecosystem::Pub => update_kind_of::<DottedVersion>(current, latest),
+        Ecosystem::Packagist | Ecosystem::Pub | Ecosystem::NuGet => {
+            update_kind_of::<DottedVersion>(current, latest)
+        }
         _ => None,
     }
 }
@@ -73,7 +75,9 @@ pub fn update_kind(eco: Ecosystem, current: &str, latest: &str) -> Option<Update
 pub fn is_outdated(eco: Ecosystem, declared: &str, latest: &str) -> bool {
     match eco {
         Ecosystem::PyPI => is_outdated_of::<Pep440>(declared, latest),
-        Ecosystem::Packagist | Ecosystem::Pub => is_outdated_of::<DottedVersion>(declared, latest),
+        Ecosystem::Packagist | Ecosystem::Pub | Ecosystem::NuGet => {
+            is_outdated_of::<DottedVersion>(declared, latest)
+        }
         _ => false,
     }
 }
@@ -83,6 +87,7 @@ pub fn render_update(eco: Ecosystem, dep: &Dependency, latest: &str) -> Option<S
     match eco {
         Ecosystem::PyPI => pep440_render_update(dep, latest),
         Ecosystem::Packagist | Ecosystem::Pub => dotted_render_update(dep, latest),
+        Ecosystem::NuGet => nuget_render_update(dep, latest),
         _ => None,
     }
 }
@@ -140,6 +145,24 @@ fn pep440_render_update(dep: &Dependency, latest: &str) -> Option<String> {
     }
     let (operator, _) = split_operator(&dep.version);
     Some(format!("{operator}{latest}"))
+}
+
+/// Replaces a NuGet version with the full `latest`. NuGet pins are exact, so the
+/// declared precision and operators do not apply. Floating, range and property
+/// versions name no single version to replace, so they are left alone.
+fn nuget_render_update(dep: &Dependency, latest: &str) -> Option<String> {
+    if dep.version.contains(char::is_whitespace)
+        || dep.version.contains(['*', '$', '(', '[', ',', '|'])
+        || latest.contains(char::is_whitespace)
+    {
+        return None;
+    }
+    let declared = DottedVersion::parse(&dep.version)?;
+    let latest_version = DottedVersion::parse(latest)?;
+    if latest_version.is_prerelease() || latest_version == declared {
+        return None;
+    }
+    Some(latest.to_owned())
 }
 
 /// Rewrites a Composer or pub.dev requirement to `latest`. It keeps the operator and
@@ -372,6 +395,63 @@ mod tests {
         assert_eq!(render("any", "1.2.0"), None);
         assert_eq!(render(">=1.0.0 <2.0.0", "3.0.0"), None);
         assert_eq!(render("^1.0.0", "2.0.0-dev.1"), None);
+    }
+
+    /// Parses a `.csproj` with one `Newtonsoft.Json` reference and returns that dependency.
+    fn nuget_dependency(requirement: &str) -> Dependency {
+        let text = format!(
+            r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="{requirement}" /></ItemGroup></Project>"#
+        );
+        parsers::csharp::parse(&text)
+            .into_iter()
+            .next()
+            .expect("one dependency")
+    }
+
+    #[test]
+    fn nuget_is_outdated_compares_the_declared_lower_bound() {
+        assert!(is_outdated(Ecosystem::NuGet, "13.0.3", "13.0.4"));
+        assert!(!is_outdated(Ecosystem::NuGet, "13.0.3", "13.0.3"));
+        assert!(!is_outdated(Ecosystem::NuGet, "13.0.3", "14.0.0-beta1"));
+        // The lower bound of a range decides, as for the other dotted ecosystems.
+        assert!(is_outdated(Ecosystem::NuGet, "[1.0,2.0)", "3.0.0"));
+        assert!(!is_outdated(Ecosystem::NuGet, "1.*", "3.0.0"));
+        assert!(!is_outdated(Ecosystem::NuGet, "$(Missing)", "3.0.0"));
+    }
+
+    #[test]
+    fn nuget_update_kind_names_the_first_changed_segment() {
+        assert_eq!(
+            update_kind(Ecosystem::NuGet, "13.0.3", "14.0.0"),
+            Some(UpdateKind::Major)
+        );
+        assert_eq!(
+            update_kind(Ecosystem::NuGet, "13.0.3", "13.1.0"),
+            Some(UpdateKind::Minor)
+        );
+        assert_eq!(
+            update_kind(Ecosystem::NuGet, "13.0.3", "13.0.4"),
+            Some(UpdateKind::Patch)
+        );
+        assert_eq!(
+            update_kind(Ecosystem::NuGet, "13.0.3", "14.0.0-beta1"),
+            Some(UpdateKind::Prerelease)
+        );
+        assert_eq!(update_kind(Ecosystem::NuGet, "13.0.3", "13.0.3"), None);
+    }
+
+    #[test]
+    fn nuget_render_writes_the_full_latest_version() {
+        let render = |requirement: &str, latest: &str| {
+            render_update(Ecosystem::NuGet, &nuget_dependency(requirement), latest)
+        };
+        assert_eq!(render("13.0.3", "13.0.4").as_deref(), Some("13.0.4"));
+        assert_eq!(render("4.2.2", "4.2.2.1").as_deref(), Some("4.2.2.1"));
+        assert_eq!(render("13.0.3", "13.0.3"), None);
+        assert_eq!(render("1.*", "3.0.0"), None);
+        assert_eq!(render("[1.0,2.0)", "3.0.0"), None);
+        assert_eq!(render("$(SerilogVersion)", "3.1.2"), None);
+        assert_eq!(render("13.0.3", "14.0.0-beta1"), None);
     }
 
     #[test]
