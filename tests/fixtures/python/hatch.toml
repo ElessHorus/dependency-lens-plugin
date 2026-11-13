@@ -1,0 +1,8 @@
+[envs.default]
+dependencies = ["pytest==7.4.0"]
+
+[envs.lint]
+extra-dependencies = [
+  "ruff==0.4.1",
+  "mypy>=1.5",
+]

@@ -57,7 +57,7 @@ impl Ecosystem {
         match self {
             Ecosystem::Cargo => parsers::cargo::parse(text),
             Ecosystem::Npm => Vec::new(),
-            Ecosystem::PyPI => Vec::new(),
+            Ecosystem::PyPI => parsers::python::parse(text),
             Ecosystem::Go => Vec::new(),
             Ecosystem::Packagist => Vec::new(),
             Ecosystem::Pub => Vec::new(),

@@ -60,23 +60,26 @@ pub struct OsvQuery {
 /// Returns `None` when the requirement names no registry version, such as `*`,
 /// a workspace, file or git source, or an unresolved `${...}` property.
 pub fn declared_version_for_osv(spec: &str) -> Option<String> {
-    // Only the first comma-separated requirement names one version.
-    let first_requirement = spec.trim_start().split(',').next()?.trim();
+    // Only the first alternative of the first comma-separated requirement names one version.
+    let first_requirement = spec.split(',').next()?.split("||").next()?.trim();
     let without_operator = VERSION_OPERATORS
         .iter()
         .find_map(|operator| first_requirement.strip_prefix(*operator))
-        .unwrap_or(first_requirement);
+        .unwrap_or(first_requirement)
+        .trim_start();
     // A `v` marks a Go-style version only when a digit follows it.
     let without_v = match without_operator.strip_prefix(['v', 'V']) {
         Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => rest,
         _ => without_operator,
     };
-    let version = without_v.trim();
+    // A range such as `>=1.0 <2.0` names its first version only, so the text stops at a space.
+    let version = without_v.split_whitespace().next()?;
     let has_digit = version.bytes().any(|byte| byte.is_ascii_digit());
     // `:` marks URLs and `workspace:`/`file:` sources, `$` marks unresolved properties.
+    // `*` marks a wildcard, which names no single version.
     let names_source =
         version.contains([':', '$']) || version.starts_with("git") || version.starts_with("path");
-    (has_digit && !names_source).then(|| version.to_owned())
+    (has_digit && !names_source && !version.contains('*')).then(|| version.to_owned())
 }
 
 /// Returns the CVSS v3.x base score of `vector`, or `None` for other versions or invalid vectors.
@@ -589,6 +592,24 @@ mod tests {
             declared_version_for_osv(">=2.0, <3").as_deref(),
             Some("2.0")
         );
+    }
+
+    #[test]
+    fn keeps_first_alternative_and_first_word_of_a_range() {
+        assert_eq!(
+            declared_version_for_osv("^1.0 || ^2.0").as_deref(),
+            Some("1.0")
+        );
+        assert_eq!(
+            declared_version_for_osv(">=1.0 <2.0").as_deref(),
+            Some("1.0")
+        );
+    }
+
+    #[test]
+    fn rejects_wildcard_versions() {
+        assert_eq!(declared_version_for_osv("2.*"), None);
+        assert_eq!(declared_version_for_osv("==2.*"), None);
     }
 
     #[test]
