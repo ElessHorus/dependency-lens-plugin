@@ -3,7 +3,7 @@
 use crate::parsers;
 
 /// A package registry that a manifest file belongs to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Ecosystem {
     /// Rust crates (`Cargo.toml`).
     Cargo,
