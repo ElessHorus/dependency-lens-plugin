@@ -245,7 +245,9 @@ fn field_slot<'p, 'a>(
 
 /// Reads the trimmed text of `text[content_start..content_end]` as a plain value.
 ///
-/// Returns `None` when the content holds child markup, an entity, or a line break.
+/// Returns `None` when the content holds child markup, an entity, or when the trimmed
+/// text spans lines. Whitespace around the value, such as a pretty-printed line break,
+/// is allowed: the span covers only the trimmed text.
 /// An entity would make the raw span differ from the value, so the value is dropped.
 fn read_field<'a>(
     text: &'a str,
@@ -260,13 +262,12 @@ fn read_field<'a>(
     if !matches!(unescape(raw), Ok(Cow::Borrowed(_))) {
         return None;
     }
-    // The untrimmed content must lie on one line, as the brief requires for every element.
-    index.span(content_start, content_end)?;
     let value = raw.trim_ascii();
     if value.is_empty() {
         return None;
     }
     let value_start = content_start + (raw.len() - raw.trim_ascii_start().len());
+    // `span` returns `None` when the trimmed text contains a line break.
     let span = index.span(value_start, value_start + value.len())?;
     Some(Field { text: value, span })
 }
@@ -444,11 +445,42 @@ mod tests {
         assert_eq!(dependencies[0].name, "c:d");
     }
 
+    // Changed from `<version>\n1.0\n</version>` (expected dropped) to a value whose
+    // trimmed text really spans two lines: R24 keeps pretty-printed values.
     #[test]
-    fn version_split_over_two_lines_skips_the_dependency() {
+    fn value_whose_trimmed_text_spans_two_lines_is_dropped() {
         let text = "<project><dependencies><dependency>\
                     <groupId>a</groupId><artifactId>b</artifactId>\
-                    <version>\n1.0\n</version></dependency></dependencies></project>";
+                    <version>1.0\n2.0</version></dependency></dependencies></project>";
         assert!(parse(text).is_empty());
+    }
+
+    #[test]
+    fn pretty_printed_value_is_trimmed_and_kept() {
+        let text = "<project><dependencies><dependency>\n  <groupId>a</groupId>\n  \
+                    <artifactId>b</artifactId>\n  <version>\n    1.0\n  </version>\n\
+                    </dependency></dependencies></project>";
+        let dependencies = parse(text);
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].version, "1.0");
+        assert_eq!(
+            text_of_span(text, dependencies[0].version_span).as_deref(),
+            Some("1.0")
+        );
+    }
+
+    #[test]
+    fn property_declared_after_its_use_resolves() {
+        let text = "<project><dependencies><dependency><groupId>a</groupId>\
+                    <artifactId>b</artifactId><version>${p}</version></dependency>\
+                    </dependencies><properties><p>2</p></properties></project>";
+        let dependencies = parse(text);
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].version, "2");
+        assert_eq!(
+            text_of_span(text, dependencies[0].version_span).as_deref(),
+            Some("${p}")
+        );
+        assert!(dependencies[0].has_additional_version_constraints);
     }
 }

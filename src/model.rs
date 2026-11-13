@@ -2,6 +2,20 @@
 
 use crate::parsers;
 
+/// UTF-8 byte order mark that some editors write at the start of a file.
+const BYTE_ORDER_MARK: char = '\u{feff}';
+
+/// Byte length of [`BYTE_ORDER_MARK`], which shifts the spans on line 0.
+const BYTE_ORDER_MARK_BYTES: u32 = BYTE_ORDER_MARK.len_utf8() as u32;
+
+/// Moves a span on line 0 past the byte order mark. Spans on other lines are unchanged.
+fn shift_first_line(span: &mut Span) {
+    if span.line == 0 {
+        span.line_start = span.line_start.saturating_add(BYTE_ORDER_MARK_BYTES);
+        span.line_end = span.line_end.saturating_add(BYTE_ORDER_MARK_BYTES);
+    }
+}
+
 /// A package registry that a manifest file belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Ecosystem {
@@ -52,8 +66,24 @@ impl Ecosystem {
 
     /// Parses the dependencies declared in a manifest of this ecosystem.
     ///
-    /// Ecosystems without a parser yet return an empty vector.
+    /// A leading byte order mark is skipped here, once for every parser. Its bytes
+    /// sit on line 0, so only the line 0 spans move past it.
     pub fn parse(self, text: &str) -> Vec<Dependency> {
+        let Some(body) = text.strip_prefix(BYTE_ORDER_MARK) else {
+            return self.parse_body(text);
+        };
+        let mut dependencies = self.parse_body(body);
+        for dependency in &mut dependencies {
+            shift_first_line(&mut dependency.name_span);
+            shift_first_line(&mut dependency.version_span);
+        }
+        dependencies
+    }
+
+    /// Dispatches to the parser of this ecosystem. `text` has no byte order mark.
+    ///
+    /// Ecosystems without a parser yet return an empty vector.
+    fn parse_body(self, text: &str) -> Vec<Dependency> {
         match self {
             Ecosystem::Cargo => parsers::cargo::parse(text),
             Ecosystem::Npm => parsers::npm::parse(text),
@@ -274,5 +304,91 @@ mod tests {
     fn advisory_severity_orders_from_low_to_critical() {
         assert!(AdvisorySeverity::Low < AdvisorySeverity::Medium);
         assert!(AdvisorySeverity::High < AdvisorySeverity::Critical);
+    }
+}
+
+#[cfg(test)]
+mod byte_order_mark_tests {
+    use super::*;
+    use crate::text::text_of_span;
+
+    const CARGO: &str = include_str!("../tests/fixtures/cargo/Cargo.toml");
+    const NPM: &str = include_str!("../tests/fixtures/npm/package.json");
+    const PYPI: &str = include_str!("../tests/fixtures/python/requirements.txt");
+    const GO: &str = include_str!("../tests/fixtures/go/go.mod");
+    const MAVEN: &str = include_str!("../tests/fixtures/maven/pom.xml");
+
+    /// Returns the fields that a byte order mark must not change.
+    fn summary(dependencies: &[Dependency]) -> Vec<(&str, &str, bool, bool, bool)> {
+        dependencies
+            .iter()
+            .map(|dependency| {
+                (
+                    dependency.name.as_str(),
+                    dependency.version.as_str(),
+                    dependency.dev,
+                    dependency.optional,
+                    dependency.has_additional_version_constraints,
+                )
+            })
+            .collect()
+    }
+
+    /// Returns the text under each version span, read back from `text`.
+    fn version_texts(text: &str, dependencies: &[Dependency]) -> Vec<Option<String>> {
+        dependencies
+            .iter()
+            .map(|dependency| text_of_span(text, dependency.version_span))
+            .collect()
+    }
+
+    fn assert_byte_order_mark_is_transparent(ecosystem: Ecosystem, plain: &str) {
+        let bom_text = format!("\u{feff}{plain}");
+        let plain_dependencies = ecosystem.parse(plain);
+        let bom_dependencies = ecosystem.parse(&bom_text);
+        assert!(
+            !plain_dependencies.is_empty(),
+            "{ecosystem:?} fixture is empty"
+        );
+        assert_eq!(summary(&bom_dependencies), summary(&plain_dependencies));
+        let plain_versions = version_texts(plain, &plain_dependencies);
+        assert_eq!(version_texts(&bom_text, &bom_dependencies), plain_versions);
+        assert!(plain_versions.iter().all(Option::is_some));
+    }
+
+    #[test]
+    fn every_ecosystem_ignores_a_leading_byte_order_mark() {
+        assert_byte_order_mark_is_transparent(Ecosystem::Cargo, CARGO);
+        assert_byte_order_mark_is_transparent(Ecosystem::Npm, NPM);
+        assert_byte_order_mark_is_transparent(Ecosystem::PyPI, PYPI);
+        assert_byte_order_mark_is_transparent(Ecosystem::Go, GO);
+        assert_byte_order_mark_is_transparent(Ecosystem::Maven, MAVEN);
+    }
+
+    #[test]
+    fn maven_spans_are_identical_with_a_byte_order_mark() {
+        let bom_text = format!("\u{feff}{MAVEN}");
+        assert_eq!(
+            Ecosystem::Maven.parse(&bom_text),
+            Ecosystem::Maven.parse(MAVEN)
+        );
+    }
+
+    #[test]
+    fn byte_order_mark_shifts_spans_on_line_zero_by_three_bytes() {
+        let plain = r#"{"dependencies":{"a":"1.0.0"}}"#;
+        let bom_text = format!("\u{feff}{plain}");
+        let plain_dependencies = Ecosystem::Npm.parse(plain);
+        let bom_dependencies = Ecosystem::Npm.parse(&bom_text);
+        assert_eq!(plain_dependencies.len(), 1);
+        assert_eq!(bom_dependencies.len(), 1);
+        assert_eq!(
+            bom_dependencies[0].version_span.line_start,
+            plain_dependencies[0].version_span.line_start + 3
+        );
+        assert_eq!(
+            text_of_span(&bom_text, bom_dependencies[0].version_span).as_deref(),
+            Some("1.0.0")
+        );
     }
 }
