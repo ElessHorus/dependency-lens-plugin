@@ -2,6 +2,9 @@
 
 use crate::parsers;
 
+/// Suffixes of the MSBuild project files that name NuGet packages (C#, F#, Visual Basic).
+const NUGET_PROJECT_SUFFIXES: [&str; 3] = [".csproj", ".fsproj", ".vbproj"];
+
 /// UTF-8 byte order mark that some editors write at the start of a file.
 const BYTE_ORDER_MARK: char = '\u{feff}';
 
@@ -31,7 +34,7 @@ pub enum Ecosystem {
     Packagist,
     /// Dart and Flutter packages (`pubspec.yaml`).
     Pub,
-    /// .NET packages (`*.csproj`, MSBuild props).
+    /// .NET packages (`*.csproj`, `*.fsproj`, `*.vbproj`, MSBuild props).
     NuGet,
     /// Ruby gems (`Gemfile`).
     RubyGems,
@@ -56,7 +59,12 @@ impl Ecosystem {
             "pubspec.yaml" => Some(Ecosystem::Pub),
             "Gemfile" => Some(Ecosystem::RubyGems),
             "Directory.Build.props" | "Directory.Packages.props" => Some(Ecosystem::NuGet),
-            _ if file_name.ends_with(".csproj") => Some(Ecosystem::NuGet),
+            _ if NUGET_PROJECT_SUFFIXES
+                .iter()
+                .any(|suffix| file_name.ends_with(suffix)) =>
+            {
+                Some(Ecosystem::NuGet)
+            }
             _ if file_name.starts_with("requirements") && file_name.ends_with(".txt") => {
                 Some(Ecosystem::PyPI)
             }
@@ -91,7 +99,7 @@ impl Ecosystem {
             Ecosystem::Go => parsers::go::parse(text),
             Ecosystem::Packagist => parsers::php::parse(text),
             Ecosystem::Pub => parsers::dart::parse(text),
-            Ecosystem::NuGet => Vec::new(),
+            Ecosystem::NuGet => parsers::csharp::parse(text),
             Ecosystem::RubyGems => Vec::new(),
             Ecosystem::Maven => parsers::maven::parse(text),
         }
@@ -242,6 +250,21 @@ mod tests {
     }
 
     #[test]
+    fn detects_msbuild_project_and_props_files_as_nuget() {
+        assert_eq!(Ecosystem::detect("/p/App.fsproj"), Some(Ecosystem::NuGet));
+        assert_eq!(Ecosystem::detect("/p/App.vbproj"), Some(Ecosystem::NuGet));
+        assert_eq!(
+            Ecosystem::detect("/p/Directory.Build.props"),
+            Some(Ecosystem::NuGet)
+        );
+        assert_eq!(
+            Ecosystem::detect("/p/Directory.Packages.props"),
+            Some(Ecosystem::NuGet)
+        );
+        assert_eq!(Ecosystem::detect("/p/App.cs"), None);
+    }
+
+    #[test]
     fn accepts_windows_separators() {
         assert_eq!(
             Ecosystem::detect(r"C:\repo\app\Cargo.toml"),
@@ -273,7 +296,15 @@ mod tests {
     fn parse_dispatches_cargo_and_returns_empty_for_unported_ecosystems() {
         let manifest = "[dependencies]\nserde = \"1.0\"\n";
         assert_eq!(Ecosystem::Cargo.parse(manifest).len(), 1);
-        assert!(Ecosystem::NuGet.parse(manifest).is_empty());
+        assert!(Ecosystem::RubyGems.parse(manifest).is_empty());
+    }
+
+    #[test]
+    fn parse_dispatches_nuget_to_the_csharp_parser() {
+        let manifest = include_str!("../tests/fixtures/csharp/app.csproj");
+        let dependencies = Ecosystem::NuGet.parse(manifest);
+        assert_eq!(dependencies.len(), 10);
+        assert_eq!(dependencies, parsers::csharp::parse(manifest));
     }
 
     #[test]

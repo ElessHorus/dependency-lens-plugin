@@ -5,26 +5,17 @@
 //! resolvable version are not returned. Parent POMs, profiles and BOM imports
 //! are not resolved.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 
-use quick_xml::escape::unescape;
 use quick_xml::events::Event;
-use quick_xml::name::QName;
 use quick_xml::reader::Reader;
 
 use super::spans::LineIndex;
-use crate::model::{Dependency, Span};
+use super::xml_text::{Field, byte_offset, element_name, read_field};
+use crate::model::Dependency;
 
 /// Elements whose `<dependency>` children belong to build tools, not to the project.
 const EXCLUDED_SECTIONS: [&str; 3] = ["plugin", "plugins", "reporting"];
-
-/// Text of one element, with the span of its trimmed content.
-#[derive(Clone, Copy)]
-struct Field<'a> {
-    text: &'a str,
-    span: Span,
-}
 
 /// A child of `<dependency>` whose text the parser reads.
 #[derive(Clone, Copy)]
@@ -207,16 +198,6 @@ fn build_dependency(pending: PendingDependency<'_>) -> Option<(Dependency, Optio
     Some((dependency, placeholder_property(version.text)))
 }
 
-/// Returns the byte offset of a reader position, or `None` when it does not fit `usize`.
-fn byte_offset(position: u64) -> Option<usize> {
-    usize::try_from(position).ok()
-}
-
-/// Returns the element name that starts at `name_start` in `text`.
-fn element_name<'a>(text: &'a str, name_start: usize, name: QName<'_>) -> Option<&'a str> {
-    text.get(name_start..)?.get(..name.0.len())
-}
-
 /// Maps a `<dependency>` child name to the field it fills.
 fn field_kind(name: &str) -> Option<FieldKind> {
     match name {
@@ -241,35 +222,6 @@ fn field_slot<'p, 'a>(
         FieldKind::Scope => &mut pending.scope,
         FieldKind::Optional => &mut pending.optional,
     }
-}
-
-/// Reads the trimmed text of `text[content_start..content_end]` as a plain value.
-///
-/// Returns `None` when the content holds child markup, an entity, or when the trimmed
-/// text spans lines. Whitespace around the value, such as a pretty-printed line break,
-/// is allowed: the span covers only the trimmed text.
-/// An entity would make the raw span differ from the value, so the value is dropped.
-fn read_field<'a>(
-    text: &'a str,
-    index: &LineIndex<'_>,
-    content_start: usize,
-    content_end: usize,
-) -> Option<Field<'a>> {
-    let raw = text.get(content_start..content_end)?;
-    if raw.contains('<') {
-        return None;
-    }
-    if !matches!(unescape(raw), Ok(Cow::Borrowed(_))) {
-        return None;
-    }
-    let value = raw.trim_ascii();
-    if value.is_empty() {
-        return None;
-    }
-    let value_start = content_start + (raw.len() - raw.trim_ascii_start().len());
-    // `span` returns `None` when the trimmed text contains a line break.
-    let span = index.span(value_start, value_start + value.len())?;
-    Some(Field { text: value, span })
 }
 
 /// Returns the property name of a `${name}` version, or `None` for any other text.

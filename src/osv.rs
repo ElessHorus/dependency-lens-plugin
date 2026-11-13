@@ -666,6 +666,16 @@ mod tests {
     }
 
     #[test]
+    fn nuget_wildcards_properties_and_ranges_follow_the_osv_rules() {
+        assert_eq!(declared_version_for_osv("1.*"), None);
+        assert_eq!(declared_version_for_osv("$(Missing)"), None);
+        assert_eq!(
+            declared_version_for_osv("[1.0,2.0)").as_deref(),
+            Some("1.0")
+        );
+    }
+
+    #[test]
     fn rejects_wildcard_versions() {
         assert_eq!(declared_version_for_osv("2.*"), None);
         assert_eq!(declared_version_for_osv("==2.*"), None);

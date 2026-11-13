@@ -1,0 +1,8 @@
+<Project>
+
+  <ItemGroup>
+    <PackageVersion Include="Moq" Version="4.20.70" />
+    <GlobalPackageReference Include="StyleCop.Analyzers" Version="1.2.0-beta.556" />
+  </ItemGroup>
+
+</Project>
