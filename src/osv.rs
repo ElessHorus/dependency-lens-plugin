@@ -593,6 +593,10 @@ mod tests {
             Some("1.2.3")
         );
         assert_eq!(declared_version_for_osv("v0.9.1").as_deref(), Some("0.9.1"));
+        assert_eq!(
+            declared_version_for_osv("v2.0.0+incompatible").as_deref(),
+            Some("2.0.0+incompatible")
+        );
         assert_eq!(declared_version_for_osv("1.2.3").as_deref(), Some("1.2.3"));
         assert_eq!(
             declared_version_for_osv(">=2.0, <3").as_deref(),
