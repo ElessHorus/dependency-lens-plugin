@@ -280,6 +280,11 @@ fn request_version_info(
     eco.parse_registry(&String::from_utf8_lossy(&response.body))
 }
 
+/// The failure-cache key of one package version, so a failure of one version leaves the others alone.
+fn osv_failure_key(name: &str, version: &str) -> String {
+    format!("{name}@{version}")
+}
+
 /// Reason stored when an OSV re-query loads no advisory detail.
 const DETAILS_NOT_LOADED: &str = "OSV: advisory details not loaded";
 
@@ -339,7 +344,12 @@ fn query_missing_vulnerabilities(
             None => None,
         };
         if cache
-            .failure(FailureKind::Osv, eco, &dependency.name, now)
+            .failure(
+                FailureKind::Osv,
+                eco,
+                &osv_failure_key(&dependency.name, version),
+                now,
+            )
             .is_some()
             || !seen.insert((dependency.name.as_str(), version))
         {
@@ -381,11 +391,13 @@ fn query_missing_vulnerabilities(
                 if made_no_progress {
                     fresh
                         .failed
-                        .insert(query.name.clone(), DETAILS_NOT_LOADED.to_owned());
+                        .entry(query.name.clone())
+                        .or_default()
+                        .insert(query.version.clone(), DETAILS_NOT_LOADED.to_owned());
                     cache.put_failure(
                         FailureKind::Osv,
                         eco,
-                        &query.name,
+                        &osv_failure_key(&query.name, &query.version),
                         DETAILS_NOT_LOADED.to_owned(),
                         now,
                     );
@@ -394,8 +406,18 @@ fn query_missing_vulnerabilities(
         }
         Err(reason) => {
             for query in &queries {
-                fresh.failed.insert(query.name.clone(), reason.clone());
-                cache.put_failure(FailureKind::Osv, eco, &query.name, reason.clone(), now);
+                fresh
+                    .failed
+                    .entry(query.name.clone())
+                    .or_default()
+                    .insert(query.version.clone(), reason.clone());
+                cache.put_failure(
+                    FailureKind::Osv,
+                    eco,
+                    &osv_failure_key(&query.name, &query.version),
+                    reason.clone(),
+                    now,
+                );
             }
         }
     }
@@ -411,8 +433,8 @@ fn query_missing_vulnerabilities(
 struct FreshOsv {
     /// Package name, then declared version, to the advisories OSV returned.
     found: HashMap<String, HashMap<String, Vec<Vulnerability>>>,
-    /// Package name to the reason its OSV answer is missing or incomplete.
-    failed: HashMap<String, String>,
+    /// Package name, then declared version, to the reason its OSV answer is missing or incomplete.
+    failed: HashMap<String, HashMap<String, String>>,
 }
 
 impl FreshOsv {
@@ -420,8 +442,8 @@ impl FreshOsv {
         self.found.get(name)?.get(version).map(Vec::as_slice)
     }
 
-    fn failure(&self, name: &str) -> Option<&str> {
-        self.failed.get(name).map(String::as_str)
+    fn failure(&self, name: &str, version: &str) -> Option<&str> {
+        self.failed.get(name)?.get(version).map(String::as_str)
     }
 }
 
@@ -469,10 +491,18 @@ fn build_entry(
                 .then(|| current.clone())
         })
         .collect();
-    let status = match fresh
-        .failure(&dependency.name)
-        .or_else(|| cache.failure(FailureKind::Osv, eco, &dependency.name, now))
-    {
+    // An OSV failure belongs to one package version, so an entry without a checked version has none.
+    let failure = checked_version.as_deref().and_then(|version| {
+        fresh.failure(&dependency.name, version).or_else(|| {
+            cache.failure(
+                FailureKind::Osv,
+                eco,
+                &osv_failure_key(&dependency.name, version),
+                now,
+            )
+        })
+    });
+    let status = match failure {
         Some(reason) => Status::Unknown(reason.to_owned()),
         None => Status::NotChecked,
     };
@@ -1903,5 +1933,34 @@ mod tests {
         // The ten loaded advisories are High, so only the five deferred ones remain.
         assert_eq!(old.vulnerabilities.len(), 5);
         assert!(old.vulnerabilities.iter().all(crate::osv::is_deferred));
+    }
+
+    #[test]
+    fn an_osv_failure_of_one_version_does_not_mark_another_version_of_the_package() {
+        let http = FakeHttp::new()
+            .route(
+                "POST",
+                BATCH_URL,
+                200,
+                r#"{"results":[{"vulns":[{"id":"GHSA-0001"}]},{}]}"#,
+            )
+            .route("GET", &format!("{DETAIL_PREFIX}GHSA-0001"), 500, "");
+        let manifest =
+            "[dependencies]\nserde = \"1.0.0\"\n\n[dev-dependencies]\nserde = \"1.0.200\"\n";
+        let mut cache = Cache::new(TTL_SECS);
+        let analysis = run(&mut cache, &http, &Settings::default(), NOW, manifest);
+        let status_of = |version: &str| {
+            analysis
+                .entries
+                .iter()
+                .find(|entry| entry.dependency.version == version)
+                .map(|entry| entry.status.clone())
+                .unwrap_or_else(|| panic!("missing entry {version}"))
+        };
+        assert_eq!(
+            status_of("1.0.0"),
+            Status::Unknown(DETAILS_NOT_LOADED.to_owned())
+        );
+        assert_eq!(status_of("1.0.200"), Status::NotChecked);
     }
 }
