@@ -6,6 +6,7 @@ use crate::model::{Dependency, Ecosystem, VersionInfo, Vulnerability};
 use crate::osv::{OsvQuery, declared_version_for_osv, query_batch};
 use crate::settings::Settings;
 use crate::update::is_outdated;
+use openidea_plugin::HttpRequest;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -167,14 +168,22 @@ fn resolve_registry(
             status_from_lookup(eco, declared, Err(reason))
         } else if let Some(lookup) = fresh.get(&*name) {
             status_from_lookup(eco, declared, lookup_view(lookup))
-        } else if budget.take() {
-            let lookup = lookup_registry(eco, &entry.dependency.name, &name, http, cache, now);
-            let status = status_from_lookup(eco, declared, lookup_view(&lookup));
-            fresh.insert(name.into_owned(), lookup);
-            status
         } else {
-            pending_count += 1;
-            Status::Pending
+            // The request is built before the budget is spent, so an invalid name costs no lookup.
+            // Its status is not cached, so a later fix of the manifest takes effect at once.
+            let Some(request) = eco.registry_request(&entry.dependency.name) else {
+                entry.status = Status::Unknown("registry: invalid package name".to_owned());
+                continue;
+            };
+            if budget.take() {
+                let lookup = lookup_registry(eco, request, &name, http, cache, now);
+                let status = status_from_lookup(eco, declared, lookup_view(&lookup));
+                fresh.insert(name.into_owned(), lookup);
+                status
+            } else {
+                pending_count += 1;
+                Status::Pending
+            }
         };
         entry.status = status;
     }
@@ -205,16 +214,16 @@ fn status_from_lookup(
     }
 }
 
-/// Asks the registry for `package`, stores the answer or the failure under `name`, and returns the outcome.
+/// Sends `request` to the registry, stores the answer or the failure under `name`, and returns the outcome.
 fn lookup_registry(
     eco: Ecosystem,
-    package: &str,
+    request: HttpRequest,
     name: &str,
     http: &dyn Http,
     cache: &mut Cache,
     now: u64,
 ) -> Lookup {
-    match request_version_info(eco, package, http) {
+    match request_version_info(eco, &request, http) {
         Ok(info) => {
             let latest = info.latest.clone();
             cache.put_version_info(eco, name, info, now);
@@ -227,17 +236,14 @@ fn lookup_registry(
     }
 }
 
-/// Sends the registry request for `package` and reads the answer. Errors carry the `registry:` prefix.
+/// Sends the registry `request` and reads the answer. Errors carry the `registry:` prefix.
 fn request_version_info(
     eco: Ecosystem,
-    package: &str,
+    request: &HttpRequest,
     http: &dyn Http,
 ) -> Result<VersionInfo, String> {
-    let Some(request) = eco.registry_request(package) else {
-        return Err("registry: no request".to_owned());
-    };
     let response = http
-        .send(&request)
+        .send(request)
         .map_err(|message| format!("registry: {message}"))?;
     if !(200..=299).contains(&response.status) {
         return Err(format!("registry: HTTP {}", response.status));
@@ -340,7 +346,7 @@ fn build_entry(
 mod tests {
     use super::*;
     use crate::http::FakeHttp;
-    use crate::model::AdvisorySeverity;
+    use crate::model::{AdvisorySeverity, Span};
     use crate::parsers;
     use std::collections::BTreeSet;
     use std::time::Duration;
@@ -1307,5 +1313,93 @@ mod tests {
         );
         assert_eq!(analysis.pending, 0);
         assert_eq!(http.count(PYPI_PREFIX), 300);
+    }
+
+    /// Builds a PyPI dependency literal. The parser would cut names such as `bad?name` short, so the tests skip it.
+    fn pypi_dependency(name: &str, version: &str) -> Dependency {
+        let span = Span {
+            line: 0,
+            line_start: 0,
+            line_end: 0,
+        };
+        Dependency {
+            name: name.to_owned(),
+            version: version.to_owned(),
+            name_span: span,
+            version_span: span,
+            dev: false,
+            optional: false,
+            has_additional_version_constraints: false,
+        }
+    }
+
+    #[test]
+    fn invalid_package_name_is_unknown_without_registry_request_or_cache_entry() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new().route("POST", BATCH_URL, 200, &batch_body(1));
+        let first = analyze(
+            Ecosystem::PyPI,
+            vec![pypi_dependency("bad?name", "1.0")],
+            &mut cache,
+            &http,
+            &Settings::default(),
+            NOW,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(
+            entry(&first, "bad?name").status,
+            Status::Unknown("registry: invalid package name".to_string())
+        );
+        assert_eq!(http.count(PYPI_PREFIX), 0);
+        assert!(
+            cache
+                .version_info(Ecosystem::PyPI, "bad?name", NOW)
+                .is_none()
+        );
+        assert!(
+            cache
+                .failure(FailureKind::Registry, Ecosystem::PyPI, "bad?name", NOW)
+                .is_none()
+        );
+
+        let second = analyze(
+            Ecosystem::PyPI,
+            vec![pypi_dependency("bad?name", "1.0")],
+            &mut cache,
+            &http,
+            &Settings::default(),
+            NOW,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(entry(&second, "bad?name").status, first.entries[0].status);
+        assert_eq!(http.count(PYPI_PREFIX), 0);
+    }
+
+    #[test]
+    fn invalid_package_name_consumes_no_budget() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("GET", REQUESTS_URL, 200, REQUESTS_BODY);
+        let analysis = analyze(
+            Ecosystem::PyPI,
+            vec![
+                pypi_dependency("bad?name", "1.0"),
+                pypi_dependency("requests", "2.28.0"),
+            ],
+            &mut cache,
+            &http,
+            &Settings::default(),
+            NOW,
+            &mut Budget::new(1, None),
+        );
+        assert_eq!(analysis.pending, 0);
+        assert_eq!(
+            entry(&analysis, "requests").status,
+            Status::Outdated {
+                latest: "2.31.0".to_owned()
+            }
+        );
+        assert_eq!(http.count(REQUESTS_URL), 1);
     }
 }

@@ -38,6 +38,64 @@ pub fn rank_with<V: Ord>(
     }
 }
 
+/// True when `name` is a plausible package name for `eco`'s registry (ASCII only, no path or query characters).
+///
+/// Names come from manifest text and go into URL paths unencoded, so each grammar
+/// is strict. Every check works on bytes: a non-ASCII byte never matches a class.
+pub fn is_valid_package_name(eco: Ecosystem, name: &str) -> bool {
+    match eco {
+        Ecosystem::PyPI => is_bounded_run(name, 128, is_dotted_byte) && has_alphanumeric_ends(name),
+        Ecosystem::Packagist => match name.split_once('/') {
+            Some((vendor, package)) => {
+                is_packagist_segment(vendor) && is_packagist_segment(package)
+            }
+            None => false,
+        },
+        Ecosystem::Pub => is_bounded_run(name, 128, is_word_byte),
+        Ecosystem::NuGet | Ecosystem::RubyGems => {
+            is_bounded_run(name, 128, is_dotted_byte) && starts_alphanumeric(name)
+        }
+        Ecosystem::Cargo | Ecosystem::Npm | Ecosystem::Go | Ecosystem::Maven => false,
+    }
+}
+
+/// Letters, digits, `_`, `.` and `-`: the class of PyPI, Packagist, NuGet and RubyGems names.
+fn is_dotted_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')
+}
+
+/// Letters, digits and `_`: the class of Pub package names.
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// True when `segment` has 1 to `max_length` bytes and every byte passes `is_allowed`.
+fn is_bounded_run(segment: &str, max_length: usize, is_allowed: fn(u8) -> bool) -> bool {
+    (1..=max_length).contains(&segment.len()) && segment.bytes().all(is_allowed)
+}
+
+/// True when the first byte is a letter or digit.
+fn starts_alphanumeric(segment: &str) -> bool {
+    segment
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphanumeric)
+}
+
+/// True when the first and the last byte are letters or digits.
+fn has_alphanumeric_ends(segment: &str) -> bool {
+    starts_alphanumeric(segment)
+        && segment
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+}
+
+/// One side of a Packagist name: a dotted run of up to 100 bytes that is not `.` or `..`.
+fn is_packagist_segment(segment: &str) -> bool {
+    is_bounded_run(segment, 100, is_dotted_byte) && segment != "." && segment != ".."
+}
+
 impl Ecosystem {
     /// Returns the registry spelling of `name`. Borrows when nothing changes.
     pub fn normalize_package(self, name: &str) -> Cow<'_, str> {
@@ -58,8 +116,11 @@ impl Ecosystem {
         }
     }
 
-    /// Builds the request for the version list of `package`, or `None` without a registry client.
+    /// Builds the request for the version list of `package`, or `None` without a registry client or for an invalid name.
     pub fn registry_request(self, package: &str) -> Option<HttpRequest> {
+        if !is_valid_package_name(self, package) {
+            return None;
+        }
         match self {
             Ecosystem::PyPI => Some(pypi::request(package)),
             Ecosystem::Packagist => Some(packagist::request(package)),
@@ -253,6 +314,93 @@ mod tests {
                 .map(|request| request.url),
             Some("https://rubygems.org/api/v1/versions/rails.json".to_owned())
         );
+    }
+
+    /// Registry ecosystems that have a client, with one valid name each.
+    const REGISTRY_ECOSYSTEMS: [Ecosystem; 5] = [
+        Ecosystem::PyPI,
+        Ecosystem::Packagist,
+        Ecosystem::Pub,
+        Ecosystem::NuGet,
+        Ecosystem::RubyGems,
+    ];
+
+    #[test]
+    fn valid_package_names_are_accepted_per_registry() {
+        let valid_names = [
+            (Ecosystem::PyPI, "requests"),
+            (Ecosystem::PyPI, "Flask-Login"),
+            (Ecosystem::PyPI, "ruamel.yaml"),
+            (Ecosystem::PyPI, "a"),
+            (Ecosystem::PyPI, "zope.interface_2"),
+            (Ecosystem::Packagist, "monolog/monolog"),
+            (Ecosystem::Packagist, "Symfony/Console"),
+            (Ecosystem::Packagist, "a-b/c.d_e"),
+            (Ecosystem::Pub, "http"),
+            (Ecosystem::Pub, "flutter_bloc"),
+            (Ecosystem::Pub, "Provider2"),
+            (Ecosystem::NuGet, "Newtonsoft.Json"),
+            (Ecosystem::NuGet, "Serilog.Sinks.File"),
+            (Ecosystem::NuGet, "a-b_c"),
+            (Ecosystem::RubyGems, "rails"),
+            (Ecosystem::RubyGems, "aws-sdk-s3"),
+            (Ecosystem::RubyGems, "net-http_2.0"),
+        ];
+        for (eco, name) in valid_names {
+            assert!(is_valid_package_name(eco, name), "{eco:?} {name:?}");
+        }
+    }
+
+    #[test]
+    fn unsafe_package_names_are_rejected_by_every_registry() {
+        let unsafe_names = [
+            "", " ", "a b", "a\n", "é", "a?x=1", "a#frag", "a%2f", "a\\b", "..", "../x", "a/../b",
+            "a:b", "a@b", "a\0b",
+        ];
+        for eco in REGISTRY_ECOSYSTEMS {
+            for name in unsafe_names {
+                assert!(!is_valid_package_name(eco, name), "{eco:?} {name:?}");
+            }
+            let too_long = "a".repeat(300);
+            assert!(!is_valid_package_name(eco, &too_long), "{eco:?} long");
+        }
+    }
+
+    #[test]
+    fn registry_specific_package_name_rules_are_enforced() {
+        let rejected = [
+            (Ecosystem::PyPI, "-a"),
+            (Ecosystem::PyPI, "a-"),
+            (Ecosystem::Packagist, "monolog"),
+            (Ecosystem::Packagist, "a/b/c"),
+            (Ecosystem::Packagist, "/b"),
+            (Ecosystem::Packagist, "a/"),
+            (Ecosystem::Packagist, "./x"),
+            (Ecosystem::Packagist, "a/.."),
+            (Ecosystem::Pub, "a-b"),
+            (Ecosystem::Pub, "a.b"),
+            (Ecosystem::NuGet, ".hidden"),
+            (Ecosystem::NuGet, "-x"),
+            (Ecosystem::RubyGems, ".hidden"),
+            (Ecosystem::RubyGems, "-x"),
+        ];
+        for (eco, name) in rejected {
+            assert!(!is_valid_package_name(eco, name), "{eco:?} {name:?}");
+        }
+    }
+
+    #[test]
+    fn ecosystems_without_a_registry_client_reject_every_name() {
+        assert!(!is_valid_package_name(Ecosystem::Cargo, "serde"));
+    }
+
+    #[test]
+    fn registry_request_is_none_for_invalid_package_names() {
+        assert!(Ecosystem::PyPI.registry_request("a/../b").is_none());
+        assert!(Ecosystem::Packagist.registry_request("monolog").is_none());
+        assert!(Ecosystem::Pub.registry_request("a-b").is_none());
+        assert!(Ecosystem::NuGet.registry_request("x?y").is_none());
+        assert!(Ecosystem::RubyGems.registry_request("x#y").is_none());
     }
 
     #[test]
