@@ -129,11 +129,16 @@ fn parse_pep508(input: &str) -> Option<Pep508> {
             byte.is_ascii_whitespace()
         });
     }
+    // PEP 508 allows the constraints inside one pair of parentheses: `requests (==2.28.0)`.
+    let is_wrapped = bytes.get(cursor) == Some(&b'(');
+    if is_wrapped {
+        cursor += 1;
+    }
     let mut constraints = Vec::new();
     let mut next_from = Some(cursor);
     // A malformed constraint after the first ends the list. The ones read so far still count.
     while let Some(from) = next_from {
-        let Some((constraint, next)) = parse_constraint(input, from) else {
+        let Some((constraint, next)) = parse_constraint(input, from, is_wrapped) else {
             break;
         };
         constraints.push(constraint);
@@ -152,7 +157,12 @@ fn parse_pep508(input: &str) -> Option<Pep508> {
 /// Reads one `operator version` pair that starts at `from`.
 ///
 /// Returns the pair and the offset of the next pair after a comma, if one follows.
-fn parse_constraint(input: &str, from: usize) -> Option<(Constraint<'_>, Option<usize>)> {
+/// In a wrapped list, the closing parenthesis ends the last version.
+fn parse_constraint(
+    input: &str,
+    from: usize,
+    is_wrapped: bool,
+) -> Option<(Constraint<'_>, Option<usize>)> {
     let bytes = input.as_bytes();
     let operator_start = scan_while(bytes, from, |byte| byte.is_ascii_whitespace());
     let operator_end = scan_while(bytes, operator_start, is_operator_byte);
@@ -161,7 +171,9 @@ fn parse_constraint(input: &str, from: usize) -> Option<(Constraint<'_>, Option<
         .filter(|operator| OPERATORS.contains(operator))?;
     let version_start = scan_while(bytes, operator_end, |byte| byte.is_ascii_whitespace());
     // A version stops at a space, a constraint or marker separator, a comment or a line continuation.
-    let version_end = scan_while(bytes, version_start, |byte| !ends_version(byte));
+    let version_end = scan_while(bytes, version_start, |byte| {
+        !ends_version(byte) && !(is_wrapped && byte == b')')
+    });
     if version_end == version_start {
         return None;
     }
@@ -801,5 +813,48 @@ dependencies = ["\u0072equests==2.28.0"]
                 .iter()
                 .any(|dependency| dependency.name == "mypy")
         );
+    }
+
+    #[test]
+    fn parenthesized_constraint_gives_the_bare_version() {
+        let text = "requests (==2.28.0)\n";
+        let dependencies = parse(text);
+        let requests = find(&dependencies, "requests");
+        assert_eq!(requests.version, "2.28.0");
+        assert_eq!(version_text(text, requests).as_deref(), Some("2.28.0"));
+        assert!(!requests.has_additional_version_constraints);
+    }
+
+    #[test]
+    fn parenthesized_constraint_after_extras_and_before_markers() {
+        let text = "requests[socks] ( >= 2.28.0 ) ; python_version < \"3.12\"\n";
+        let dependencies = parse(text);
+        let requests = find(&dependencies, "requests");
+        assert_eq!(requests.version, "2.28.0");
+        assert_eq!(version_text(text, requests).as_deref(), Some("2.28.0"));
+    }
+
+    #[test]
+    fn parenthesized_constraints_keep_the_additional_constraint_flag() {
+        let dependencies = parse("flask (>=2.0, <3)\n");
+        let flask = find(&dependencies, "flask");
+        assert_eq!(flask.version, "2.0");
+        assert!(flask.has_additional_version_constraints);
+    }
+
+    #[test]
+    fn parenthesized_constraint_in_pyproject() {
+        let text = "[project]\nname = \"x\"\ndependencies = [\"requests (==2.28.0)\"]\n";
+        let dependencies = parse(text);
+        let requests = find(&dependencies, "requests");
+        assert_eq!(requests.version, "2.28.0");
+        assert_eq!(version_text(text, requests).as_deref(), Some("2.28.0"));
+    }
+
+    #[test]
+    fn closing_parenthesis_without_opening_one_stays_part_of_the_version() {
+        // Only a wrapped constraint list may end at `)`.
+        let dependencies = parse("requests==2.28.0)\n");
+        assert_eq!(find(&dependencies, "requests").version, "2.28.0)");
     }
 }

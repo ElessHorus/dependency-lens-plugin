@@ -11,7 +11,7 @@ const OPERATORS: [&str; 8] = ["", "=", "!=", ">", "<", ">=", "<=", "~>"];
 /// Operators whose version pins a gem. `!=`, `<` and `<=` never pin.
 const PIN_OPERATORS: [&str; 5] = ["", "=", "~>", ">=", ">"];
 
-/// Option keys whose value names a source other than the registry.
+/// Option keys, and block methods, whose value names a source other than the registry.
 const SOURCE_OPTION_KEYS: [&str; 7] = [
     "git",
     "github",
@@ -65,16 +65,25 @@ struct Requirement<'a> {
     version_offset: usize,
 }
 
+/// The scope that one open `do` block gives to the gems inside it.
+#[derive(Clone, Copy)]
+struct OpenBlock {
+    /// The block is a development or test group.
+    is_development: bool,
+    /// The block is a `path`, `git` or `source` block. Its gems do not come from the registry.
+    has_custom_source: bool,
+}
+
 /// Parses the gems of a `Gemfile`.
 ///
 /// Returns the gems with a pin constraint, in document order. A gem inside a
 /// development or test group, or with a development group option, has `dev`.
+/// A gem inside a `path`, `git` or `source` block is skipped, like a gem with a source option.
 pub fn parse(text: &str) -> Vec<Dependency> {
     let mut dependencies = Vec::new();
     // One token buffer serves every line, so no line allocates on its own.
     let mut tokens = Vec::new();
-    // One flag per open block. A flag is `true` when the block is a development group.
-    let mut open_blocks: Vec<bool> = Vec::new();
+    let mut open_blocks: Vec<OpenBlock> = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let Ok(line_number) = u32::try_from(index) else {
             break;
@@ -85,13 +94,19 @@ pub fn parse(text: &str) -> Vec<Dependency> {
         }
         if is_gem_line(&tokens) {
             // A gem line never opens a block, so the stack is read but not changed.
-            let in_dev_block = open_blocks.contains(&true);
-            dependencies.extend(parse_gem(&tokens, line_number, in_dev_block));
+            // A source block applies to every gem inside it, however deeply nested.
+            if !open_blocks.iter().any(|block| block.has_custom_source) {
+                let in_dev_block = open_blocks.iter().any(|block| block.is_development);
+                dependencies.extend(parse_gem(&tokens, line_number, in_dev_block));
+            }
         } else if is_lone_end(&tokens) {
             // An `end` with no open block is ignored.
             open_blocks.pop();
         } else if opens_block(&tokens) {
-            open_blocks.push(opens_development_group(&tokens));
+            open_blocks.push(OpenBlock {
+                is_development: opens_development_group(&tokens),
+                has_custom_source: opens_custom_source(&tokens),
+            });
         }
     }
     dependencies
@@ -214,6 +229,14 @@ fn opens_block(tokens: &[Token<'_>]) -> bool {
         .checked_sub(1)
         .and_then(|keyword_index| tokens.get(keyword_index))
         .is_some_and(|token| token.kind == Kind::Word("do"))
+}
+
+/// Returns `true` when the block starts with a source method such as `path` or `git`.
+fn opens_custom_source(tokens: &[Token<'_>]) -> bool {
+    matches!(
+        tokens.first(),
+        Some(Token { kind: Kind::Word(method), .. }) if SOURCE_OPTION_KEYS.contains(method)
+    )
 }
 
 /// Returns `true` for a `group` block whose list names a development or test group.
@@ -610,5 +633,56 @@ mod tests {
         let dependencies = parse(manifest);
         assert!(find(&dependencies, "h").dev);
         assert!(!find(&dependencies, "l").dev);
+    }
+
+    #[test]
+    fn gems_inside_a_non_registry_block_are_skipped() {
+        for opener in [
+            "path '../components/internal-review-gem' do",
+            "path('../components/internal-review-gem') do",
+            "git 'https://example.com/x.git' do",
+            "github 'x/y' do",
+            "source 'https://gems.example.com' do",
+            "git 'https://example.com/x.git', branch: 'main' do |repo|",
+        ] {
+            let manifest = format!("{opener}\n  gem 'internal-review-gem', '1.0.0'\nend\n");
+            assert!(parse(&manifest).is_empty(), "{opener} must hide its gems");
+        }
+    }
+
+    #[test]
+    fn non_registry_scope_covers_nested_blocks_and_ends_with_its_block() {
+        let manifest = "\
+path '../local' do
+  group :test do
+    gem 'inner', '1.0'
+  end
+  gem 'after_group', '2.0'
+end
+gem 'outside', '3.0'
+";
+        assert_eq!(
+            summary(&parse(manifest)),
+            [("outside", "3.0", false, false)]
+        );
+    }
+
+    #[test]
+    fn registry_blocks_nested_in_a_non_registry_block_stay_skipped() {
+        let manifest = "git 'x' do\n  platforms :ruby do\n    gem 'inner', '1.0'\n  end\nend\n";
+        assert!(parse(manifest).is_empty());
+    }
+
+    #[test]
+    fn non_registry_block_inside_a_group_skips_only_its_gems() {
+        let manifest = "\
+group :test do
+  path '../local' do
+    gem 'hidden', '1.0'
+  end
+  gem 'visible', '2.0'
+end
+";
+        assert_eq!(summary(&parse(manifest)), [("visible", "2.0", true, false)]);
     }
 }
