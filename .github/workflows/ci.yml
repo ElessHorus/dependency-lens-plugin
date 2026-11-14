@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+    branches: [main, "feat/**"]
+  schedule:
+    # Weekly, so a new OpenIDEA release that breaks the build shows up early.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+# The default token only reads the repository.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # Third-party actions are pinned by major tag. The maintainer may pin them to commit SHAs.
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The tag must match the SDK tag in Cargo.toml (`openidea-plugin` git dependency).
+      # Keep both in sync when the SDK changes.
+      - name: Install the plugin tool
+        run: cargo install --locked --git https://github.com/l0ng-ai/openidea --tag v0.1.44 ide-host --bin openidea-plugin
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      - name: Build and check the package
+        run: openidea-plugin build
+
+  # Early warning for the registry's rule: a plugin that fails the checks against a new
+  # OpenIDEA release is delisted after 30 days without a fixed version. This job runs the
+  # tool of the latest OpenIDEA release, so a breaking release shows here before the registry reports it.
+  latest-release:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Download the latest plugin tool
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          gh release download --repo l0ng-ai/openidea --pattern 'openidea-plugin-linux-x86_64.gz'
+          gunzip openidea-plugin-linux-x86_64.gz
+          chmod +x openidea-plugin-linux-x86_64
+
+      - name: Build and check the package with the latest tool
+        run: |
+          set -euo pipefail
+          tool="$RUNNER_TEMP/openidea-plugin-linux-x86_64"
+          "$tool" build
+          "$tool" check

@@ -2,6 +2,9 @@
 name = "dependency-lens"
 version = "0.1.0"
 edition = "2024"
+description = "Dependency Lens: inline OSV vulnerabilities and newer-version hints for dependency manifests, for OpenIDEA."
+license = "MIT"
+readme = "README.md"
 publish = false
 
 # A plugin builds on its own (target wasm32-wasip2), outside any IDE workspace.

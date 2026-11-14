@@ -1,0 +1,101 @@
+name: Release
+
+# Runs on a version tag such as v0.1.0. The tag must match `version` in plugin.toml.
+on:
+  push:
+    tags: ["v*"]
+
+# Creating the release needs write access to the repository contents.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      # Third-party actions are pinned by major tag. The maintainer may pin them to commit SHAs.
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Same tool and SDK tag as the CI workflow. Keep both in sync when the SDK changes.
+      - name: Install the plugin tool
+        run: cargo install --locked --git https://github.com/l0ng-ai/openidea --tag v0.1.44 ide-host --bin openidea-plugin
+
+      - name: Check the signing settings
+        env:
+          SIGNING_KEY: ${{ secrets.OPENIDEA_PLUGIN_KEY }}
+          PUBLISHER: ${{ vars.PUBLISHER }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "::error::The repository secret OPENIDEA_PLUGIN_KEY is missing. Add the content of your signing key file."
+            exit 1
+          fi
+          if [ -z "$PUBLISHER" ]; then
+            echo "::error::The repository variable PUBLISHER is missing. Set it to your publisher id."
+            exit 1
+          fi
+
+      - name: Check the tag against plugin.toml
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          manifest_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' plugin.toml | head -n 1)"
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "::error::The tag $GITHUB_REF_NAME does not match version $manifest_version in plugin.toml."
+            exit 1
+          fi
+
+      - name: Build the plugin
+        run: openidea-plugin build
+
+      # The key is written to a private file, used once and deleted in the next step.
+      # `umask 077` keeps the file readable by the runner user only. The secret is passed
+      # through the environment, never on the command line, and is not echoed.
+      - name: Pack and sign the plugin
+        id: pack
+        env:
+          SIGNING_KEY: ${{ secrets.OPENIDEA_PLUGIN_KEY }}
+          PUBLISHER: ${{ vars.PUBLISHER }}
+        run: |
+          set -euo pipefail
+          set +x
+          umask 077
+          printf '%s\n' "$SIGNING_KEY" > "$RUNNER_TEMP/publisher.key"
+          openidea-plugin pack . --key "$RUNNER_TEMP/publisher.key" --publisher "$PUBLISHER"
+          # `pack` writes <id>-<version>.oiplugin into the current folder.
+          shopt -s nullglob
+          packages=(./*.oiplugin)
+          if [ "${#packages[@]}" -ne 1 ]; then
+            echo "::error::Expected one .oiplugin package, found ${#packages[@]}."
+            exit 1
+          fi
+          echo "package=${packages[0]#./}" >> "$GITHUB_OUTPUT"
+
+      - name: Delete the signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/publisher.key"
+
+      - name: Print the package digest
+        env:
+          PACKAGE: ${{ steps.pack.outputs.package }}
+        run: |
+          set -euo pipefail
+          digest="$(sha256sum "$PACKAGE" | cut -d ' ' -f 1)"
+          {
+            echo "### Plugin package"
+            echo
+            echo "- File: \`$PACKAGE\`"
+            echo "- SHA-256: \`$digest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE: ${{ steps.pack.outputs.package }}
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes "$PACKAGE"

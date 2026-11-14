@@ -2,7 +2,9 @@ id = "local.dependency-lens"
 name = "Dependency Lens"
 version = "0.1.0"
 description = "Shows OSV vulnerabilities and newer versions inline in dependency manifests."
-authors = []
+authors = ["The Dependency Lens authors"]
+license = "MIT"
+change-notes = "0.1.0 — first release: OSV vulnerabilities for nine ecosystems; version hints and update quick fixes for Python, PHP, Dart, C# and Ruby."
 # Marketplace categories (up to 3): languages, themes, icon-themes, linters,
 # vcs, ai, frameworks, tools, other.
 categories = ["tools"]
