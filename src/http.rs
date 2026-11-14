@@ -1,6 +1,10 @@
 //! HTTP transport seam: the host implementation and a test double.
 
 use openidea_plugin::{HttpRequest, HttpResponse, host};
+use std::borrow::Cow;
+
+/// Timeout of a request that sets none. The host default (30 s) would let two hung requests fill a chunk.
+const DEFAULT_TIMEOUT_MS: u32 = 10_000;
 
 /// Sends HTTP requests. Implemented by the host in production and by [`FakeHttp`] in tests.
 pub trait Http {
@@ -13,7 +17,42 @@ pub struct HostHttp;
 
 impl Http for HostHttp {
     fn send(&self, request: &HttpRequest) -> Result<HttpResponse, String> {
-        host::fetch(request).map_err(|error| error.to_string())
+        host::fetch(&with_default_timeout(request)).map_err(|error| error.to_string())
+    }
+}
+
+/// Returns `request` with [`DEFAULT_TIMEOUT_MS`] when it sets no timeout. Otherwise borrows it unchanged.
+fn with_default_timeout(request: &HttpRequest) -> Cow<'_, HttpRequest> {
+    if request.timeout_ms.is_some() {
+        return Cow::Borrowed(request);
+    }
+    Cow::Owned(HttpRequest {
+        timeout_ms: Some(DEFAULT_TIMEOUT_MS),
+        ..request.clone()
+    })
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn request_without_timeout_gets_the_default() {
+        let request = HttpRequest::get("https://pypi.org/pypi/requests/json");
+        let bounded = with_default_timeout(&request);
+        assert_eq!(bounded.timeout_ms, Some(DEFAULT_TIMEOUT_MS));
+        assert_eq!(bounded.url, request.url);
+    }
+
+    #[test]
+    fn request_with_its_own_timeout_is_unchanged() {
+        let request = HttpRequest {
+            timeout_ms: Some(3_000),
+            ..HttpRequest::get("https://pypi.org/pypi/requests/json")
+        };
+        let bounded = with_default_timeout(&request);
+        assert!(matches!(bounded, Cow::Borrowed(_)));
+        assert_eq!(bounded.timeout_ms, Some(3_000));
     }
 }
 

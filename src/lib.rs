@@ -24,27 +24,29 @@ use openidea_plugin::{
     Context, Decoration, Diagnostic, Error, Event, EventKind, Invocation, LogLevel, Plugin, Range,
     host, register_plugin,
 };
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Folders whose manifests belong to dependencies or build output, not to the project.
 const SKIPPED_DIRECTORIES: [&str; 4] = ["node_modules", "target", "vendor", ".git"];
-/// Time box of one `handle_events` call, kept below the host's 60 s task limit.
-/// The deadline is checked between chunks, so a call can overrun it by one chunk.
-const TIME_BOX: Duration = Duration::from_secs(50);
+/// Soft time cap of one `handle_events` call, checked between chunks.
+/// Entries still pending at the cap are finished by the next open, save or refresh of their manifest.
+const TIME_BOX: Duration = Duration::from_secs(300);
+/// Hard limit of one chunk. Its lookups that start after this limit stay pending.
+const CHUNK_LIMIT: Duration = Duration::from_secs(40);
 /// Registry lookups per chunk. Each chunk publishes its results before the next one starts.
 const REGISTRY_CHUNK: usize = 20;
+/// Offset of the fallback deadline used when a time box is too large for the clock.
+const FAR_FUTURE: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
 /// Title of the background task shown while a manifest is analyzed.
 const TASK_TITLE: &str = "Dependency Lens";
 
-/// Dependency Lens plugin state: the analysis cache, the settings it runs with, and the work left over.
+/// Dependency Lens plugin state: the analysis cache, the settings it runs with, and the chunk limits.
 pub struct DependencyLens {
     cache: Cache,
     settings: Settings,
     time_box: Duration,
     chunk: usize,
-    /// Manifests whose registry lookups did not finish. Sorted, so each `Scheduled` event visits them in one order.
-    pending_paths: BTreeSet<String>,
 }
 
 impl Default for DependencyLens {
@@ -55,7 +57,6 @@ impl Default for DependencyLens {
             settings,
             time_box: TIME_BOX,
             chunk: REGISTRY_CHUNK,
-            pending_paths: BTreeSet::new(),
         }
     }
 }
@@ -82,21 +83,19 @@ impl DependencyLens {
         self.settings = settings;
     }
 
+    /// Lookups per chunk. Without a cache, a chunk cannot keep what it finds, so one pass does all of them.
+    fn chunk_size(&self) -> usize {
+        if self.settings.cache_ttl_secs == 0 {
+            usize::MAX
+        } else {
+            self.chunk
+        }
+    }
+
     /// Analyzes the manifest at `path` and publishes its decorations and problems, chunk by chunk.
     ///
-    /// A path that comes after an expired `deadline` waits in `pending_paths`, so its file is not read.
-    /// The first path of a batch always makes progress, even when the deadline has passed.
-    fn refresh(
-        &mut self,
-        path: &str,
-        ctx: &Invocation,
-        deadline: Instant,
-        batch_progressed: &mut bool,
-    ) {
-        if Instant::now() >= deadline && *batch_progressed {
-            self.pending_paths.insert(path.to_owned());
-            return;
-        }
+    /// Every call makes at least its first chunk, so each manifest of a batch makes progress.
+    fn refresh(&mut self, path: &str, ctx: &Invocation, deadline: Instant) {
         let Some(eco) = Ecosystem::detect(path) else {
             return;
         };
@@ -113,21 +112,13 @@ impl DependencyLens {
         };
         let deps = eco.parse(&text);
         let task = host::begin_task(TASK_TITLE, true);
-        let pending_count = self.publish_chunks(eco, path, &text, &deps, &task, deadline);
-        // Every call publishes at least one chunk, so the batch has made progress from here on.
-        *batch_progressed = true;
-        if pending_count == 0 {
-            self.pending_paths.remove(path);
-        } else {
-            self.pending_paths.insert(path.to_owned());
-        }
+        self.publish_chunks(eco, path, &text, &deps, &task, deadline);
     }
 
     /// Runs the registry lookups of `deps` in chunks and publishes after each chunk.
     ///
-    /// Stops when no entry is pending, when the task is cancelled, or when `deadline` has passed.
-    /// The deadline ends the loop only after one chunk of this call, so a call always makes progress.
-    /// Returns the pending count of the last chunk.
+    /// Reports progress and checks cancellation after every chunk. The host renews the call's
+    /// time budget on each of these, so a long manifest is not cut while it reports.
     fn publish_chunks(
         &mut self,
         eco: Ecosystem,
@@ -136,16 +127,13 @@ impl DependencyLens {
         deps: &[Dependency],
         task: &Task,
         deadline: Instant,
-    ) -> usize {
-        let mut pending_count = 0;
-        let mut is_first_chunk = true;
+    ) {
+        let chunk = self.chunk_size();
+        let mut previous_pending = None;
         loop {
-            if !is_first_chunk && Instant::now() >= deadline {
-                break;
-            }
-            is_first_chunk = false;
             // The dependency vector is cloned per chunk; the parse is not repeated.
-            let mut budget = Budget::new(self.chunk, None);
+            // Each chunk gets its own deadline, so its first lookup always runs.
+            let mut budget = Budget::new(chunk, Some(Instant::now() + CHUNK_LIMIT));
             let analysis = analyze(
                 eco,
                 deps.to_vec(),
@@ -156,21 +144,53 @@ impl DependencyLens {
                 &mut budget,
             );
             publish_analysis(path, text, &analysis);
-            pending_count = analysis.pending;
+            let pending = analysis.pending;
             // Pending entries are the only ones without a status, so the done count is a subtraction, not a scan.
             let total = analysis.entries.len();
-            let done = total.saturating_sub(pending_count);
+            let done = total.saturating_sub(pending);
             task.report(
                 done as u32,
                 Some(total as u32),
                 Some(&format!("{done} of {total}")),
             );
-            if pending_count == 0 || task.is_cancelled() {
-                break;
+            let cancelled = task.is_cancelled();
+            if !should_continue(
+                pending,
+                previous_pending,
+                cancelled,
+                Instant::now(),
+                deadline,
+            ) {
+                return;
             }
+            previous_pending = Some(pending);
         }
-        pending_count
     }
+}
+
+/// The instant `time_box` from now. A box too large for the clock ends far in the future instead.
+fn deadline_after(time_box: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(time_box)
+        .or_else(|| now.checked_add(FAR_FUTURE))
+        .unwrap_or(now)
+}
+
+/// Whether the chunk loop runs one more chunk after a chunk that left `pending` entries.
+///
+/// `previous_pending` is the pending count of the chunk before, or `None` after the first chunk.
+/// A chunk that does not lower the pending count stops the loop, because the next chunk would repeat it.
+fn should_continue(
+    pending: usize,
+    previous_pending: Option<usize>,
+    cancelled: bool,
+    now: Instant,
+    deadline: Instant,
+) -> bool {
+    pending > 0
+        && !cancelled
+        && now < deadline
+        && previous_pending.is_none_or(|previous| pending < previous)
 }
 
 /// Publishes the decorations and problems of one analysis of the manifest `text` at `path`.
@@ -242,9 +262,7 @@ impl Plugin for DependencyLens {
                     return Ok(Some("Dependency Lens: not a supported manifest".to_owned()));
                 }
                 // A command is one batch of its own: it gets a fresh time box.
-                let deadline = Instant::now() + self.time_box;
-                let mut batch_progressed = false;
-                self.refresh(&path, ctx, deadline, &mut batch_progressed);
+                self.refresh(&path, ctx, deadline_after(self.time_box));
                 Ok(Some("Dependency Lens: refreshed".to_owned()))
             }
             _ => Err(Error::NotFound(format!("command {id}"))),
@@ -256,11 +274,9 @@ impl Plugin for DependencyLens {
         let mut changed_paths: Vec<&str> = Vec::new();
         let mut removed_paths: Vec<&str> = Vec::new();
         let mut settings_changed = false;
-        let mut scheduled = false;
         for event in events {
             match event {
                 Event::Other { kind, .. } if kind == "settings-changed" => settings_changed = true,
-                Event::Scheduled => scheduled = true,
                 Event::FileOpened(path) | Event::FileSaved(path) => changed_paths.push(path),
                 Event::FilesChanged(changes) => {
                     changed_paths.extend(
@@ -280,23 +296,15 @@ impl Plugin for DependencyLens {
             self.reload_settings();
         }
         for path in removed_paths.into_iter().filter(|path| is_manifest(path)) {
-            self.pending_paths.remove(path);
             publish_results(path, &[], &[]);
         }
-        // One deadline and one progress flag for the whole batch, so the time box is shared.
-        let deadline = Instant::now() + self.time_box;
-        let mut batch_progressed = false;
+        // One deadline for the batch: manifests after it still get their first chunk.
+        let deadline = deadline_after(self.time_box);
         // A set skips a path that appears twice in one batch; the first occurrence keeps its place.
         let mut refreshed: HashSet<&str> = HashSet::new();
         for path in changed_paths.into_iter().filter(|path| is_manifest(path)) {
             if refreshed.insert(path) {
-                self.refresh(path, ctx, deadline, &mut batch_progressed);
-            }
-        }
-        // Nothing pending means no host call. Otherwise the set is taken, and the shared deadline bounds all its paths.
-        if scheduled && !self.pending_paths.is_empty() {
-            for path in std::mem::take(&mut self.pending_paths) {
-                self.refresh(&path, ctx, deadline, &mut batch_progressed);
+                self.refresh(path, ctx, deadline);
             }
         }
     }
@@ -316,3 +324,82 @@ impl Providers for DependencyLens {
 }
 
 register_plugin!(DependencyLens, providers);
+
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+
+    /// A deadline one minute away, so the time cap does not end the loop.
+    fn open_deadline(now: Instant) -> Instant {
+        now + Duration::from_secs(60)
+    }
+
+    #[test]
+    fn continues_while_pending_and_progressing_before_the_deadline() {
+        let now = Instant::now();
+        assert!(should_continue(280, None, false, now, open_deadline(now)));
+        assert!(should_continue(
+            260,
+            Some(280),
+            false,
+            now,
+            open_deadline(now)
+        ));
+    }
+
+    #[test]
+    fn stops_when_nothing_is_pending() {
+        let now = Instant::now();
+        assert!(!should_continue(
+            0,
+            Some(20),
+            false,
+            now,
+            open_deadline(now)
+        ));
+        assert!(!should_continue(0, None, false, now, open_deadline(now)));
+    }
+
+    #[test]
+    fn stops_when_cancelled() {
+        let now = Instant::now();
+        assert!(!should_continue(
+            260,
+            Some(280),
+            true,
+            now,
+            open_deadline(now)
+        ));
+    }
+
+    #[test]
+    fn stops_at_or_after_the_deadline() {
+        let now = Instant::now();
+        assert!(!should_continue(260, Some(280), false, now, now));
+    }
+
+    #[test]
+    fn stops_when_the_pending_count_does_not_decrease() {
+        let now = Instant::now();
+        assert!(!should_continue(
+            280,
+            Some(280),
+            false,
+            now,
+            open_deadline(now)
+        ));
+        assert!(!should_continue(
+            281,
+            Some(280),
+            false,
+            now,
+            open_deadline(now)
+        ));
+    }
+
+    #[test]
+    fn deadline_after_saturates_instead_of_overflowing() {
+        let before = Instant::now();
+        assert!(deadline_after(Duration::MAX) > before);
+    }
+}

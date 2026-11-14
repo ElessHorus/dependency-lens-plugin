@@ -15,7 +15,6 @@ activation = [
   "on-event:file-saved",
   "on-event:files-changed",
   "on-event:settings-changed",
-  "on-schedule:60",
   "on-command:*",
 ]
 

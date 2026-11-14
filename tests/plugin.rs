@@ -805,9 +805,15 @@ fn registry_requests(host: &MockHost) -> usize {
         .count()
 }
 
-/// Delivers one `Scheduled` event, as the `on-schedule` activation does.
-fn deliver_scheduled(plugin: &mut DependencyLens, host: &MockHost) {
-    plugin.handle_events(&[Event::Scheduled], &host.invocation());
+/// The largest number of times one PyPI URL was requested; above one means a repeated lookup.
+fn largest_repeat_of_a_lookup(host: &MockHost) -> usize {
+    let mut counts = std::collections::HashMap::<String, usize>::new();
+    for request in host.requests() {
+        if request.url.starts_with(PYPI_PREFIX) {
+            *counts.entry(request.url).or_default() += 1;
+        }
+    }
+    counts.values().copied().max().unwrap_or(0)
 }
 
 /// Counts the decorations of `path` whose text is `after`.
@@ -845,14 +851,10 @@ fn default_limits_resolve_every_package_in_one_refresh() {
         last_report.and_then(|(_, _, message)| message.as_deref()),
         Some("300 of 300")
     );
-
-    let fetches_after_refresh = fetches.get();
-    deliver_scheduled(&mut plugin, &host);
-    assert_eq!(fetches.get(), fetches_after_refresh);
 }
 
 #[test]
-fn zero_time_box_publishes_one_chunk_per_call_until_all_resolve() {
+fn zero_time_box_gives_each_save_one_chunk_until_all_resolve() {
     let fetches = Rc::new(Cell::new(0));
     let host = host_with_pypi_latest(fetches.clone());
     host.add_file("requirements.txt", &pinned_requirements(0, 300));
@@ -878,12 +880,15 @@ fn zero_time_box_publishes_one_chunk_per_call_until_all_resolve() {
             .all(|decoration| decoration.style == "muted")
     );
 
-    for call in 1..=14 {
-        deliver_scheduled(&mut plugin, &host);
+    for save_number in 1..=14 {
+        plugin.handle_events(
+            &[Event::FileSaved(REQUIREMENTS_PATH.to_owned())],
+            &host.invocation(),
+        );
         assert_eq!(
             fetches.get(),
-            1 + 20 * (call + 1),
-            "after scheduled call {call}"
+            1 + 20 * (save_number + 1),
+            "after save {save_number}"
         );
     }
     assert_eq!(registry_requests(&host), 300);
@@ -892,16 +897,71 @@ fn zero_time_box_publishes_one_chunk_per_call_until_all_resolve() {
         count_decorations_with(&host, REQUIREMENTS_PATH, LATEST_TEXT),
         300
     );
+}
 
-    deliver_scheduled(&mut plugin, &host);
-    assert_eq!(fetches.get(), 1 + 300);
+#[test]
+fn batch_of_manifests_gives_each_its_first_chunk_then_each_save_finishes_it() {
+    let fetches = Rc::new(Cell::new(0));
+    let host = host_with_pypi_latest(fetches.clone());
+    let paths = [
+        "/p/a/requirements.txt",
+        "/p/b/requirements.txt",
+        "/p/c/requirements.txt",
+    ];
+    host.add_file("a/requirements.txt", &pinned_requirements(0, 40));
+    host.add_file("b/requirements.txt", &pinned_requirements(40, 40));
+    host.add_file("c/requirements.txt", &pinned_requirements(80, 40));
+    let mut plugin = DependencyLens::with_limits(Duration::ZERO, 20);
+    plugin.handle_events(
+        &paths.map(|path| Event::FileOpened(path.to_owned())),
+        &host.invocation(),
+    );
+
+    assert_eq!(osv_batch_requests(&host), 3);
+    assert_eq!(registry_requests(&host), 60);
+    for path in paths {
+        assert_eq!(count_decorations_with(&host, path, LATEST_TEXT), 20);
+        assert_eq!(count_decorations_with(&host, path, PENDING_TEXT), 20);
+    }
+
+    plugin.handle_events(
+        &paths.map(|path| Event::FileSaved(path.to_owned())),
+        &host.invocation(),
+    );
+    assert_eq!(registry_requests(&host), 120);
+    assert_eq!(osv_batch_requests(&host), 3);
+    for path in paths {
+        assert_eq!(count_decorations_with(&host, path, LATEST_TEXT), 40);
+    }
+}
+
+#[test]
+fn zero_cache_lifetime_resolves_everything_without_repeating_a_lookup() {
+    let fetches = Rc::new(Cell::new(0));
+    let host = host_with_pypi_latest(fetches.clone());
+    host.set_setting("cacheTtlSeconds", "0");
+    host.add_file("requirements.txt", &pinned_requirements(0, 300));
+    let mut plugin = DependencyLens::with_limits(Duration::from_secs(300), 20);
+    plugin.activate(&host.context(PLUGIN_ID)).unwrap();
+    plugin.handle_events(
+        &[Event::FileOpened(REQUIREMENTS_PATH.to_owned())],
+        &host.invocation(),
+    );
+
+    assert_eq!(
+        count_decorations_with(&host, REQUIREMENTS_PATH, LATEST_TEXT),
+        300
+    );
+    assert_eq!(registry_requests(&host), 300);
+    assert_eq!(largest_repeat_of_a_lookup(&host), 1);
+    assert_eq!(osv_batch_requests(&host), 1);
 }
 
 #[test]
 fn progress_reports_grow_during_one_refresh() {
     let host = host_with_pypi_latest(Rc::new(Cell::new(0)));
     host.add_file("requirements.txt", &pinned_requirements(0, 300));
-    let mut plugin = DependencyLens::with_limits(Duration::from_secs(50), 20);
+    let mut plugin = DependencyLens::with_limits(Duration::from_secs(300), 20);
     plugin.handle_events(
         &[Event::FileOpened(REQUIREMENTS_PATH.to_owned())],
         &host.invocation(),
@@ -923,48 +983,8 @@ fn progress_reports_grow_during_one_refresh() {
 }
 
 #[test]
-fn shared_time_box_lets_only_the_first_file_progress_per_call() {
-    let fetches = Rc::new(Cell::new(0));
-    let host = host_with_pypi_latest(fetches.clone());
-    let paths = [
-        "/p/a/requirements.txt",
-        "/p/b/requirements.txt",
-        "/p/c/requirements.txt",
-    ];
-    host.add_file("a/requirements.txt", &pinned_requirements(0, 40));
-    host.add_file("b/requirements.txt", &pinned_requirements(40, 40));
-    host.add_file("c/requirements.txt", &pinned_requirements(80, 40));
-    let mut plugin = DependencyLens::with_limits(Duration::ZERO, 20);
-    plugin.handle_events(
-        &paths.map(|path| Event::FileOpened(path.to_owned())),
-        &host.invocation(),
-    );
-
-    assert_eq!(registry_requests(&host), 20);
-    assert_eq!(osv_batch_requests(&host), 1);
-    assert_eq!(host.tasks().len(), 1);
-    assert!(decorations_of(&host, paths[1]).is_empty());
-    assert!(decorations_of(&host, paths[2]).is_empty());
-
-    // A finishes in the first call, B and C need two calls each.
-    for _ in 0..5 {
-        deliver_scheduled(&mut plugin, &host);
-    }
-    assert_eq!(registry_requests(&host), 120);
-    assert_eq!(osv_batch_requests(&host), 3);
-    for path in paths {
-        assert_eq!(count_decorations_with(&host, path, LATEST_TEXT), 40);
-    }
-
-    let fetches_after_all = fetches.get();
-    deliver_scheduled(&mut plugin, &host);
-    assert_eq!(fetches.get(), fetches_after_all);
-}
-
-#[test]
-fn removing_a_pending_manifest_clears_it_and_stops_its_lookups() {
-    let fetches = Rc::new(Cell::new(0));
-    let host = host_with_pypi_latest(fetches.clone());
+fn removed_manifest_stays_cleared_while_its_lookups_are_unfinished() {
+    let host = host_with_pypi_latest(Rc::new(Cell::new(0)));
     host.add_file("requirements.txt", &pinned_requirements(0, 300));
     let mut plugin = DependencyLens::with_limits(Duration::ZERO, 20);
     plugin.handle_events(
@@ -983,18 +1003,33 @@ fn removing_a_pending_manifest_clears_it_and_stops_its_lookups() {
     );
     assert!(decorations_of(&host, REQUIREMENTS_PATH).is_empty());
     assert!(diagnostics_of(&host, REQUIREMENTS_PATH).is_empty());
-
-    let fetches_after_removal = fetches.get();
-    deliver_scheduled(&mut plugin, &host);
-    assert_eq!(fetches.get(), fetches_after_removal);
 }
 
 #[test]
-fn scheduled_event_without_pending_paths_makes_no_request() {
+fn time_box_too_large_for_the_clock_still_resolves_every_package() {
+    let fetches = Rc::new(Cell::new(0));
+    let host = host_with_pypi_latest(fetches.clone());
+    host.add_file("requirements.txt", &pinned_requirements(0, 300));
+    let mut plugin = DependencyLens::with_limits(Duration::MAX, 20);
+    plugin.handle_events(
+        &[Event::FileOpened(REQUIREMENTS_PATH.to_owned())],
+        &host.invocation(),
+    );
+
+    assert_eq!(
+        count_decorations_with(&host, REQUIREMENTS_PATH, LATEST_TEXT),
+        300
+    );
+    assert_eq!(fetches.get(), 1 + 300);
+}
+
+#[test]
+fn scheduled_event_is_ignored() {
     let fetches = Rc::new(Cell::new(0));
     let host = host_with_pypi_latest(fetches.clone());
     let mut plugin = DependencyLens::default();
-    deliver_scheduled(&mut plugin, &host);
+    plugin.handle_events(&[Event::Scheduled], &host.invocation());
     assert_eq!(fetches.get(), 0);
     assert!(host.tasks().is_empty());
+    assert!(host.decorations().is_empty());
 }
