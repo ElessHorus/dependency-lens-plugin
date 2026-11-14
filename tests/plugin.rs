@@ -136,6 +136,24 @@ fn opening_manifest_shows_serde_advisory_only() {
 }
 
 #[test]
+fn advisories_are_shown_when_the_cache_lifetime_is_zero() {
+    // `cacheTtlSeconds = 0` keeps nothing between refreshes; a refresh must still show what it fetched.
+    let host = host_counting_fetches(Rc::new(Cell::new(0)));
+    host.set_setting("cacheTtlSeconds", "0");
+    let mut plugin = DependencyLens::default();
+    plugin.activate(&host.context(PLUGIN_ID)).unwrap();
+    open_manifest(&host, &mut plugin);
+
+    let decorations = decorations_of(&host, MANIFEST_PATH);
+    assert_eq!(decorations.len(), 1);
+    assert_eq!(decorations[0].range, SERDE_VERSION_RANGE);
+    assert_eq!(decorations[0].after.as_deref(), Some("⚠ 1 vulnerability"));
+    let diagnostics = diagnostics_of(&host, MANIFEST_PATH);
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].code.as_deref(), Some(HIGH_ID));
+}
+
+#[test]
 fn saving_without_serde_clears_its_decoration_and_problem() {
     let host = host_counting_fetches(Rc::new(Cell::new(0)));
     let mut plugin = DependencyLens::default();

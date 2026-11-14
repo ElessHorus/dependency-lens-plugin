@@ -124,7 +124,7 @@ pub fn analyze(
         .iter()
         .map(|dependency| declared_version_for_osv(&dependency.version))
         .collect();
-    if settings.vulnerabilities {
+    let fresh_osv = if settings.vulnerabilities {
         query_missing_vulnerabilities(
             eco,
             &kept,
@@ -133,14 +133,24 @@ pub fn analyze(
             http,
             now,
             budget.deadline(),
-        );
-    }
+        )
+    } else {
+        FreshOsv::default()
+    };
     let mut entries: Vec<Entry> = {
         let cache_view: &Cache = cache;
         kept.into_iter()
             .zip(checked_versions)
             .map(|(dependency, checked_version)| {
-                build_entry(eco, dependency, checked_version, cache_view, settings, now)
+                build_entry(
+                    eco,
+                    dependency,
+                    checked_version,
+                    cache_view,
+                    &fresh_osv,
+                    settings,
+                    now,
+                )
             })
             .collect()
     };
@@ -283,7 +293,8 @@ fn unresolved_count(list: &[Vulnerability], cache: &Cache, now: u64) -> usize {
 /// R35): the pair is queried again, and `fetch_missing_details` loads the details within its cap.
 /// A query that leaves as many unresolved placeholders as it started with stores a 60 s failure,
 /// so the package is not queried again at once. A query that makes progress stores none, so the
-/// next chunk continues at once. Stores each answer, or the failure reason for every queried package.
+/// next chunk continues at once. Stores each answer, or the failure reason for every queried package,
+/// in the cache and in the returned [`FreshOsv`].
 fn query_missing_vulnerabilities(
     eco: Ecosystem,
     deps: &[Dependency],
@@ -292,7 +303,8 @@ fn query_missing_vulnerabilities(
     http: &dyn Http,
     now: u64,
     deadline: Option<Instant>,
-) {
+) -> FreshOsv {
+    let mut fresh = FreshOsv::default();
     // Borrowed pairs: duplicates are found without copying the names.
     let mut seen: HashSet<(&str, &str)> = HashSet::new();
     let mut queries: Vec<OsvQuery> = Vec::new();
@@ -324,7 +336,7 @@ fn query_missing_vulnerabilities(
         unresolved_before.push(unresolved);
     }
     if queries.is_empty() {
-        return;
+        return fresh;
     }
     match query_batch(http, cache, &queries, now, deadline) {
         Ok(results) => {
@@ -335,8 +347,16 @@ fn query_missing_vulnerabilities(
                 // A pair never queried starts with every advisory unresolved.
                 let made_no_progress = unresolved_after > 0
                     && unresolved_after >= before.unwrap_or(vulnerabilities.len());
+                fresh
+                    .found
+                    .entry(query.name.clone())
+                    .or_default()
+                    .insert(query.version.clone(), vulnerabilities.clone());
                 cache.put_vulnerabilities(eco, &query.name, &query.version, vulnerabilities, now);
                 if made_no_progress {
+                    fresh
+                        .failed
+                        .insert(query.name.clone(), DETAILS_NOT_LOADED.to_owned());
                     cache.put_failure(
                         FailureKind::Osv,
                         eco,
@@ -349,9 +369,34 @@ fn query_missing_vulnerabilities(
         }
         Err(reason) => {
             for query in &queries {
+                fresh.failed.insert(query.name.clone(), reason.clone());
                 cache.put_failure(FailureKind::Osv, eco, &query.name, reason.clone(), now);
             }
         }
+    }
+    fresh
+}
+
+/// What the OSV phase of one `analyze` call learned, kept for that call.
+///
+/// The cache stores nothing when `cacheTtlSeconds` is zero, so reading the answers back from the
+/// cache alone would hide every advisory and every OSV failure. Entries are built from this first.
+/// The maps are nested so a lookup borrows the name and the version instead of building a key.
+#[derive(Default)]
+struct FreshOsv {
+    /// Package name, then declared version, to the advisories OSV returned.
+    found: HashMap<String, HashMap<String, Vec<Vulnerability>>>,
+    /// Package name to the reason its OSV answer is missing or incomplete.
+    failed: HashMap<String, String>,
+}
+
+impl FreshOsv {
+    fn vulnerabilities(&self, name: &str, version: &str) -> Option<&[Vulnerability]> {
+        self.found.get(name)?.get(version).map(Vec::as_slice)
+    }
+
+    fn failure(&self, name: &str) -> Option<&str> {
+        self.failed.get(name).map(String::as_str)
     }
 }
 
@@ -366,6 +411,7 @@ fn build_entry(
     dependency: Dependency,
     checked_version: Option<String>,
     cache: &Cache,
+    fresh: &FreshOsv,
     settings: &Settings,
     now: u64,
 ) -> Entry {
@@ -379,7 +425,11 @@ fn build_entry(
     }
     let vulnerabilities = checked_version
         .as_deref()
-        .and_then(|version| cache.vulnerabilities(eco, &dependency.name, version, now))
+        .and_then(|version| {
+            fresh
+                .vulnerabilities(&dependency.name, version)
+                .or_else(|| cache.vulnerabilities(eco, &dependency.name, version, now))
+        })
         .unwrap_or_default()
         .iter()
         .filter_map(|cached| {
@@ -392,7 +442,10 @@ fn build_entry(
                 .then(|| current.clone())
         })
         .collect();
-    let status = match cache.failure(FailureKind::Osv, eco, &dependency.name, now) {
+    let status = match fresh
+        .failure(&dependency.name)
+        .or_else(|| cache.failure(FailureKind::Osv, eco, &dependency.name, now))
+    {
         Some(reason) => Status::Unknown(reason.to_owned()),
         None => Status::NotChecked,
     };
@@ -488,6 +541,46 @@ mod tests {
         assert_eq!(serde.vulnerabilities[0].severity, AdvisorySeverity::High);
         assert!(entry(&analysis, "anyhow").vulnerabilities.is_empty());
         assert!(entry(&analysis, "tokio").vulnerabilities.is_empty());
+    }
+
+    #[test]
+    fn reports_advisories_when_the_cache_stores_nothing() {
+        // A cache lifetime of zero keeps nothing between calls, but one call must still show its answers.
+        let mut cache = Cache::new(0);
+        let http = serde_high_http();
+        let analysis = run(&mut cache, &http, &Settings::default(), NOW, MANIFEST);
+        let serde = entry(&analysis, "serde");
+        assert_eq!(serde.status, Status::NotChecked);
+        assert_eq!(serde.vulnerabilities.len(), 1);
+        assert_eq!(serde.vulnerabilities[0].id, "GHSA-high-0001");
+        assert_eq!(serde.vulnerabilities[0].severity, AdvisorySeverity::High);
+        assert!(entry(&analysis, "anyhow").vulnerabilities.is_empty());
+        assert_eq!(http.count(BATCH_URL), 1);
+    }
+
+    #[test]
+    fn reports_an_osv_failure_when_the_cache_stores_nothing() {
+        let mut cache = Cache::new(0);
+        let http = FakeHttp::new().route("POST", BATCH_URL, 500, "");
+        let analysis = run(&mut cache, &http, &Settings::default(), NOW, MANIFEST);
+        for name in ["serde", "anyhow", "tokio"] {
+            assert_eq!(
+                entry(&analysis, name).status,
+                Status::Unknown("OSV: HTTP 500".to_owned()),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn minimum_severity_still_filters_when_the_cache_stores_nothing() {
+        let mut cache = Cache::new(0);
+        let settings = Settings {
+            minimum_severity: AdvisorySeverity::Critical,
+            ..Settings::default()
+        };
+        let analysis = run(&mut cache, &serde_high_http(), &settings, NOW, MANIFEST);
+        assert!(entry(&analysis, "serde").vulnerabilities.is_empty());
     }
 
     #[test]
