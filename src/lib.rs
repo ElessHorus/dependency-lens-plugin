@@ -105,14 +105,13 @@ impl DependencyLens {
         };
         // The deepest open project holding the path wins; the window's project is only a fallback.
         let Some(project) = host::project_of(path).or_else(|| ctx.project()) else {
-            self.published_paths.remove(path);
+            self.forget_shown(path);
             return;
         };
         let text = match project.read_file(path) {
             Ok(text) => text,
             Err(error) => {
-                // A manifest that cannot be read is no longer a shown one.
-                self.published_paths.remove(path);
+                self.forget_shown(path);
                 host::log(LogLevel::Warn, &format!("cannot read {path}: {error}"));
                 return;
             }
@@ -121,6 +120,13 @@ impl DependencyLens {
         self.published_paths.insert(path.to_owned());
         let task = host::begin_task(TASK_TITLE, true);
         self.publish_chunks(eco, path, &text, &deps, &task, deadline);
+    }
+
+    /// Stops tracking a manifest that cannot be read, and clears what the editor still shows for it.
+    fn forget_shown(&mut self, path: &str) {
+        if self.published_paths.remove(path) {
+            publish_results(path, &[], &[]);
+        }
     }
 
     /// Runs the registry lookups of `deps` in chunks and publishes after each chunk.
@@ -265,15 +271,17 @@ pub(crate) fn is_manifest_in(path: &str, project_root: Option<&str>) -> bool {
 /// Without a project root, the whole path is checked.
 fn is_in_skipped_directory(path: &str, project_root: Option<&str>) -> bool {
     let path_parts = path_components(path);
-    // Whole components are compared, so `/p/app2` is not inside `/p/app`. Both separators and
-    // any case count, because the host may write a Windows path either way.
+    // Whole components are compared, so `/p/app2` is not inside `/p/app`. Both separators count,
+    // because the host may write a Windows path either way.
     let below_root = project_root.and_then(|root| {
+        // Windows paths ignore case. A path with a drive colon or a backslash is one of them.
+        let ignores_case = root.contains([':', '\\']);
         let mut remaining_parts = path_parts.clone();
         path_components(root)
             .all(|root_part| {
-                remaining_parts
-                    .next()
-                    .is_some_and(|part| part.eq_ignore_ascii_case(root_part))
+                remaining_parts.next().is_some_and(|part| {
+                    part == root_part || (ignores_case && part.eq_ignore_ascii_case(root_part))
+                })
             })
             .then_some(remaining_parts)
     });
@@ -515,6 +523,25 @@ mod skipped_directory_tests {
         assert!(is_in_skipped_directory(
             "C:/work/vendor/app/target/Cargo.toml",
             Some("C:\\work\\vendor\\app")
+        ));
+    }
+}
+
+#[cfg(test)]
+mod path_case_tests {
+    use super::is_in_skipped_directory;
+
+    #[test]
+    fn case_matters_on_a_unix_path_and_not_on_a_windows_path() {
+        // `/p/vendor/App` is another directory than `/p/vendor/app` on Linux, so the root does
+        // not match and the whole path is checked, which holds `vendor`.
+        assert!(is_in_skipped_directory(
+            "/p/vendor/App/Cargo.toml",
+            Some("/p/vendor/app")
+        ));
+        assert!(!is_in_skipped_directory(
+            "C:/Work/vendor/App/Cargo.toml",
+            Some("c:\\work\\vendor\\app")
         ));
     }
 }

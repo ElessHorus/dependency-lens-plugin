@@ -364,9 +364,14 @@ fn exclude_uv_sources(dom: &Node, dependencies: &mut Vec<Dependency>) {
 fn has_private_index(dom: &Node) -> bool {
     let tool = dom.get("tool");
     let uv = tool.get("uv");
+    // `[tool.uv.pip]` holds the same settings for the `uv pip` commands.
+    let uv_pip = uv.get("pip");
     holds_private_url(&uv.get("index-url"))
         || holds_private_url(&uv.get("extra-index-url"))
         || holds_private_url(&uv.get("find-links"))
+        || holds_private_url(&uv_pip.get("index-url"))
+        || holds_private_url(&uv_pip.get("extra-index-url"))
+        || holds_private_url(&uv_pip.get("find-links"))
         || holds_private_index_table(&uv.get("index"), |table| {
             table.get("explicit").as_bool().is_some_and(Bool::value)
         })
@@ -1113,6 +1118,20 @@ internal-dev = { workspace = true }
                 1,
                 "{index_setting} must keep the file"
             );
+        }
+    }
+
+    #[test]
+    fn a_private_uv_pip_index_hides_the_manifest() {
+        for setting in [
+            "index-url = \"https://pypi.acme.internal/simple\"",
+            "extra-index-url = [\"https://pypi.acme.internal/simple\"]",
+            "find-links = [\"./wheels\"]",
+        ] {
+            let manifest = format!(
+                "[project]\ndependencies = [\"internal==1.0\"]\n\n[tool.uv.pip]\n{setting}\n"
+            );
+            assert!(parse(&manifest).is_empty(), "{setting} must hide the file");
         }
     }
 }
