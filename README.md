@@ -99,7 +99,7 @@ Add the package name to `ignore`, for example `["serde", "left-pad"]`. The name 
 - The IDE unloads an idle plugin after about five minutes, and the in-memory cache is then empty. The "→ x" decorations stay on screen, but the update quick fix is unavailable until the next save or "Dependency Lens: Refresh".
 - "Dependency Lens: Refresh" reads the file again, but it answers from the cache while the entries are younger than `cacheTtlSeconds`.
 - The update quick fix writes the exact latest version. A compatible-release requirement such as `~=2.28` (Python) or `~> 7.0` (Ruby) becomes narrower after the fix (`~=2.31.0`).
-- Unlisted and deprecated package states are not shown.
+- Unlisted and deprecated package states are not shown. For NuGet, the latest release can be a version that its author unlisted, because the version index does not tell them apart.
 - The Maven parser reads the `project/properties` block only, for `${name}` version placeholders.
 - Composer `-p1` and `-patch` stabilities count as prereleases.
 
