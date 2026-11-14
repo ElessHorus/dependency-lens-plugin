@@ -1,8 +1,8 @@
 //! Parser for Maven `pom.xml` dependency declarations.
 //!
 //! Reads `<dependency>` entries under `<dependencies>` in one streaming pass.
-//! Plugin dependencies, reporting sections and entries without a literal or
-//! resolvable version are not returned. Parent POMs, profiles and BOM imports
+//! Plugin dependencies, reporting sections, `system` scope entries (local JARs)
+//! and entries without a literal or resolvable version are not returned. Parent POMs, profiles and BOM imports
 //! are not resolved.
 
 use std::collections::HashMap;
@@ -184,6 +184,10 @@ fn build_dependency(pending: PendingDependency<'_>) -> Option<(Dependency, Optio
     let artifact = pending.artifact_id?;
     let version = pending.version?;
     if group.text.contains("${") || artifact.text.contains("${") {
+        return None;
+    }
+    // A system-scope dependency is a local JAR, so no registry holds it.
+    if pending.scope.is_some_and(|scope| scope.text == "system") {
         return None;
     }
     let dependency = Dependency {
@@ -434,5 +438,32 @@ mod tests {
             Some("${p}")
         );
         assert!(dependencies[0].has_additional_version_constraints);
+    }
+
+    #[test]
+    fn system_scope_dependencies_are_local_jars_and_are_skipped() {
+        let manifest = "\
+<project>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>local-jar</artifactId>
+      <version>1.0</version>
+      <scope>system</scope>
+      <systemPath>${project.basedir}/lib/local.jar</systemPath>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>2.0.9</version>
+    </dependency>
+  </dependencies>
+</project>
+";
+        let names: Vec<_> = parse(manifest)
+            .into_iter()
+            .map(|dependency| dependency.name)
+            .collect();
+        assert_eq!(names, ["org.slf4j:slf4j-api"]);
     }
 }
