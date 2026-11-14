@@ -1,4 +1,5 @@
 .superpowers/
+.serena/
 target/
 dist/
 *.key

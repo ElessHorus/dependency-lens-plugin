@@ -96,6 +96,9 @@ Add the package name to `ignore`, for example `["serde", "left-pad"]`. The name 
 - For a requirement with a range (`^1.2`, `>=2.0`, `||`), the plugin checks the lower bound of the first alternative. A newer release is then shown as outdated against that bound.
 - The first lookup of a large manifest takes seconds. The lookups run one after another. The status bar shows the progress, and you can cancel the task. Each chunk of 20 lookups shows its results before the next chunk starts. After a five-minute soft cap, the entries that still show `…` finish on the next open, save or "Dependency Lens: Refresh" of their manifest.
 - Answers are cached in memory for `cacheTtlSeconds` (one hour by default). The cache is lost when the IDE unloads the plugin. A failed lookup is retried after 60 seconds.
+- The IDE unloads an idle plugin after about five minutes, and the in-memory cache is then empty. The "→ x" decorations stay on screen, but the update quick fix is unavailable until the next save or "Dependency Lens: Refresh".
+- "Dependency Lens: Refresh" reads the file again, but it answers from the cache while the entries are younger than `cacheTtlSeconds`.
+- The update quick fix writes the exact latest version. A compatible-release requirement such as `~=2.28` (Python) or `~> 7.0` (Ruby) becomes narrower after the fix (`~=2.31.0`).
 - Unlisted and deprecated package states are not shown.
 - The Maven parser reads the `project/properties` block only, for `${name}` version placeholders.
 - Composer `-p1` and `-patch` stabilities count as prereleases.

@@ -6,12 +6,11 @@ This page is for the maintainer. It lists the checks to run in the IDE, the step
 
 Run these checks in the real IDE, after building and linking the plugin (see the Building section of the README).
 
-1. Open `fixtures/rust-app/Cargo.toml`, `ts-app/package.json`, `go-app/go.mod`, `python-app/requirements.txt` (or `pyproject.toml`) and `java-app/pom.xml` of the OpenIDEA checkout. Check the decorations, the hover, the Problems view and the quick fix.
+1. Open `fixtures/rust-app/Cargo.toml`, `ts-app/package.json`, `go-app/go.mod`, `python-app/requirements.txt` (or `pyproject.toml`) and `java-app/pom.xml` of the OpenIDEA checkout. Also open a `composer.json`, a `pubspec.yaml`, a `.csproj` file and a `Gemfile`. Check the decorations, the hover, the Problems view and the quick fix.
 2. Measure the time from opening a manifest to its final decoration. Measure it cold and warm, on a manifest with 50 or more dependencies.
 3. In a multi-project window, open a manifest of a project that is not the main project. Check that its decorations and problems appear.
 4. Open a manifest saved with a UTF-8 byte order mark. Check that the decoration columns are correct.
 5. Turn one ecosystem off in the settings. Check that no request is sent for its manifests.
-6. Check the claim about OpenIDEA's built-in outdated-dependency inspection in the first paragraph of the README.
 
 ## Before the first release
 

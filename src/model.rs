@@ -117,8 +117,6 @@ impl Ecosystem {
     }
 
     /// Dispatches to the parser of this ecosystem. `text` has no byte order mark.
-    ///
-    /// Ecosystems without a parser yet return an empty vector.
     fn parse_body(self, text: &str) -> Vec<Dependency> {
         match self {
             Ecosystem::Cargo => parsers::cargo::parse(text),

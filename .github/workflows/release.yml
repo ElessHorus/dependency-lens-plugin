@@ -15,6 +15,8 @@ jobs:
     steps:
       # Third-party actions are pinned by major tag. The maintainer may pin them to commit SHAs.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # Fail fast: a mismatched tag stops the job before any toolchain is installed.
       - name: Check the tag against plugin.toml

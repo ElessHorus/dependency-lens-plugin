@@ -1,6 +1,6 @@
 //! Reads top-level JSON sections of `name: version` pairs with source spans.
 //!
-//! Shared by npm and, later, Composer. The module holds no ecosystem rules:
+//! Shared by npm and Composer. The module holds no ecosystem rules:
 //! the caller chooses the sections and the entries to skip.
 
 use json_spanned_value::spanned;
