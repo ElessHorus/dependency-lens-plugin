@@ -1,4 +1,4 @@
-id = "local.dependency-lens"
+id = "dawnshadow.dependency-lens"
 name = "Dependency Lens"
 version = "0.1.0"
 description = "Shows OSV vulnerabilities and newer versions inline in dependency manifests."
