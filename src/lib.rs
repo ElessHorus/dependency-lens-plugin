@@ -132,7 +132,8 @@ impl DependencyLens {
         let mut previous_pending = None;
         loop {
             // The dependency vector is cloned per chunk; the parse is not repeated.
-            // Each chunk gets its own deadline, so its first lookup always runs.
+            // Each chunk gets its own deadline. The first registry lookup of a chunk always runs,
+            // and the OSV phase stops fetching advisory details once the deadline has passed.
             let mut budget = Budget::new(chunk, Some(Instant::now() + CHUNK_LIMIT));
             let analysis = analyze(
                 eco,

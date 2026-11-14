@@ -3,7 +3,7 @@
 use crate::cache::{Cache, FailureKind};
 use crate::http::Http;
 use crate::model::{Dependency, Ecosystem, VersionInfo, Vulnerability};
-use crate::osv::{OsvQuery, declared_version_for_osv, query_batch};
+use crate::osv::{OsvQuery, declared_version_for_osv, is_placeholder, query_batch};
 use crate::settings::Settings;
 use crate::update::is_outdated;
 use openidea_plugin::HttpRequest;
@@ -66,6 +66,11 @@ impl Budget {
         }
     }
 
+    /// The instant at which the run must stop starting slow work, when one is set.
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
     /// Consumes one registry lookup; false when none is left or the deadline passed.
     pub fn take(&mut self) -> bool {
         // Count first: a spent budget never reads the clock.
@@ -120,7 +125,15 @@ pub fn analyze(
         .map(|dependency| declared_version_for_osv(&dependency.version))
         .collect();
     if settings.vulnerabilities {
-        query_missing_vulnerabilities(eco, &kept, &checked_versions, cache, http, now);
+        query_missing_vulnerabilities(
+            eco,
+            &kept,
+            &checked_versions,
+            cache,
+            http,
+            now,
+            budget.deadline(),
+        );
     }
     let mut entries: Vec<Entry> = {
         let cache_view: &Cache = cache;
@@ -144,6 +157,8 @@ type Lookup = Result<Option<String>, String>;
 
 /// Sets the registry status of every entry with a checked version. Returns how many stay pending.
 ///
+/// An entry that already is [`Status::Unknown`] (an OSV failure) keeps that status and costs no request.
+///
 /// Each entry reads the cache first. A name that is missing from the cache gets one request
 /// per call, and the call-local map answers its duplicates even when the cache keeps nothing.
 fn resolve_registry(
@@ -156,10 +171,9 @@ fn resolve_registry(
 ) -> usize {
     let mut fresh: HashMap<String, Lookup> = HashMap::new();
     let mut pending_count = 0;
-    for entry in entries
-        .iter_mut()
-        .filter(|entry| entry.checked_version.is_some())
-    {
+    for entry in entries.iter_mut().filter(|entry| {
+        entry.checked_version.is_some() && !matches!(entry.status, Status::Unknown(_))
+    }) {
         let name = eco.normalize_package(&entry.dependency.name);
         let declared = entry.dependency.version.as_str();
         let status = if let Some(info) = cache.version_info(eco, &name, now) {
@@ -251,9 +265,25 @@ fn request_version_info(
     eco.parse_registry(&String::from_utf8_lossy(&response.body))
 }
 
-/// Sends one OSV batch for the checked pairs that have neither a cached answer nor a recent failure.
+/// Reason stored when an OSV re-query loads no advisory detail.
+const DETAILS_NOT_LOADED: &str = "OSV: advisory details not loaded";
+
+/// Counts the placeholders of `list` whose real record is not in the advisory cache.
+fn unresolved_count(list: &[Vulnerability], cache: &Cache, now: u64) -> usize {
+    list.iter()
+        .filter(|vulnerability| {
+            is_placeholder(vulnerability) && cache.advisory(&vulnerability.id, now).is_none()
+        })
+        .count()
+}
+
+/// Sends one OSV batch for the checked pairs that have no usable cached answer and no recent failure.
 ///
-/// Stores each answer, or the failure reason for every queried package.
+/// A cached answer is not usable while it holds a placeholder without a cached advisory (ruling
+/// R35): the pair is queried again, and `fetch_missing_details` loads the details within its cap.
+/// A query that leaves as many unresolved placeholders as it started with stores a 60 s failure,
+/// so the package is not queried again at once. A query that makes progress stores none, so the
+/// next chunk continues at once. Stores each answer, or the failure reason for every queried package.
 fn query_missing_vulnerabilities(
     eco: Ecosystem,
     deps: &[Dependency],
@@ -261,20 +291,27 @@ fn query_missing_vulnerabilities(
     cache: &mut Cache,
     http: &dyn Http,
     now: u64,
+    deadline: Option<Instant>,
 ) {
     // Borrowed pairs: duplicates are found without copying the names.
     let mut seen: HashSet<(&str, &str)> = HashSet::new();
     let mut queries: Vec<OsvQuery> = Vec::new();
+    // Unresolved placeholders of a cached pair before its re-query; `None` for a pair never queried.
+    let mut unresolved_before: Vec<Option<usize>> = Vec::new();
     for (dependency, checked_version) in deps.iter().zip(checked_versions) {
         let Some(version) = checked_version.as_deref() else {
             continue;
         };
+        let unresolved = match cache.vulnerabilities(eco, &dependency.name, version, now) {
+            Some(list) => match unresolved_count(list, cache, now) {
+                0 => continue,
+                count => Some(count),
+            },
+            None => None,
+        };
         if cache
-            .vulnerabilities(eco, &dependency.name, version, now)
+            .failure(FailureKind::Osv, eco, &dependency.name, now)
             .is_some()
-            || cache
-                .failure(FailureKind::Osv, eco, &dependency.name, now)
-                .is_some()
             || !seen.insert((dependency.name.as_str(), version))
         {
             continue;
@@ -284,14 +321,30 @@ fn query_missing_vulnerabilities(
             name: dependency.name.clone(),
             version: version.to_owned(),
         });
+        unresolved_before.push(unresolved);
     }
     if queries.is_empty() {
         return;
     }
-    match query_batch(http, cache, &queries, now) {
+    match query_batch(http, cache, &queries, now, deadline) {
         Ok(results) => {
-            for (query, vulnerabilities) in queries.iter().zip(results) {
+            for ((query, before), vulnerabilities) in
+                queries.iter().zip(unresolved_before).zip(results)
+            {
+                let unresolved_after = unresolved_count(&vulnerabilities, cache, now);
+                // A pair never queried starts with every advisory unresolved.
+                let made_no_progress = unresolved_after > 0
+                    && unresolved_after >= before.unwrap_or(vulnerabilities.len());
                 cache.put_vulnerabilities(eco, &query.name, &query.version, vulnerabilities, now);
+                if made_no_progress {
+                    cache.put_failure(
+                        FailureKind::Osv,
+                        eco,
+                        &query.name,
+                        DETAILS_NOT_LOADED.to_owned(),
+                        now,
+                    );
+                }
             }
         }
         Err(reason) => {
@@ -305,7 +358,9 @@ fn query_missing_vulnerabilities(
 /// Builds the entry of one dependency from cached data.
 ///
 /// Advisories below `minimum_severity` are filtered here, at read time, so a
-/// change of the setting applies to answers that are already cached.
+/// change of the setting applies to answers that are already cached. A placeholder
+/// is replaced by its advisory once that is cached, and is never filtered: its
+/// severity is unknown, so it must stay visible.
 fn build_entry(
     eco: Ecosystem,
     dependency: Dependency,
@@ -327,8 +382,15 @@ fn build_entry(
         .and_then(|version| cache.vulnerabilities(eco, &dependency.name, version, now))
         .unwrap_or_default()
         .iter()
-        .filter(|vulnerability| vulnerability.severity >= settings.minimum_severity)
-        .cloned()
+        .filter_map(|cached| {
+            let current = if is_placeholder(cached) {
+                cache.advisory(&cached.id, now).unwrap_or(cached)
+            } else {
+                cached
+            };
+            (is_placeholder(current) || current.severity >= settings.minimum_severity)
+                .then(|| current.clone())
+        })
         .collect();
     let status = match cache.failure(FailureKind::Osv, eco, &dependency.name, now) {
         Some(reason) => Status::Unknown(reason.to_owned()),
@@ -1401,5 +1463,161 @@ mod tests {
             }
         );
         assert_eq!(http.count(REQUESTS_URL), 1);
+    }
+
+    // OSV failure and advisory placeholders
+
+    const SINGLE_SERDE: &str = "[dependencies]\nserde = \"1.0.0\"\n";
+    const CRIT_DETAIL_URL: &str = "https://api.osv.dev/v1/vulns/GHSA-crit";
+
+    /// Settings that keep only advisories of High severity or above.
+    fn high_only() -> Settings {
+        Settings {
+            minimum_severity: AdvisorySeverity::High,
+            ..Settings::default()
+        }
+    }
+
+    /// Answers the batch with one advisory id for the only query.
+    fn one_advisory_batch(id: &str) -> String {
+        format!(r#"{{"results":[{{"vulns":[{{"id":"{id}"}}]}}]}}"#)
+    }
+
+    #[test]
+    fn osv_failure_keeps_a_packagist_dependency_unknown_without_registry_request() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new().route("POST", BATCH_URL, 500, "{}").route(
+            "GET",
+            CURRENT_URL,
+            200,
+            CURRENT_BODY,
+        );
+        let analysis = analyze_composer(
+            &mut cache,
+            &http,
+            r#"{"require":{"acme/current":"3.12.1"}}"#,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(
+            entry(&analysis, "acme/current").status,
+            Status::Unknown("OSV: HTTP 500".to_string())
+        );
+        assert_eq!(analysis.pending, 0);
+        assert_eq!(http.count("https://repo.packagist.org/"), 0);
+    }
+
+    #[test]
+    fn osv_failure_keeps_a_pypi_dependency_unknown_without_registry_request() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 500, "{}")
+            .route("GET", FLASK_URL, 200, FLASK_BODY);
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            "flask==2.31.0\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(
+            entry(&analysis, "flask").status,
+            Status::Unknown("OSV: HTTP 500".to_string())
+        );
+        assert_eq!(analysis.pending, 0);
+        assert_eq!(http.count(PYPI_PREFIX), 0);
+    }
+
+    #[test]
+    fn failed_detail_fetch_keeps_the_placeholder_despite_the_minimum_severity() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &one_advisory_batch("GHSA-crit"))
+            .route("GET", CRIT_DETAIL_URL, 503, "");
+        let analysis = run(&mut cache, &http, &high_only(), NOW, SINGLE_SERDE);
+        let vulnerabilities = &entry(&analysis, "serde").vulnerabilities;
+        assert_eq!(vulnerabilities.len(), 1);
+        assert_eq!(vulnerabilities[0].id, "GHSA-crit");
+        assert!(crate::osv::is_placeholder(&vulnerabilities[0]));
+    }
+
+    #[test]
+    fn placeholder_is_queried_again_after_the_failure_window() {
+        let mut cache = Cache::new(TTL_SECS);
+        let failing = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &one_advisory_batch("GHSA-crit"))
+            .route("GET", CRIT_DETAIL_URL, 503, "");
+        run(&mut cache, &failing, &high_only(), NOW, SINGLE_SERDE);
+        assert_eq!(failing.count(CRIT_DETAIL_URL), 1);
+
+        let working = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &one_advisory_batch("GHSA-crit"))
+            .route(
+                "GET",
+                CRIT_DETAIL_URL,
+                200,
+                &detail_body("GHSA-crit", "CRITICAL"),
+            );
+        let second = run(&mut cache, &working, &high_only(), NOW + 61, SINGLE_SERDE);
+        let vulnerabilities = &entry(&second, "serde").vulnerabilities;
+        assert_eq!(vulnerabilities.len(), 1);
+        assert_eq!(vulnerabilities[0].severity, AdvisorySeverity::Critical);
+        assert!(!crate::osv::is_placeholder(&vulnerabilities[0]));
+        assert_eq!(working.count(CRIT_DETAIL_URL), 1);
+        assert_eq!(working.count(BATCH_URL), 1);
+        assert_eq!(entry(&second, "serde").status, Status::NotChecked);
+    }
+
+    #[test]
+    fn placeholder_is_not_queried_again_inside_the_failure_window() {
+        let mut cache = Cache::new(TTL_SECS);
+        let failing = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &one_advisory_batch("GHSA-crit"))
+            .route("GET", CRIT_DETAIL_URL, 503, "");
+        run(&mut cache, &failing, &high_only(), NOW, SINGLE_SERDE);
+
+        let working = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &one_advisory_batch("GHSA-crit"))
+            .route(
+                "GET",
+                CRIT_DETAIL_URL,
+                200,
+                &detail_body("GHSA-crit", "CRITICAL"),
+            );
+        let second = run(&mut cache, &working, &high_only(), NOW + 5, SINGLE_SERDE);
+        assert!(working.requests().is_empty());
+        assert_eq!(entry(&second, "serde").vulnerabilities.len(), 1);
+    }
+
+    #[test]
+    fn more_advisories_than_the_detail_cap_complete_on_the_next_call_without_delay() {
+        let ids: Vec<String> = (0..120).map(|index| format!("TEST-{index:03}")).collect();
+        let list: Vec<String> = ids.iter().map(|id| format!(r#"{{"id":"{id}"}}"#)).collect();
+        let batch = format!(r#"{{"results":[{{"vulns":[{}]}}]}}"#, list.join(","));
+        let mut http = FakeHttp::new().route("POST", BATCH_URL, 200, &batch);
+        for id in &ids {
+            http = http.route(
+                "GET",
+                &format!("{DETAIL_PREFIX}{id}"),
+                200,
+                &detail_body(id, "LOW"),
+            );
+        }
+        let mut cache = Cache::new(TTL_SECS);
+        let count_placeholders = |analysis: &Analysis| {
+            entry(analysis, "serde")
+                .vulnerabilities
+                .iter()
+                .filter(|vulnerability| crate::osv::is_placeholder(vulnerability))
+                .count()
+        };
+
+        let first = run(&mut cache, &http, &Settings::default(), NOW, SINGLE_SERDE);
+        assert_eq!(http.count(DETAIL_PREFIX), 100);
+        assert_eq!(count_placeholders(&first), 20);
+
+        let second = run(&mut cache, &http, &Settings::default(), NOW, SINGLE_SERDE);
+        assert_eq!(http.count(DETAIL_PREFIX), 120);
+        assert_eq!(count_placeholders(&second), 0);
+        assert_eq!(entry(&second, "serde").vulnerabilities.len(), 120);
     }
 }

@@ -7,6 +7,7 @@ use crate::registries::dotted::is_dev_branch;
 use openidea_plugin::{HttpRequest, HttpResponse};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 /// Most advisory details fetched during one call to [`query_batch`].
 pub const MAX_DETAIL_FETCHES_PER_RUN: usize = 100;
@@ -20,7 +21,8 @@ const MAX_ADVISORY_ID_LEN: usize = 64;
 const BATCH_URL: &str = "https://api.osv.dev/v1/querybatch";
 const DETAIL_URL_PREFIX: &str = "https://api.osv.dev/v1/vulns/";
 const ADVISORY_URL_PREFIX: &str = "https://osv.dev/vulnerability/";
-const PLACEHOLDER_SUMMARY: &str = "Details not loaded yet";
+/// Summary of the placeholder shown while the details of an advisory are not loaded.
+pub const PLACEHOLDER_SUMMARY: &str = "Details not loaded yet";
 /// Longest advisory summary kept, in characters.
 const SUMMARY_MAX_CHARS: usize = 200;
 const INVALID_RESPONSE: &str = "OSV: invalid response";
@@ -185,8 +187,11 @@ fn roundup(value: f64) -> f64 {
 /// Checks `queries` against OSV and returns the advisories of each query, in input order.
 ///
 /// Advisory ids come from `querybatch`. Their details come from `cache` or from
-/// `GET /v1/vulns/{id}`, at most [`MAX_DETAIL_FETCHES_PER_RUN`] per call. Ids beyond that
-/// cap, and ids whose detail fetch fails, get a placeholder that is not cached.
+/// `GET /v1/vulns/{id}`, at most [`MAX_DETAIL_FETCHES_PER_RUN`] per call, and none once
+/// `deadline` has passed. Ids beyond that cap or limit, and ids whose detail fetch fails,
+/// get a placeholder (see [`is_placeholder`]). The advisory cache never holds a placeholder,
+/// but the returned lists do: a caller that stores them must treat a placeholder as unresolved
+/// and query again later.
 ///
 /// # Errors
 ///
@@ -196,12 +201,13 @@ pub fn query_batch(
     cache: &mut Cache,
     queries: &[OsvQuery],
     now: u64,
+    deadline: Option<Instant>,
 ) -> Result<Vec<Vec<Vulnerability>>, String> {
     let mut advisory_ids_per_query: Vec<Vec<String>> = Vec::with_capacity(queries.len());
     for chunk in queries.chunks(MAX_BATCH_QUERIES) {
         advisory_ids_per_query.extend(query_chunk(http, chunk)?);
     }
-    let fetched = fetch_missing_details(http, cache, &advisory_ids_per_query, now);
+    let fetched = fetch_missing_details(http, cache, &advisory_ids_per_query, now, deadline);
     let cache: &Cache = cache;
     Ok(advisory_ids_per_query
         .iter()
@@ -259,12 +265,14 @@ fn query_chunk(http: &dyn Http, chunk: &[OsvQuery]) -> Result<Vec<Vec<String>>, 
 
 /// Fetches the details of uncached advisory ids, at most [`MAX_DETAIL_FETCHES_PER_RUN`].
 ///
+/// Stops before the first request that would start at or after `deadline`.
 /// Stores each fetched advisory in `cache` and returns the fetched advisories by id.
 fn fetch_missing_details<'a>(
     http: &dyn Http,
     cache: &mut Cache,
     advisory_ids_per_query: &'a [Vec<String>],
     now: u64,
+    deadline: Option<Instant>,
 ) -> HashMap<&'a str, Vulnerability> {
     // One pass: `seen` drops repeats, and `take` stops the scan at the cap.
     let mut seen: HashSet<&str> = HashSet::new();
@@ -278,6 +286,10 @@ fn fetch_missing_details<'a>(
 
     let mut fetched = HashMap::with_capacity(missing_ids.len());
     for id in missing_ids {
+        // The caller's deadline bounds this loop: a sequence of GETs would otherwise outlast the host's limit.
+        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+            break;
+        }
         if let Some(advisory) = fetch_detail(http, id) {
             cache.put_advisory(advisory.clone(), now);
             fetched.insert(id, advisory);
@@ -320,6 +332,11 @@ fn placeholder(id: &str) -> Vulnerability {
         summary: PLACEHOLDER_SUMMARY.to_owned(),
         url: Some(advisory_url(id)),
     }
+}
+
+/// Returns `true` when `vulnerability` is the placeholder of an advisory whose details are not loaded.
+pub fn is_placeholder(vulnerability: &Vulnerability) -> bool {
+    vulnerability.summary == PLACEHOLDER_SUMMARY
 }
 
 fn advisory_url(id: &str) -> String {
@@ -501,6 +518,7 @@ mod tests {
     use openidea_plugin::HttpResponse;
     use serde_json::{Value, json};
     use std::cell::RefCell;
+    use std::time::Duration;
 
     const NOW: u64 = 1_000;
     const TTL_SECS: u64 = 3600;
@@ -918,7 +936,7 @@ mod tests {
     fn results_align_with_queries_and_details_are_cached() {
         let http = fixture_http();
         let mut cache = Cache::new(TTL_SECS);
-        let results = query_batch(&http, &mut cache, &fixture_queries(), NOW).unwrap();
+        let results = query_batch(&http, &mut cache, &fixture_queries(), NOW, None).unwrap();
 
         let smallvec_summary = "Buffer overflow in SmallVec::insert_many";
         let rustsec = Vulnerability {
@@ -959,7 +977,7 @@ mod tests {
     fn batch_body_lists_one_entry_per_query() {
         let http = fixture_http();
         let mut cache = Cache::new(TTL_SECS);
-        query_batch(&http, &mut cache, &fixture_queries(), NOW).unwrap();
+        query_batch(&http, &mut cache, &fixture_queries(), NOW, None).unwrap();
         let sent: Value = serde_json::from_str(&http.request_bodies()[0]).unwrap();
         assert_eq!(
             sent,
@@ -977,9 +995,9 @@ mod tests {
     fn second_call_is_served_from_the_cache_without_detail_requests() {
         let http = fixture_http();
         let mut cache = Cache::new(TTL_SECS);
-        let first = query_batch(&http, &mut cache, &fixture_queries(), NOW).unwrap();
+        let first = query_batch(&http, &mut cache, &fixture_queries(), NOW, None).unwrap();
         let details_after_first = http.count(DETAIL_URL_PREFIX);
-        let second = query_batch(&http, &mut cache, &fixture_queries(), NOW + 1).unwrap();
+        let second = query_batch(&http, &mut cache, &fixture_queries(), NOW + 1, None).unwrap();
         assert_eq!(first, second);
         assert_eq!(details_after_first, 3);
         assert_eq!(http.count(DETAIL_URL_PREFIX), 3);
@@ -990,7 +1008,10 @@ mod tests {
     fn empty_query_list_sends_nothing() {
         let http = FakeHttp::new();
         let mut cache = Cache::new(TTL_SECS);
-        assert_eq!(query_batch(&http, &mut cache, &[], NOW), Ok(Vec::new()));
+        assert_eq!(
+            query_batch(&http, &mut cache, &[], NOW, None),
+            Ok(Vec::new())
+        );
         assert!(http.requests().is_empty());
     }
 
@@ -1008,7 +1029,8 @@ mod tests {
         let mut cache = Cache::new(TTL_SECS);
         let overflow_id = &ids[MAX_DETAIL_FETCHES_PER_RUN];
 
-        let results = query_batch(&http, &mut cache, &[query("serde", "1.0.0")], NOW).unwrap();
+        let results =
+            query_batch(&http, &mut cache, &[query("serde", "1.0.0")], NOW, None).unwrap();
 
         assert_eq!(http.count(DETAIL_URL_PREFIX), MAX_DETAIL_FETCHES_PER_RUN);
         assert_eq!(results[0].len(), ids.len());
@@ -1020,12 +1042,49 @@ mod tests {
         assert!(cache.advisory(&ids[0], NOW).is_some());
 
         // A later run completes the overflow id: only that one detail is fetched.
-        query_batch(&http, &mut cache, &[query("serde", "1.0.0")], NOW).unwrap();
+        query_batch(&http, &mut cache, &[query("serde", "1.0.0")], NOW, None).unwrap();
         assert_eq!(
             http.count(DETAIL_URL_PREFIX),
             MAX_DETAIL_FETCHES_PER_RUN + 1
         );
         assert!(cache.advisory(overflow_id, NOW).is_some());
+    }
+
+    #[test]
+    fn passed_deadline_sends_the_batch_but_no_detail_requests() {
+        let http = fixture_http();
+        let mut cache = Cache::new(TTL_SECS);
+        // Any instant that already passed ends the detail phase before its first request.
+        let passed = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+
+        let results =
+            query_batch(&http, &mut cache, &fixture_queries(), NOW, Some(passed)).unwrap();
+
+        assert_eq!(http.count(BATCH_URL), 1);
+        assert_eq!(http.count(DETAIL_URL_PREFIX), 0);
+        assert_eq!(
+            results,
+            vec![
+                vec![
+                    placeholder("RUSTSEC-2021-0003"),
+                    placeholder("GHSA-43w2-9j62-hq99")
+                ],
+                vec![],
+                vec![placeholder("GHSA-5rcv-m4m3-hfh7")]
+            ]
+        );
+        assert!(results.iter().flatten().all(is_placeholder));
+    }
+
+    #[test]
+    fn future_deadline_fetches_details_as_without_a_deadline() {
+        let http = fixture_http();
+        let mut cache = Cache::new(TTL_SECS);
+        let future = Instant::now() + Duration::from_secs(3600);
+        query_batch(&http, &mut cache, &fixture_queries(), NOW, Some(future)).unwrap();
+        assert_eq!(http.count(DETAIL_URL_PREFIX), 3);
     }
 
     #[test]
@@ -1042,7 +1101,8 @@ mod tests {
             );
         let mut cache = Cache::new(TTL_SECS);
 
-        let results = query_batch(&http, &mut cache, &[query("serde", "1.0.0")], NOW).unwrap();
+        let results =
+            query_batch(&http, &mut cache, &[query("serde", "1.0.0")], NOW, None).unwrap();
 
         assert_eq!(results[0].len(), 1);
         assert_eq!(results[0][0].id, "GHSA-ok-1234");
@@ -1065,7 +1125,8 @@ mod tests {
             .route("GET", &detail_url(ids[3]), 200, RUSTSEC_DETAIL);
         let mut cache = Cache::new(TTL_SECS);
 
-        let results = query_batch(&http, &mut cache, &[query("serde", "1.0.0")], NOW).unwrap();
+        let results =
+            query_batch(&http, &mut cache, &[query("serde", "1.0.0")], NOW, None).unwrap();
 
         let expected: Vec<Vulnerability> = ids.iter().map(|id| placeholder(id)).collect();
         assert_eq!(results, vec![expected]);
@@ -1081,31 +1142,31 @@ mod tests {
 
         let too_many = FakeHttp::new().route("POST", BATCH_URL, 429, "{}");
         assert_eq!(
-            query_batch(&too_many, &mut cache, &queries, NOW),
+            query_batch(&too_many, &mut cache, &queries, NOW, None),
             Err("OSV: HTTP 429".to_owned())
         );
 
         let server_error = FakeHttp::new().route("POST", BATCH_URL, 500, "{}");
         assert_eq!(
-            query_batch(&server_error, &mut cache, &queries, NOW),
+            query_batch(&server_error, &mut cache, &queries, NOW, None),
             Err("OSV: HTTP 500".to_owned())
         );
 
         let invalid_json = FakeHttp::new().route("POST", BATCH_URL, 200, "not json");
         assert_eq!(
-            query_batch(&invalid_json, &mut cache, &queries, NOW),
+            query_batch(&invalid_json, &mut cache, &queries, NOW, None),
             Err(INVALID_RESPONSE.to_owned())
         );
 
         let missing_result = FakeHttp::new().route("POST", BATCH_URL, 200, r#"{"results":[]}"#);
         assert_eq!(
-            query_batch(&missing_result, &mut cache, &queries, NOW),
+            query_batch(&missing_result, &mut cache, &queries, NOW, None),
             Err(INVALID_RESPONSE.to_owned())
         );
 
         let offline = FakeHttp::new().transport_error("POST", BATCH_URL, "network down");
         assert_eq!(
-            query_batch(&offline, &mut cache, &queries, NOW),
+            query_batch(&offline, &mut cache, &queries, NOW, None),
             Err("OSV: network down".to_owned())
         );
     }
@@ -1119,7 +1180,7 @@ mod tests {
         let http = EchoBatchHttp::default();
         let mut cache = Cache::new(TTL_SECS);
 
-        let results = query_batch(&http, &mut cache, &queries, NOW).unwrap();
+        let results = query_batch(&http, &mut cache, &queries, NOW, None).unwrap();
 
         assert_eq!(results.len(), queries.len());
         assert_eq!(*http.batch_sizes.borrow(), vec![MAX_BATCH_QUERIES, 1]);
