@@ -20,7 +20,8 @@ const OPERATORS: [&str; 8] = ["===", "==", ">=", "<=", "!=", "~=", ">", "<"];
 const PIN_OPERATORS: [&str; 5] = ["===", "==", "~=", ">=", ">"];
 
 /// Source names that a Poetry dependency table can use instead of a registry version.
-const POETRY_SOURCE_KEYS: [&str; 3] = ["path", "git", "url"];
+// `source` names a private Poetry source, so the package is not on the public index.
+const POETRY_SOURCE_KEYS: [&str; 4] = ["path", "git", "url", "source"];
 
 /// Parses the dependencies of a PyPI manifest.
 ///
@@ -856,5 +857,18 @@ dependencies = ["\u0072equests==2.28.0"]
         // Only a wrapped constraint list may end at `)`.
         let dependencies = parse("requests==2.28.0)\n");
         assert_eq!(find(&dependencies, "requests").version, "2.28.0)");
+    }
+
+    #[test]
+    fn poetry_dependency_with_a_named_source_is_skipped() {
+        let manifest = "\
+[tool.poetry.dependencies]
+python = \"^3.11\"
+internal = { version = \"^1.0\", source = \"private\" }
+requests = \"^2.28.0\"
+";
+        let dependencies = parse(manifest);
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].name, "requests");
     }
 }
