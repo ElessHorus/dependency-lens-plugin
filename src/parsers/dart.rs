@@ -1,7 +1,7 @@
 //! Parser for Dart and Flutter `pubspec.yaml` files.
 //!
 //! Reads the `dependencies` and `dev_dependencies` blocks only. Entries with a
-//! `sdk`, `path`, `git` or `url` key come from a source other than the registry,
+//! `sdk`, `path`, `git` or `url` key, or with a `hosted` key that is not pub.dev, come from a source other than the registry,
 //! so they are skipped. The parser is line based and reads each line once. It
 //! does not use a YAML library, so quoted keys are not read.
 
@@ -9,6 +9,9 @@ use crate::model::{Dependency, Span};
 
 /// Keys that make a map-form entry a non-registry source.
 const SOURCE_KEYS: [&str; 4] = ["sdk", "path", "git", "url"];
+
+/// URLs of the public pub.dev registry. A `hosted` entry with one of them is a registry entry.
+const PUBLIC_REGISTRY_URLS: [&str; 2] = ["https://pub.dev", "https://pub.dartlang.org"];
 
 /// One `key: value` line. Offsets are byte columns inside the line.
 struct Field<'a> {
@@ -133,7 +136,7 @@ impl<'a> PendingEntry<'a> {
         let Some(field) = field else {
             return;
         };
-        if SOURCE_KEYS.contains(&field.key) {
+        if SOURCE_KEYS.contains(&field.key) || names_custom_server(&field) {
             self.is_skipped = true;
         } else if field.key == "version"
             && let Some(value) = field.value.filter(|value| !value.text.is_empty())
@@ -142,6 +145,18 @@ impl<'a> PendingEntry<'a> {
             self.version_line = line;
         }
     }
+}
+
+/// Returns `true` for a `hosted` key that does not name pub.dev.
+///
+/// The map form (`hosted:` with nested `name` and `url`) is not read, so it counts
+/// as a custom server. The scalar form counts only when its URL is not pub.dev.
+fn names_custom_server(field: &Field<'_>) -> bool {
+    field.key == "hosted"
+        && !field
+            .value
+            .as_ref()
+            .is_some_and(|value| PUBLIC_REGISTRY_URLS.contains(&value.text.trim_end_matches('/')))
 }
 
 /// Reads `key: value` from `line`, whose key starts at byte `indent`.
@@ -280,7 +295,7 @@ mod tests {
                 ("http", "^1.0.0", false),
                 ("provider", "^6.1.0", false),
                 ("intl", "any", false),
-                ("hosted_pkg", "^2.3.4", false),
+                ("versioned_pkg", "^2.3.4", false),
                 ("old", ">=1.0.0 <2.0.0", false),
                 ("lints", "^3.0.0", true),
             ]
@@ -296,7 +311,7 @@ mod tests {
         };
         assert_eq!(text_of("http").as_deref(), Some("^1.0.0"));
         assert_eq!(text_of("provider").as_deref(), Some("^6.1.0"));
-        assert_eq!(text_of("hosted_pkg").as_deref(), Some("^2.3.4"));
+        assert_eq!(text_of("versioned_pkg").as_deref(), Some("^2.3.4"));
     }
 
     #[test]
@@ -346,5 +361,42 @@ mod tests {
     fn unterminated_block_keeps_entries_read_so_far() {
         let manifest = "dependencies:\n  http: ^1.0.0\n  provider: ^6.0.0\n";
         assert_eq!(parse(manifest).len(), 2);
+    }
+
+    #[test]
+    fn hosted_entries_come_from_a_custom_server_and_are_skipped() {
+        let manifest = "\
+dependencies:
+  scalar_form:
+    hosted: https://pub.example.com
+    version: ^1.0.0
+  map_form:
+    hosted:
+      name: map_form
+      url: https://pub.example.com
+    version: ^1.0.0
+  http: ^1.0.0
+";
+        assert_eq!(summary(&parse(manifest)), [("http", "^1.0.0", false)]);
+    }
+
+    #[test]
+    fn hosted_entry_with_the_public_pub_dev_url_is_kept() {
+        let manifest = "\
+dependencies:
+  plain:
+    hosted: https://pub.dev
+    version: ^1.0.0
+  slash:
+    hosted: \"https://pub.dev/\"
+    version: ^2.0.0
+  lookalike:
+    hosted: https://pub.dev.evil.example
+    version: ^3.0.0
+";
+        assert_eq!(
+            summary(&parse(manifest)),
+            [("plain", "^1.0.0", false), ("slash", "^2.0.0", false)]
+        );
     }
 }

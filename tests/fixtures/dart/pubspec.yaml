@@ -21,6 +21,8 @@ dependencies:
       name: hosted_pkg
       url: https://pub.example.com
     version: ^2.3.4
+  versioned_pkg:
+    version: ^2.3.4
 
   # A comment and a blank line inside the block.
 
