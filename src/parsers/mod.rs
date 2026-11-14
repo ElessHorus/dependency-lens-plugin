@@ -9,5 +9,6 @@ pub mod maven;
 pub mod npm;
 pub mod php;
 pub mod python;
+pub mod ruby;
 pub mod spans;
 mod xml_text;

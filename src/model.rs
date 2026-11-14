@@ -128,7 +128,7 @@ impl Ecosystem {
             Ecosystem::Packagist => parsers::php::parse(text),
             Ecosystem::Pub => parsers::dart::parse(text),
             Ecosystem::NuGet => parsers::csharp::parse(text),
-            Ecosystem::RubyGems => Vec::new(),
+            Ecosystem::RubyGems => parsers::ruby::parse(text),
             Ecosystem::Maven => parsers::maven::parse(text),
         }
     }
@@ -321,10 +321,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_dispatches_cargo_and_returns_empty_for_unported_ecosystems() {
+    fn parse_dispatches_cargo_to_the_cargo_parser() {
         let manifest = "[dependencies]\nserde = \"1.0\"\n";
         assert_eq!(Ecosystem::Cargo.parse(manifest).len(), 1);
-        assert!(Ecosystem::RubyGems.parse(manifest).is_empty());
+    }
+
+    #[test]
+    fn parse_dispatches_rubygems_to_the_ruby_parser() {
+        let manifest = include_str!("../tests/fixtures/ruby/Gemfile");
+        let dependencies = Ecosystem::RubyGems.parse(manifest);
+        assert_eq!(dependencies.len(), 13);
+        assert_eq!(dependencies, parsers::ruby::parse(manifest));
     }
 
     #[test]
