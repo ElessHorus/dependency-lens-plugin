@@ -31,11 +31,13 @@ pub fn code_actions(
     if !eco.offers_updates() || !settings.is_enabled(eco) {
         return Vec::new();
     }
+    let ignored = settings.ignored_packages(eco);
     // One parse; the line test is a range check, so lines outside the selection build no action.
     let selected_lines = selection.start.line..=selection.end.line;
     eco.parse(doc_text)
         .iter()
         .filter(|dep| selected_lines.contains(&dep.version_span.line))
+        .filter(|dep| !ignored.contains(&eco.normalize_package(&dep.name)))
         .filter_map(|dep| action_for(cache, eco, dep, doc_path, doc_text, now))
         .collect()
 }
@@ -229,6 +231,26 @@ mod tests {
             );
             assert!(actions.is_empty(), "{path} must offer nothing");
         }
+    }
+
+    #[test]
+    fn ignored_packages_offer_no_quick_fix() {
+        let cache = pypi_cache(TTL_SECS);
+        // The ignore list is compared in the ecosystem's normal form, like the analysis does.
+        let settings = Settings {
+            ignore: vec!["Requests".to_owned()],
+            ..Settings::default()
+        };
+        let titles: Vec<String> = actions_for(
+            &cache,
+            &settings,
+            Range::new(Position::new(0, 0), Position::new(2, 0)),
+        )
+        .into_iter()
+        .map(|action| action.title)
+        .collect();
+        assert_eq!(titles.len(), 1);
+        assert!(titles[0].starts_with("Update django"), "{titles:?}");
     }
 
     #[test]

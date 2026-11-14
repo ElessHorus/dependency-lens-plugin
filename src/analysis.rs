@@ -7,7 +7,6 @@ use crate::osv::{OsvQuery, declared_version_for_osv, is_placeholder, query_batch
 use crate::settings::Settings;
 use crate::update::is_outdated;
 use openidea_plugin::HttpRequest;
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -110,11 +109,7 @@ pub fn analyze(
         };
     }
     // The ignore list is normalised once per call, so each dependency name is the only per-item work.
-    let ignored: HashSet<Cow<'_, str>> = settings
-        .ignore
-        .iter()
-        .map(|entry| eco.normalize_package(entry))
-        .collect();
+    let ignored = settings.ignored_packages(eco);
     let kept: Vec<Dependency> = deps
         .into_iter()
         .filter(|dependency| !ignored.contains(&eco.normalize_package(&dependency.name)))

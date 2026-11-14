@@ -41,10 +41,13 @@ const FAR_FUTURE: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
 /// Title of the background task shown while a manifest is analyzed.
 const TASK_TITLE: &str = "Dependency Lens";
 
-/// Dependency Lens plugin state: the analysis cache, the settings it runs with, and the chunk limits.
+/// Dependency Lens plugin state: the analysis cache, the settings it runs with, the manifests it
+/// shows, and the chunk limits.
 pub struct DependencyLens {
     cache: Cache,
     settings: Settings,
+    /// Manifests with published results. A settings change republishes them.
+    published_paths: HashSet<String>,
     time_box: Duration,
     chunk: usize,
 }
@@ -55,6 +58,7 @@ impl Default for DependencyLens {
         Self {
             cache: Cache::new(settings.cache_ttl_secs),
             settings,
+            published_paths: HashSet::new(),
             time_box: TIME_BOX,
             chunk: REGISTRY_CHUNK,
         }
@@ -111,6 +115,7 @@ impl DependencyLens {
             }
         };
         let deps = eco.parse(&text);
+        self.published_paths.insert(path.to_owned());
         let task = host::begin_task(TASK_TITLE, true);
         self.publish_chunks(eco, path, &text, &deps, &task, deadline);
     }
@@ -323,6 +328,7 @@ impl Plugin for DependencyLens {
             self.reload_settings();
         }
         for path in removed_paths.into_iter().filter(|path| is_manifest(path)) {
+            self.published_paths.remove(path);
             publish_results(path, &[], &[]);
         }
         // One deadline for the batch: manifests after it still get their first chunk.
@@ -331,6 +337,19 @@ impl Plugin for DependencyLens {
         let mut refreshed: HashSet<&str> = HashSet::new();
         for path in changed_paths.into_iter().filter(|path| is_manifest(path)) {
             if refreshed.insert(path) {
+                self.refresh(path, ctx, deadline);
+            }
+        }
+        // A new setting changes what the shown manifests display. The cache answers most of it
+        // without a request, and a disabled ecosystem clears its results.
+        if settings_changed {
+            let shown_paths: Vec<String> = self
+                .published_paths
+                .iter()
+                .filter(|path| !refreshed.contains(path.as_str()))
+                .cloned()
+                .collect();
+            for path in &shown_paths {
                 self.refresh(path, ctx, deadline);
             }
         }

@@ -378,6 +378,65 @@ fn settings_changed_event_disables_an_ecosystem_for_later_opens() {
     assert_eq!(fetches.get(), 0);
 }
 
+/// Sends one `settings-changed` event for `key`.
+fn send_settings_changed(host: &MockHost, plugin: &mut DependencyLens, key: &str) {
+    plugin.handle_events(
+        &[Event::Other {
+            kind: "settings-changed".to_owned(),
+            data: format!(r#"["{key}"]"#),
+        }],
+        &host.invocation(),
+    );
+}
+
+#[test]
+fn disabling_an_ecosystem_clears_the_manifests_already_shown() {
+    let host = host_counting_fetches(Rc::new(Cell::new(0)));
+    let mut plugin = DependencyLens::default();
+    plugin.activate(&host.context(PLUGIN_ID)).unwrap();
+    open_manifest(&host, &mut plugin);
+    assert_eq!(decorations_of(&host, MANIFEST_PATH).len(), 1);
+
+    host.set_setting("ecosystems.cargo.enabled", "false");
+    send_settings_changed(&host, &mut plugin, "ecosystems.cargo.enabled");
+    assert!(decorations_of(&host, MANIFEST_PATH).is_empty());
+    assert!(diagnostics_of(&host, MANIFEST_PATH).is_empty());
+}
+
+#[test]
+fn raising_the_minimum_severity_republishes_from_the_cache_without_a_request() {
+    let host = host_counting_fetches(Rc::new(Cell::new(0)));
+    let mut plugin = DependencyLens::default();
+    plugin.activate(&host.context(PLUGIN_ID)).unwrap();
+    open_manifest(&host, &mut plugin);
+    assert_eq!(diagnostics_of(&host, MANIFEST_PATH).len(), 1);
+    assert_eq!(osv_batch_requests(&host), 1);
+
+    host.set_setting("minimumSeverity", "\"critical\"");
+    send_settings_changed(&host, &mut plugin, "minimumSeverity");
+    assert!(diagnostics_of(&host, MANIFEST_PATH).is_empty());
+    assert_eq!(osv_batch_requests(&host), 1);
+}
+
+#[test]
+fn a_removed_manifest_is_not_republished_after_a_settings_change() {
+    let host = host_counting_fetches(Rc::new(Cell::new(0)));
+    let mut plugin = DependencyLens::default();
+    plugin.activate(&host.context(PLUGIN_ID)).unwrap();
+    open_manifest(&host, &mut plugin);
+    plugin.handle_events(
+        &[Event::FilesChanged(FilesChanged {
+            created: Vec::new(),
+            modified: Vec::new(),
+            removed: vec![MANIFEST_PATH.to_owned()],
+        })],
+        &host.invocation(),
+    );
+    send_settings_changed(&host, &mut plugin, "minimumSeverity");
+    assert!(decorations_of(&host, MANIFEST_PATH).is_empty());
+    assert_eq!(osv_batch_requests(&host), 1);
+}
+
 #[test]
 fn settings_changed_event_with_zero_ttl_replaces_the_cache() {
     let host = host_counting_fetches(Rc::new(Cell::new(0)));
