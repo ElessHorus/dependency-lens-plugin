@@ -2,7 +2,7 @@
 //!
 //! Reads `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, the
 //! same tables under `[target.<cfg>]`, and `[workspace.dependencies]`. Entries
-//! without a registry version (`path`, `git`, `workspace = true`) are skipped.
+//! without a crates.io version (`path`, `git`, `registry`, `workspace = true`) are skipped.
 
 use taplo::dom::Node;
 use taplo::dom::node::{Bool, DomNode, Key, Str};
@@ -18,6 +18,9 @@ const DEPENDENCY_SECTIONS: [(&str, bool); 3] = [
     ("dev-dependencies", true),
     ("build-dependencies", false),
 ];
+
+/// Keys that make an entry come from a source other than crates.io.
+const NON_REGISTRY_KEYS: [&str; 4] = ["path", "git", "registry", "registry-index"];
 
 /// Parses the dependencies of a `Cargo.toml` manifest.
 ///
@@ -90,8 +93,11 @@ fn parse_dependency(
         Node::Str(version) => build_dependency(key, None, version, false, index, is_dev),
         // Inline table `name = { version = "1.0" }` or sub-table `[dependencies.name]`.
         Node::Table(table) => {
-            // A path or git source has no registry version to check.
-            if table.get("path").is_some() || table.get("git").is_some() {
+            // A path, git or alternative registry source has no crates.io version to check.
+            if NON_REGISTRY_KEYS
+                .iter()
+                .any(|source_key| table.get(*source_key).is_some())
+            {
                 return None;
             }
             let version_node = table.get("version")?;
@@ -275,5 +281,22 @@ mod tests {
         assert!(parse("[dependencies\nserde = \"1.0\"\n").is_empty());
         assert!(parse("\u{0}= \"").is_empty());
         assert!(parse("").is_empty());
+    }
+
+    #[test]
+    fn skips_dependencies_from_an_alternative_registry() {
+        let manifest = "\
+[dependencies]
+by_name = { version = \"1.0\", registry = \"corp\" }
+by_index = { version = \"1.0\", registry-index = \"sparse+https://cargo.example.com/\" }
+serde = \"1.0\"
+
+[dependencies.sub_table]
+version = \"2.0\"
+registry = \"corp\"
+";
+        let dependencies = parse(manifest);
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].name, "serde");
     }
 }

@@ -1,7 +1,8 @@
 //! Parser for RubyGems manifests (`Gemfile`).
 //!
-//! The reader does not evaluate Ruby. It scans each line once into tokens, so a
-//! declaration that spans lines is read only up to its first line.
+//! The reader does not evaluate Ruby. It scans each line once into tokens. A `gem`
+//! declaration that continues on the next lines is read across them, but its name
+//! and constraints must sit on the first line.
 
 use crate::model::{Dependency, Span};
 
@@ -21,6 +22,18 @@ const SOURCE_OPTION_KEYS: [&str; 7] = [
     "path",
     "source",
 ];
+
+/// The one registry URL that counts as the public RubyGems registry.
+const PUBLIC_REGISTRY_URL: &str = "https://rubygems.org";
+
+/// Keywords that open a construct which an `end` closes. `def` is handled apart,
+/// because its endless form has no `end`.
+const END_KEYWORDS: [&str; 9] = [
+    "if", "unless", "case", "begin", "while", "until", "for", "class", "module",
+];
+
+/// Words that may come before `def`, as in `private def helper`.
+const VISIBILITY_WORDS: [&str; 3] = ["private", "protected", "public"];
 
 /// Option keys whose value lists the groups of a gem.
 const GROUP_OPTION_KEYS: [&str; 2] = ["group", "groups"];
@@ -70,8 +83,26 @@ struct Requirement<'a> {
 struct OpenBlock {
     /// The block is a development or test group.
     is_development: bool,
-    /// The block is a `path`, `git` or `source` block. Its gems do not come from the registry.
+    /// The block is a `path`, `git` or `source` block with a source other than the public registry.
+    /// Its gems do not come from the registry.
     has_custom_source: bool,
+}
+
+/// A `gem` declaration that continues on the next lines.
+///
+/// The name and the constraints come from the first line, so the spans stay exact.
+/// The options can sit on any line.
+struct PendingGem<'a> {
+    line_number: u32,
+    /// The tokens of the first line, then the tokens of the continuation lines.
+    tokens: Vec<Token<'a>>,
+    first_line_length: usize,
+    in_dev_block: bool,
+    /// The gem sits inside a non-registry block, so it is read but not returned.
+    /// A hidden gem keeps no tokens, because only its end matters.
+    is_hidden: bool,
+    /// Brackets opened and not yet closed. A gem goes on while any bracket is open.
+    open_brackets: i32,
 }
 
 /// Parses the gems of a `Gemfile`.
@@ -79,11 +110,14 @@ struct OpenBlock {
 /// Returns the gems with a pin constraint, in document order. A gem inside a
 /// development or test group, or with a development group option, has `dev`.
 /// A gem inside a `path`, `git` or `source` block is skipped, like a gem with a source option.
+/// A `source` block or option that names the public RubyGems registry does not skip the gem.
+/// A declaration that ends a line with `,` or `\` continues on the next line.
 pub fn parse(text: &str) -> Vec<Dependency> {
     let mut dependencies = Vec::new();
     // One token buffer serves every line, so no line allocates on its own.
     let mut tokens = Vec::new();
     let mut open_blocks: Vec<OpenBlock> = Vec::new();
+    let mut pending_gem: Option<PendingGem<'_>> = None;
     for (index, line) in text.lines().enumerate() {
         let Ok(line_number) = u32::try_from(index) else {
             break;
@@ -92,24 +126,95 @@ pub fn parse(text: &str) -> Vec<Dependency> {
         if tokens.is_empty() {
             continue;
         }
-        if is_gem_line(&tokens) {
+        if let Some(gem) = pending_gem.as_mut() {
+            if !gem.is_hidden {
+                gem.tokens.extend_from_slice(&tokens);
+            }
+            gem.open_brackets += bracket_balance(&tokens);
+            if !continues_on_next_line(&tokens, gem.open_brackets) {
+                finish_gem(pending_gem.take(), &mut dependencies);
+            }
+        } else if is_gem_line(&tokens) {
             // A gem line never opens a block, so the stack is read but not changed.
             // A source block applies to every gem inside it, however deeply nested.
-            if !open_blocks.iter().any(|block| block.has_custom_source) {
-                let in_dev_block = open_blocks.iter().any(|block| block.is_development);
-                dependencies.extend(parse_gem(&tokens, line_number, in_dev_block));
+            let is_hidden = open_blocks.iter().any(|block| block.has_custom_source);
+            let in_dev_block = open_blocks.iter().any(|block| block.is_development);
+            let open_brackets = bracket_balance(&tokens);
+            if continues_on_next_line(&tokens, open_brackets) {
+                pending_gem = Some(PendingGem {
+                    line_number,
+                    first_line_length: tokens.len(),
+                    tokens: if is_hidden {
+                        Vec::new()
+                    } else {
+                        tokens.clone()
+                    },
+                    in_dev_block,
+                    is_hidden,
+                    open_brackets,
+                });
+            } else if !is_hidden {
+                dependencies.extend(parse_gem(&tokens, tokens.len(), line_number, in_dev_block));
             }
-        } else if is_lone_end(&tokens) {
-            // An `end` with no open block is ignored.
-            open_blocks.pop();
-        } else if opens_block(&tokens) {
-            open_blocks.push(OpenBlock {
-                is_development: opens_development_group(&tokens),
-                has_custom_source: opens_custom_source(&tokens),
-            });
+        } else {
+            // A close with no open block is ignored. A line such as `end.each do |x|`
+            // closes one block and opens the next, so the close comes first.
+            if starts_with_closer(&tokens) {
+                open_blocks.pop();
+            }
+            if opens_block(&tokens) {
+                open_blocks.push(OpenBlock {
+                    is_development: opens_development_group(&tokens),
+                    has_custom_source: opens_custom_source(&tokens),
+                });
+            } else if opens_keyword_block(&tokens) {
+                // Its `end` must pop this entry and not the block that holds it.
+                open_blocks.push(OpenBlock {
+                    is_development: false,
+                    has_custom_source: false,
+                });
+            }
         }
     }
+    finish_gem(pending_gem, &mut dependencies);
     dependencies
+}
+
+/// Returns the gem of a finished declaration, unless it is hidden.
+fn finish_gem(gem: Option<PendingGem<'_>>, dependencies: &mut Vec<Dependency>) {
+    if let Some(gem) = gem
+        && !gem.is_hidden
+    {
+        dependencies.extend(parse_gem(
+            &gem.tokens,
+            gem.first_line_length,
+            gem.line_number,
+            gem.in_dev_block,
+        ));
+    }
+}
+
+/// Returns `true` when the declaration goes on after this line.
+///
+/// It goes on after a `,` or a `\`, and while a bracket is still open, as in a
+/// multi-line array or hash option.
+fn continues_on_next_line(tokens: &[Token<'_>], open_brackets: i32) -> bool {
+    open_brackets > 0
+        || tokens
+            .last()
+            .is_some_and(|last| is_punct(last, b',') || is_punct(last, b'\\'))
+}
+
+/// Returns the number of brackets that the line opens minus the number that it closes.
+fn bracket_balance(tokens: &[Token<'_>]) -> i32 {
+    tokens
+        .iter()
+        .map(|token| match token.kind {
+            Kind::Punct(b'(' | b'[' | b'{') => 1,
+            Kind::Punct(b')' | b']' | b'}') => -1,
+            _ => 0,
+        })
+        .sum()
 }
 
 /// Splits one line into tokens, stopping at the first `#` outside a string.
@@ -201,18 +306,21 @@ fn is_gem_line(tokens: &[Token<'_>]) -> bool {
     )
 }
 
-/// Returns `true` when the line is only `end`.
-fn is_lone_end(tokens: &[Token<'_>]) -> bool {
-    matches!(
-        tokens,
-        [Token {
+/// Returns `true` when the line starts with `end` or `}`, such as `}.freeze` or `end.each do`.
+///
+/// A key named `end`, as in `end: 5`, is not a closer.
+fn starts_with_closer(tokens: &[Token<'_>]) -> bool {
+    match tokens.first() {
+        Some(Token {
             kind: Kind::Word("end"),
             ..
-        }]
-    )
+        }) => !punct_at(tokens, 1, b':'),
+        Some(token) => is_punct(token, b'}'),
+        None => false,
+    }
 }
 
-/// Returns `true` when the line ends with `do` or `do |...|`.
+/// Returns `true` when the line ends with `do`, `do |...|`, `{` or `{ |...|`.
 fn opens_block(tokens: &[Token<'_>]) -> bool {
     // The `do` of `do |params|` sits before the opening pipe of the parameters.
     let keyword_end = match tokens.last() {
@@ -228,15 +336,91 @@ fn opens_block(tokens: &[Token<'_>]) -> bool {
     keyword_end
         .checked_sub(1)
         .and_then(|keyword_index| tokens.get(keyword_index))
-        .is_some_and(|token| token.kind == Kind::Word("do"))
+        .is_some_and(|token| token.kind == Kind::Word("do") || is_punct(token, b'{'))
 }
 
-/// Returns `true` when the block starts with a source method such as `path` or `git`.
+/// Returns `true` when the line starts a Ruby construct that an `end` closes.
+///
+/// The keyword may start the line, follow a visibility word (`private def x`) or
+/// follow an assignment (`value = if x`). A line that holds its own `end`, and an
+/// endless `def`, open nothing. A modifier such as `gem 'a' if x` never starts
+/// with the keyword, so it is not matched.
+fn opens_keyword_block(tokens: &[Token<'_>]) -> bool {
+    if tokens
+        .last()
+        .is_some_and(|last| last.kind == Kind::Word("end"))
+    {
+        return false;
+    }
+    let word_at = |index: usize| match tokens.get(index) {
+        Some(Token {
+            kind: Kind::Word(word),
+            ..
+        }) => Some(*word),
+        _ => None,
+    };
+    let keyword_index =
+        usize::from(word_at(0).is_some_and(|word| VISIBILITY_WORDS.contains(&word)));
+    // A keyword followed by `:` is a hash key, as in `begin: 1`.
+    if punct_at(tokens, keyword_index + 1, b':') {
+        return false;
+    }
+    match word_at(keyword_index) {
+        Some("def") => !is_endless_def(&tokens[keyword_index..]),
+        Some(word) if END_KEYWORDS.contains(&word) => true,
+        _ => tokens.windows(2).any(|pair| {
+            is_punct(&pair[0], b'=')
+                && matches!(pair[1].kind, Kind::Word(word) if END_KEYWORDS.contains(&word))
+        }),
+    }
+}
+
+/// Returns `true` for `def name(args) = body`, which has no `end`.
+///
+/// An `=` inside the parentheses is a default value, so only an `=` outside counts.
+fn is_endless_def(tokens: &[Token<'_>]) -> bool {
+    let mut depth = 0_i32;
+    tokens.iter().skip(1).any(|token| match token.kind {
+        Kind::Punct(b'(') => {
+            depth += 1;
+            false
+        }
+        Kind::Punct(b')') => {
+            depth -= 1;
+            false
+        }
+        Kind::Punct(b'=') => depth == 0,
+        _ => false,
+    })
+}
+
+/// Returns `true` when the block starts with a source method that is not the public registry.
 fn opens_custom_source(tokens: &[Token<'_>]) -> bool {
-    matches!(
-        tokens.first(),
-        Some(Token { kind: Kind::Word(method), .. }) if SOURCE_OPTION_KEYS.contains(method)
-    )
+    let Some(Token {
+        kind: Kind::Word(method),
+        ..
+    }) = tokens.first()
+    else {
+        return false;
+    };
+    // The source is the first argument, with or without parentheses.
+    let argument_index = if punct_at(tokens, 1, b'(') { 2 } else { 1 };
+    names_custom_source(method, tokens.get(argument_index))
+}
+
+/// Returns `true` when `key` names a source other than the registry.
+///
+/// `value` is the token after the key. Only a `source` key whose value is the
+/// public RubyGems URL names the registry. Any other value, such as a variable
+/// or a symbol, is unknown, so it counts as a custom source.
+fn names_custom_source(key: &str, value: Option<&Token<'_>>) -> bool {
+    SOURCE_OPTION_KEYS.contains(&key)
+        && !(key == "source"
+            && matches!(
+                value,
+                Some(Token { kind: Kind::Str(url), .. })
+                    if url.trim_end_matches('/').eq_ignore_ascii_case(PUBLIC_REGISTRY_URL)
+            ))
 }
 
 /// Returns `true` for a `group` block whose list names a development or test group.
@@ -254,13 +438,22 @@ fn opens_development_group(tokens: &[Token<'_>]) -> bool {
 
 /// Reads one `gem` declaration. Returns `None` when the gem is skipped.
 ///
-/// `in_dev_block` tells whether an open block is a development group.
-fn parse_gem(tokens: &[Token<'_>], line_number: u32, in_dev_block: bool) -> Option<Dependency> {
+/// `first_line_length` is the number of tokens on the first line. The name and the
+/// constraints come from them alone, because a span needs the line of its token.
+/// The options come from all tokens. `in_dev_block` tells whether an open block is a
+/// development group.
+fn parse_gem(
+    tokens: &[Token<'_>],
+    first_line_length: usize,
+    line_number: u32,
+    in_dev_block: bool,
+) -> Option<Dependency> {
+    let first_line = tokens.get(..first_line_length)?;
     let mut cursor = 1;
-    if punct_at(tokens, cursor, b'(') {
+    if punct_at(first_line, cursor, b'(') {
         cursor += 1;
     }
-    let name_token = tokens.get(cursor)?;
+    let name_token = first_line.get(cursor)?;
     let Kind::Str(name) = name_token.kind else {
         return None;
     };
@@ -278,8 +471,8 @@ fn parse_gem(tokens: &[Token<'_>], line_number: u32, in_dev_block: bool) -> Opti
     let mut requirement_count = 0;
     let mut pin = None;
     let mut index = cursor + 1;
-    while punct_at(tokens, index, b',') {
-        let Some(requirement_token) = tokens.get(index + 1) else {
+    while punct_at(first_line, index, b',') {
+        let Some(requirement_token) = first_line.get(index + 1) else {
             break;
         };
         let Kind::Str(content) = requirement_token.kind else {
@@ -303,7 +496,7 @@ fn parse_gem(tokens: &[Token<'_>], line_number: u32, in_dev_block: bool) -> Opti
         let Some(key) = option_key(tokens, option_index) else {
             continue;
         };
-        if SOURCE_OPTION_KEYS.contains(&key) {
+        if names_custom_source(key, option_value(tokens, option_index)) {
             return None;
         }
         if GROUP_OPTION_KEYS.contains(&key) {
@@ -365,6 +558,16 @@ fn option_key<'a>(tokens: &[Token<'a>], index: usize) -> Option<&'a str> {
         }
         _ => None,
     }
+}
+
+/// Returns the token that follows the key at `index` and its separator.
+///
+/// The separator is `:` for `key: value` and `=>` for `:key => value`.
+fn option_value<'a, 'b>(tokens: &'b [Token<'a>], index: usize) -> Option<&'b Token<'a>> {
+    tokens
+        .get(index + 1..)?
+        .iter()
+        .find(|token| !matches!(token.kind, Kind::Punct(b':' | b'=' | b'>')))
 }
 
 /// Returns `true` when the values of a group option, from `value_start`, name a development group.
@@ -674,6 +877,83 @@ gem 'outside', '3.0'
     }
 
     #[test]
+    fn gems_inside_a_public_rubygems_source_block_are_kept() {
+        for opener in [
+            "source 'https://rubygems.org' do",
+            "source \"https://rubygems.org\" do",
+            "source 'https://rubygems.org/' do",
+            "source('https://rubygems.org') do",
+            "source 'https://rubygems.org' do |s|",
+        ] {
+            let manifest = format!("{opener}\n  gem 'rails', '1.0.0'\nend\ngem 'after', '2.0.0'\n");
+            assert_eq!(
+                summary(&parse(&manifest)),
+                [
+                    ("rails", "1.0.0", false, false),
+                    ("after", "2.0.0", false, false)
+                ],
+                "{opener} must keep its gems"
+            );
+        }
+    }
+
+    #[test]
+    fn source_block_with_an_unknown_source_stays_skipped() {
+        for opener in [
+            "source ENV['GEM_SOURCE'] do",
+            "source :rubygems do",
+            "source do",
+            "source 'https://rubygems.org.evil.example' do",
+            "source 'https://gems.example.com/https://rubygems.org' do",
+        ] {
+            let manifest = format!("{opener}\n  gem 'internal', '1.0.0'\nend\n");
+            assert!(parse(&manifest).is_empty(), "{opener} must hide its gems");
+        }
+    }
+
+    #[test]
+    fn public_source_block_does_not_lift_an_inner_non_registry_block() {
+        let manifest = "\
+source 'https://rubygems.org' do
+  path '../local' do
+    gem 'hidden', '1.0'
+  end
+  group :test do
+    gem 'visible', '2.0'
+  end
+end
+";
+        assert_eq!(summary(&parse(manifest)), [("visible", "2.0", true, false)]);
+    }
+
+    #[test]
+    fn non_registry_block_hides_a_public_source_block_nested_in_it() {
+        let manifest = "\
+path '../local' do
+  source 'https://rubygems.org' do
+    gem 'hidden', '1.0'
+  end
+end
+";
+        assert!(parse(manifest).is_empty());
+    }
+
+    #[test]
+    fn gem_option_with_the_public_rubygems_source_is_kept() {
+        let manifest = "\
+gem 'a', '1.0', source: 'https://rubygems.org'
+gem 'b', '1.0', :source => 'https://rubygems.org/'
+gem 'c', '1.0', source: 'https://gems.example.com'
+gem 'd', '1.0', source: ENV['GEM_SOURCE']
+gem 'e', '1.0', path: 'https://rubygems.org'
+";
+        assert_eq!(
+            summary(&parse(manifest)),
+            [("a", "1.0", false, false), ("b", "1.0", false, false)]
+        );
+    }
+
+    #[test]
     fn non_registry_block_inside_a_group_skips_only_its_gems() {
         let manifest = "\
 group :test do
@@ -684,5 +964,259 @@ group :test do
 end
 ";
         assert_eq!(summary(&parse(manifest)), [("visible", "2.0", true, false)]);
+    }
+
+    #[test]
+    fn gem_options_on_a_continuation_line_are_honored() {
+        let manifest = "\
+gem 'git_gem', '1.0',
+  git: 'https://github.com/acme/internal'
+gem 'source_gem', '1.0', # comment
+  source: 'https://gems.example.com'
+gem 'backslash_gem', '1.0', \\
+  path: '../x'
+gem('paren_gem', '1.0',
+    path: '../x')
+gem 'rocket_gem', '1.0',
+
+  :git => 'https://github.com/acme/internal'
+gem 'kept', '1.0',
+  require: false
+gem 'kept_dev', '1.0',
+  group: :test
+gem 'kept_public', '1.0',
+  source: 'https://rubygems.org'
+gem 'after', '2.0'
+";
+        let dependencies = parse(manifest);
+        assert_eq!(
+            summary(&dependencies),
+            [
+                ("kept", "1.0", false, false),
+                ("kept_dev", "1.0", true, false),
+                ("kept_public", "1.0", false, false),
+                ("after", "2.0", false, false),
+            ]
+        );
+        // The span of a continued declaration still points at the first line.
+        assert_eq!(
+            text_of_span(manifest, find(&dependencies, "kept").version_span).as_deref(),
+            Some("1.0")
+        );
+    }
+
+    #[test]
+    fn continuation_of_a_hidden_gem_stays_hidden_and_ends_at_the_last_line() {
+        let manifest = "\
+path '../local' do
+  gem 'inner', '1.0',
+    require: false
+end
+gem 'outside', '2.0',
+  require: false
+";
+        assert_eq!(
+            summary(&parse(manifest)),
+            [("outside", "2.0", false, false)]
+        );
+        // A trailing comma at the end of the text keeps the gem read so far.
+        assert_eq!(
+            summary(&parse("gem 'last', '1.0',\n")),
+            [("last", "1.0", false, false)]
+        );
+    }
+
+    #[test]
+    fn end_of_a_conditional_does_not_close_the_source_block() {
+        let manifest = "\
+source 'https://gems.example.com' do
+  if ENV['X']
+    gem 'conditional', '1.0'
+  end
+  unless ENV['Y']
+  end
+  case ENV['Z']
+  when 'a'
+  end
+  begin
+  end
+  gem 'secret', '1.0'
+end
+gem 'outside', '2.0'
+";
+        assert_eq!(
+            summary(&parse(manifest)),
+            [("outside", "2.0", false, false)]
+        );
+    }
+
+    #[test]
+    fn end_of_a_conditional_does_not_close_the_development_group() {
+        let manifest = "\
+group :test do
+  if ENV['X']
+    gem 'conditional', '1.0'
+  end
+  gem 'rspec', '1.0'
+end
+gem 'outside', '2.0'
+";
+        assert_eq!(
+            summary(&parse(manifest)),
+            [
+                ("conditional", "1.0", true, false),
+                ("rspec", "1.0", true, false),
+                ("outside", "2.0", false, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn modifiers_and_one_line_conditionals_do_not_open_a_block() {
+        let manifest = "\
+path '../local' do
+  gem 'a', '1.0' if ENV['X']
+  puts 'x' if true
+  if ENV['Y'] then puts 'y' end
+end
+gem 'outside', '2.0'
+";
+        assert_eq!(
+            summary(&parse(manifest)),
+            [("outside", "2.0", false, false)]
+        );
+    }
+
+    #[test]
+    fn brace_blocks_scope_their_gems_like_do_blocks() {
+        let manifest = "\
+source('https://gems.example.com') {
+  gem 'secret', '1.0'
+}
+source 'https://gems.example.com' { |source|
+  gem 'secret_with_parameter', '1.0'
+}
+path('../local') {
+  group(:test) {
+    gem 'nested_secret', '1.0'
+  }
+}
+group(:test) {
+  gem 'rspec', '1.0'
+}
+source('https://rubygems.org') {
+  gem 'rails', '1.0'
+}
+OPTIONS = {
+  a: 1
+}
+gem 'outside', '2.0'
+";
+        assert_eq!(
+            summary(&parse(manifest)),
+            [
+                ("rspec", "1.0", true, false),
+                ("rails", "1.0", false, false),
+                ("outside", "2.0", false, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn assigned_conditionals_modules_and_defs_keep_the_blocks_balanced() {
+        let manifest = "\
+source 'https://gems.example.com' do
+  value = if ENV['A']
+    1
+  else
+    2
+  end
+  other = case ENV['B']
+  when 'x' then 1
+  end
+  module Helper
+  end
+  private def helper
+  end
+  def endless(x) = x
+  gem 'secret', '1.0'
+end
+gem 'outside', '2.0'
+";
+        assert_eq!(
+            summary(&parse(manifest)),
+            [("outside", "2.0", false, false)]
+        );
+    }
+
+    #[test]
+    fn closing_lines_that_start_with_a_brace_pop_their_block() {
+        for closer in ["}", "},", "}.freeze", "})", "} # end of the hash"] {
+            let manifest = format!(
+                "\
+source 'https://gems.example.com' do
+  OPTIONS = {{
+    a: 1
+  {closer}
+  gem 'secret', '1.0'
+end
+gem 'outside', '2.0'
+"
+            );
+            assert_eq!(
+                summary(&parse(&manifest)),
+                [("outside", "2.0", false, false)],
+                "{closer} must close the hash"
+            );
+        }
+    }
+
+    #[test]
+    fn brackets_left_open_on_a_gem_line_continue_the_declaration() {
+        let manifest = "\
+group :test do
+  gem 'listed', '1.0', require: [
+    :a,
+    :b
+  ]
+  gem 'hashed', '1.0', options: {
+    x: 1
+  }
+end
+gem 'outside', '2.0', groups: [
+  :development,
+  :test
+]
+gem 'private', '3.0', git: 'x',
+  platforms: [
+    :ruby
+  ]
+";
+        assert_eq!(
+            summary(&parse(manifest)),
+            [
+                ("listed", "1.0", true, false),
+                ("hashed", "1.0", true, false),
+                ("outside", "2.0", true, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_hash_key_named_end_does_not_close_a_block() {
+        let manifest = "\
+source 'https://gems.example.com' do
+  OPTIONS = {
+    end: 5,
+    begin: 1
+  }
+  gem 'secret', '1.0'
+end
+gem 'outside', '2.0'
+";
+        assert_eq!(
+            summary(&parse(manifest)),
+            [("outside", "2.0", false, false)]
+        );
     }
 }

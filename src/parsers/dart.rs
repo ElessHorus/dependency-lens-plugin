@@ -1,7 +1,7 @@
 //! Parser for Dart and Flutter `pubspec.yaml` files.
 //!
 //! Reads the `dependencies` and `dev_dependencies` blocks only. Entries with a
-//! `sdk`, `path`, `git` or `url` key come from a source other than the registry,
+//! `sdk`, `path`, `git` or `url` key, or with a `hosted` key that is not pub.dev, come from a source other than the registry,
 //! so they are skipped. The parser is line based and reads each line once. It
 //! does not use a YAML library, so quoted keys are not read.
 
@@ -9,6 +9,9 @@ use crate::model::{Dependency, Span};
 
 /// Keys that make a map-form entry a non-registry source.
 const SOURCE_KEYS: [&str; 4] = ["sdk", "path", "git", "url"];
+
+/// URLs of the public pub.dev registry. A `hosted` entry with one of them is a registry entry.
+const PUBLIC_REGISTRY_URLS: [&str; 2] = ["https://pub.dev", "https://pub.dartlang.org"];
 
 /// One `key: value` line. Offsets are byte columns inside the line.
 struct Field<'a> {
@@ -27,6 +30,17 @@ struct Value<'a> {
     start: usize,
 }
 
+/// The server named by the `hosted` key of an entry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hosted {
+    /// The entry has no `hosted` key.
+    Absent,
+    /// The entry names a server other than pub.dev, or names none that the parser can read.
+    Custom,
+    /// The entry names pub.dev.
+    Public,
+}
+
 /// An entry whose nested lines may still change its version or skip it.
 struct PendingEntry<'a> {
     /// 0-based line of the entry key.
@@ -43,6 +57,8 @@ struct PendingEntry<'a> {
     child_indent: Option<usize>,
     /// `true` once a direct key names a non-registry source.
     is_skipped: bool,
+    /// What the `hosted` key of the entry says about its server.
+    hosted: Hosted,
     dev: bool,
 }
 
@@ -117,6 +133,7 @@ impl<'a> PendingEntry<'a> {
             is_map,
             child_indent: None,
             is_skipped: false,
+            hosted: Hosted::Absent,
             dev,
         }
     }
@@ -127,13 +144,26 @@ impl<'a> PendingEntry<'a> {
             return;
         }
         let direct_indent = *self.child_indent.get_or_insert(indent);
-        if indent != direct_indent {
-            return;
-        }
         let Some(field) = field else {
             return;
         };
-        if SOURCE_KEYS.contains(&field.key) {
+        if indent != direct_indent {
+            // Only the `url` under an open `hosted:` map can name pub.dev.
+            if self.hosted == Hosted::Custom
+                && field.key == "url"
+                && field.value.as_ref().is_some_and(is_public_registry_url)
+            {
+                self.hosted = Hosted::Public;
+            }
+            return;
+        }
+        if field.key == "hosted" {
+            self.hosted = if field.value.as_ref().is_some_and(is_public_registry_url) {
+                Hosted::Public
+            } else {
+                Hosted::Custom
+            };
+        } else if SOURCE_KEYS.contains(&field.key) {
             self.is_skipped = true;
         } else if field.key == "version"
             && let Some(value) = field.value.filter(|value| !value.text.is_empty())
@@ -142,6 +172,14 @@ impl<'a> PendingEntry<'a> {
             self.version_line = line;
         }
     }
+}
+
+/// Returns `true` when the value is the URL of pub.dev, with or without a final `/`.
+fn is_public_registry_url(value: &Value<'_>) -> bool {
+    let url = value.text.trim_end_matches('/');
+    PUBLIC_REGISTRY_URLS
+        .iter()
+        .any(|public_url| url.eq_ignore_ascii_case(public_url))
 }
 
 /// Reads `key: value` from `line`, whose key starts at byte `indent`.
@@ -212,7 +250,8 @@ fn finish_entry(entry: Option<PendingEntry<'_>>, dependencies: &mut Vec<Dependen
     let Some(entry) = entry else {
         return;
     };
-    if entry.is_skipped {
+    // A `hosted` key that does not name pub.dev makes the entry come from a custom server.
+    if entry.is_skipped || entry.hosted == Hosted::Custom {
         return;
     }
     let Some(version) = entry.version else {
@@ -280,7 +319,7 @@ mod tests {
                 ("http", "^1.0.0", false),
                 ("provider", "^6.1.0", false),
                 ("intl", "any", false),
-                ("hosted_pkg", "^2.3.4", false),
+                ("versioned_pkg", "^2.3.4", false),
                 ("old", ">=1.0.0 <2.0.0", false),
                 ("lints", "^3.0.0", true),
             ]
@@ -296,7 +335,7 @@ mod tests {
         };
         assert_eq!(text_of("http").as_deref(), Some("^1.0.0"));
         assert_eq!(text_of("provider").as_deref(), Some("^6.1.0"));
-        assert_eq!(text_of("hosted_pkg").as_deref(), Some("^2.3.4"));
+        assert_eq!(text_of("versioned_pkg").as_deref(), Some("^2.3.4"));
     }
 
     #[test]
@@ -346,5 +385,74 @@ mod tests {
     fn unterminated_block_keeps_entries_read_so_far() {
         let manifest = "dependencies:\n  http: ^1.0.0\n  provider: ^6.0.0\n";
         assert_eq!(parse(manifest).len(), 2);
+    }
+
+    #[test]
+    fn hosted_entries_come_from_a_custom_server_and_are_skipped() {
+        let manifest = "\
+dependencies:
+  scalar_form:
+    hosted: https://pub.example.com
+    version: ^1.0.0
+  map_form:
+    hosted:
+      name: map_form
+      url: https://pub.example.com
+    version: ^1.0.0
+  http: ^1.0.0
+";
+        assert_eq!(summary(&parse(manifest)), [("http", "^1.0.0", false)]);
+    }
+
+    #[test]
+    fn hosted_entry_with_the_public_pub_dev_url_is_kept() {
+        let manifest = "\
+dependencies:
+  plain:
+    hosted: https://pub.dev
+    version: ^1.0.0
+  slash:
+    hosted: \"https://pub.dev/\"
+    version: ^2.0.0
+  lookalike:
+    hosted: https://pub.dev.evil.example
+    version: ^3.0.0
+";
+        assert_eq!(
+            summary(&parse(manifest)),
+            [("plain", "^1.0.0", false), ("slash", "^2.0.0", false)]
+        );
+    }
+
+    #[test]
+    fn hosted_map_form_with_the_public_url_is_kept() {
+        let manifest = "\
+dependencies:
+  public_map:
+    hosted:
+      name: public_map
+      url: https://pub.dev
+    version: ^1.0.0
+  upper_case:
+    hosted:
+      url: \"HTTPS://PUB.DEV/\"
+    version: ^2.0.0
+  private_map:
+    hosted:
+      name: private_map
+      url: https://pub.example.com
+    version: ^3.0.0
+  git_url:
+    git:
+      url: https://pub.dev
+    version: ^4.0.0
+";
+        assert_eq!(
+            summary(&parse(manifest)),
+            [
+                ("public_map", "^1.0.0", false),
+                ("upper_case", "^2.0.0", false)
+            ]
+        );
     }
 }
