@@ -41,10 +41,13 @@ const FAR_FUTURE: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
 /// Title of the background task shown while a manifest is analyzed.
 const TASK_TITLE: &str = "Dependency Lens";
 
-/// Dependency Lens plugin state: the analysis cache, the settings it runs with, and the chunk limits.
+/// Dependency Lens plugin state: the analysis cache, the settings it runs with, the manifests it
+/// shows, and the chunk limits.
 pub struct DependencyLens {
     cache: Cache,
     settings: Settings,
+    /// Manifests with published results. A settings change republishes them.
+    published_paths: HashSet<String>,
     time_box: Duration,
     chunk: usize,
 }
@@ -55,6 +58,7 @@ impl Default for DependencyLens {
         Self {
             cache: Cache::new(settings.cache_ttl_secs),
             settings,
+            published_paths: HashSet::new(),
             time_box: TIME_BOX,
             chunk: REGISTRY_CHUNK,
         }
@@ -101,18 +105,28 @@ impl DependencyLens {
         };
         // The deepest open project holding the path wins; the window's project is only a fallback.
         let Some(project) = host::project_of(path).or_else(|| ctx.project()) else {
+            self.forget_shown(path);
             return;
         };
         let text = match project.read_file(path) {
             Ok(text) => text,
             Err(error) => {
+                self.forget_shown(path);
                 host::log(LogLevel::Warn, &format!("cannot read {path}: {error}"));
                 return;
             }
         };
         let deps = eco.parse(&text);
+        self.published_paths.insert(path.to_owned());
         let task = host::begin_task(TASK_TITLE, true);
         self.publish_chunks(eco, path, &text, &deps, &task, deadline);
+    }
+
+    /// Stops tracking a manifest that cannot be read, and clears what the editor still shows for it.
+    fn forget_shown(&mut self, path: &str) {
+        if self.published_paths.remove(path) {
+            publish_results(path, &[], &[]);
+        }
     }
 
     /// Runs the registry lookups of `deps` in chunks and publishes after each chunk.
@@ -129,10 +143,13 @@ impl DependencyLens {
         deadline: Instant,
     ) {
         let chunk = self.chunk_size();
+        // One clock reading serves the whole run. With a cache lifetime shorter than a chunk, a
+        // fresh reading per chunk would expire the answers of the chunk before and repeat its work.
+        let run_started_at = now_secs();
         let mut previous_pending = None;
         loop {
             // The dependency vector is cloned per chunk; the parse is not repeated.
-            // Each chunk gets its own deadline. The first registry lookup of a chunk always runs,
+            // Each chunk gets its own deadline. The first registry lookup of a chunk runs unless the deadline has passed,
             // and the OSV phase stops fetching advisory details once the deadline has passed.
             let mut budget = Budget::new(chunk, Some(Instant::now() + CHUNK_LIMIT));
             let analysis = analyze(
@@ -141,7 +158,7 @@ impl DependencyLens {
                 &mut self.cache,
                 &HostHttp,
                 &self.settings,
-                now_secs(),
+                run_started_at,
                 &mut budget,
             );
             publish_analysis(path, text, &analysis);
@@ -231,11 +248,51 @@ fn now_secs() -> u64 {
 }
 
 /// Whether `path` is a manifest the plugin analyzes, outside dependency and build folders.
+///
+/// Only the folders inside the project count as skipped, so a project that sits under a
+/// folder named `vendor` or `target` is still analyzed.
 pub(crate) fn is_manifest(path: &str) -> bool {
-    Ecosystem::detect(path).is_some()
-        && !path
-            .split(['/', '\\'])
-            .any(|part| SKIPPED_DIRECTORIES.contains(&part))
+    // `&&` stops at the cheap name check, so the host is asked only for real manifest names.
+    Ecosystem::detect(path).is_some() && is_manifest_in(path, project_root_of(path).as_deref())
+}
+
+/// The root of the open project that holds `path`, when the host knows one.
+fn project_root_of(path: &str) -> Option<String> {
+    host::project_of(path)?.root().ok()
+}
+
+/// Whether `path` is a manifest of the project at `project_root`. It does not ask the host.
+pub(crate) fn is_manifest_in(path: &str, project_root: Option<&str>) -> bool {
+    Ecosystem::detect(path).is_some() && !is_in_skipped_directory(path, project_root)
+}
+
+/// Whether `path` lies in a skipped folder, looking only at the part below `project_root`.
+///
+/// Without a project root, the whole path is checked.
+fn is_in_skipped_directory(path: &str, project_root: Option<&str>) -> bool {
+    let path_parts = path_components(path);
+    // Whole components are compared, so `/p/app2` is not inside `/p/app`. Both separators count,
+    // because the host may write a Windows path either way.
+    let below_root = project_root.and_then(|root| {
+        // Windows paths ignore case. A path with a drive colon or a backslash is one of them.
+        let ignores_case = root.contains([':', '\\']);
+        let mut remaining_parts = path_parts.clone();
+        path_components(root)
+            .all(|root_part| {
+                remaining_parts.next().is_some_and(|part| {
+                    part == root_part || (ignores_case && part.eq_ignore_ascii_case(root_part))
+                })
+            })
+            .then_some(remaining_parts)
+    });
+    below_root
+        .unwrap_or(path_parts)
+        .any(|part| SKIPPED_DIRECTORIES.contains(&part))
+}
+
+/// The non-empty parts of a path, split at `/` and `\`.
+fn path_components(path: &str) -> impl Iterator<Item = &str> + Clone {
+    path.split(['/', '\\']).filter(|part| !part.is_empty())
 }
 
 impl Plugin for DependencyLens {
@@ -297,6 +354,7 @@ impl Plugin for DependencyLens {
             self.reload_settings();
         }
         for path in removed_paths.into_iter().filter(|path| is_manifest(path)) {
+            self.published_paths.remove(path);
             publish_results(path, &[], &[]);
         }
         // One deadline for the batch: manifests after it still get their first chunk.
@@ -305,6 +363,19 @@ impl Plugin for DependencyLens {
         let mut refreshed: HashSet<&str> = HashSet::new();
         for path in changed_paths.into_iter().filter(|path| is_manifest(path)) {
             if refreshed.insert(path) {
+                self.refresh(path, ctx, deadline);
+            }
+        }
+        // A new setting changes what the shown manifests display. The cache answers most of it
+        // without a request, and a disabled ecosystem clears its results.
+        if settings_changed {
+            let shown_paths: Vec<String> = self
+                .published_paths
+                .iter()
+                .filter(|path| !refreshed.contains(path.as_str()))
+                .cloned()
+                .collect();
+            for path in &shown_paths {
                 self.refresh(path, ctx, deadline);
             }
         }
@@ -317,6 +388,7 @@ impl Providers for DependencyLens {
             &self.cache,
             &self.settings,
             &doc.path,
+            project_root_of(&doc.path).as_deref(),
             &doc.text,
             selection,
             now_secs(),
@@ -402,5 +474,74 @@ mod loop_tests {
     fn deadline_after_saturates_instead_of_overflowing() {
         let before = Instant::now();
         assert!(deadline_after(Duration::MAX) > before);
+    }
+}
+
+#[cfg(test)]
+mod skipped_directory_tests {
+    use super::is_in_skipped_directory;
+
+    #[test]
+    fn only_folders_below_the_project_root_are_skipped() {
+        assert!(!is_in_skipped_directory(
+            "/srv/vendor/app/Cargo.toml",
+            Some("/srv/vendor/app")
+        ));
+        assert!(is_in_skipped_directory(
+            "/srv/vendor/app/target/Cargo.toml",
+            Some("/srv/vendor/app")
+        ));
+        assert!(is_in_skipped_directory(
+            "/p/node_modules/x/package.json",
+            None
+        ));
+    }
+
+    #[test]
+    fn the_root_must_end_at_a_path_boundary() {
+        // `/p/app2` is not inside `/p/app`, so the whole path is checked, and it holds no skipped folder.
+        assert!(!is_in_skipped_directory(
+            "/p/app2/Cargo.toml",
+            Some("/p/app")
+        ));
+        assert!(is_in_skipped_directory(
+            "/p/app2/vendor/Cargo.toml",
+            Some("/p/app")
+        ));
+    }
+
+    #[test]
+    fn mixed_separators_and_drive_letter_case_still_match_the_root() {
+        assert!(!is_in_skipped_directory(
+            "C:/work/vendor/app/Cargo.toml",
+            Some("C:\\work\\vendor\\app")
+        ));
+        assert!(!is_in_skipped_directory(
+            "c:\\work\\vendor\\app\\Cargo.toml",
+            Some("C:\\work\\vendor\\app\\")
+        ));
+        assert!(is_in_skipped_directory(
+            "C:/work/vendor/app/target/Cargo.toml",
+            Some("C:\\work\\vendor\\app")
+        ));
+    }
+}
+
+#[cfg(test)]
+mod path_case_tests {
+    use super::is_in_skipped_directory;
+
+    #[test]
+    fn case_matters_on_a_unix_path_and_not_on_a_windows_path() {
+        // `/p/vendor/App` is another directory than `/p/vendor/app` on Linux, so the root does
+        // not match and the whole path is checked, which holds `vendor`.
+        assert!(is_in_skipped_directory(
+            "/p/vendor/App/Cargo.toml",
+            Some("/p/vendor/app")
+        ));
+        assert!(!is_in_skipped_directory(
+            "C:/Work/vendor/App/Cargo.toml",
+            Some("c:\\work\\vendor\\app")
+        ));
     }
 }

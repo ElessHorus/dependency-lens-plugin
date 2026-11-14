@@ -3,7 +3,8 @@
 use crate::model::{AdvisorySeverity, Ecosystem};
 use openidea_plugin::host;
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashSet};
 
 /// Largest cache lifetime that is accepted, in seconds (one week).
 const MAX_CACHE_TTL_SECS: u64 = 604_800;
@@ -59,6 +60,16 @@ impl Settings {
     /// Returns `true` when dependencies of `eco` are analyzed.
     pub fn is_enabled(&self, eco: Ecosystem) -> bool {
         self.enabled.contains(&eco)
+    }
+
+    /// Returns the `ignore` names in the normal form of `eco`, ready for set lookups.
+    ///
+    /// A dependency is ignored when its own normal-form name is in the set.
+    pub fn ignored_packages(&self, eco: Ecosystem) -> HashSet<Cow<'_, str>> {
+        self.ignore
+            .iter()
+            .map(|entry| eco.normalize_package(entry))
+            .collect()
     }
 
     /// Reads the settings from the host. See [`Settings::from_lookup`].

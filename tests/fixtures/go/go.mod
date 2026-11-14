@@ -16,7 +16,7 @@ require (
 require github.com/single/dep v1.2.3
 
 replace (
-	github.com/pkg/errors => ../errors
+	github.com/unused/mod => ../unused
 )
 
 exclude github.com/bad/mod v1.0.0

@@ -1,7 +1,7 @@
 //! Code actions: quick fixes that bump an outdated requirement to the latest registry release.
 
 use crate::cache::Cache;
-use crate::is_manifest;
+use crate::is_manifest_in;
 use crate::model::{Dependency, Ecosystem};
 use crate::osv::declared_version_for_osv;
 use crate::settings::Settings;
@@ -17,11 +17,12 @@ pub fn code_actions(
     cache: &Cache,
     settings: &Settings,
     doc_path: &str,
+    project_root: Option<&str>,
     doc_text: &str,
     selection: Range,
     now: u64,
 ) -> Vec<CodeAction> {
-    if !is_manifest(doc_path) {
+    if !is_manifest_in(doc_path, project_root) {
         return Vec::new();
     }
     let Some(eco) = Ecosystem::detect(doc_path) else {
@@ -30,11 +31,13 @@ pub fn code_actions(
     if !eco.offers_updates() || !settings.is_enabled(eco) {
         return Vec::new();
     }
+    let ignored = settings.ignored_packages(eco);
     // One parse; the line test is a range check, so lines outside the selection build no action.
     let selected_lines = selection.start.line..=selection.end.line;
     eco.parse(doc_text)
         .iter()
         .filter(|dep| selected_lines.contains(&dep.version_span.line))
+        .filter(|dep| !ignored.contains(&eco.normalize_package(&dep.name)))
         .filter_map(|dep| action_for(cache, eco, dep, doc_path, doc_text, now))
         .collect()
 }
@@ -120,7 +123,15 @@ mod tests {
     }
 
     fn actions_for(cache: &Cache, settings: &Settings, selection: Range) -> Vec<CodeAction> {
-        code_actions(cache, settings, DOC_PATH, DOC_TEXT, selection, NOW)
+        code_actions(
+            cache,
+            settings,
+            DOC_PATH,
+            Some("/p"),
+            DOC_TEXT,
+            selection,
+            NOW,
+        )
     }
 
     #[test]
@@ -193,6 +204,7 @@ mod tests {
             &cache,
             &Settings::default(),
             DOC_PATH,
+            Some("/p"),
             DOC_TEXT,
             cursor_on(0),
             NOW + 60,
@@ -212,12 +224,33 @@ mod tests {
                 &cache,
                 &Settings::default(),
                 path,
+                Some("/p"),
                 DOC_TEXT,
                 cursor_on(0),
                 NOW,
             );
             assert!(actions.is_empty(), "{path} must offer nothing");
         }
+    }
+
+    #[test]
+    fn ignored_packages_offer_no_quick_fix() {
+        let cache = pypi_cache(TTL_SECS);
+        // The ignore list is compared in the ecosystem's normal form, like the analysis does.
+        let settings = Settings {
+            ignore: vec!["Requests".to_owned()],
+            ..Settings::default()
+        };
+        let titles: Vec<String> = actions_for(
+            &cache,
+            &settings,
+            Range::new(Position::new(0, 0), Position::new(2, 0)),
+        )
+        .into_iter()
+        .map(|action| action.title)
+        .collect();
+        assert_eq!(titles.len(), 1);
+        assert!(titles[0].starts_with("Update django"), "{titles:?}");
     }
 
     #[test]

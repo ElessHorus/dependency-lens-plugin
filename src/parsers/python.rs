@@ -4,6 +4,7 @@
 //! text, because the model passes only the text. Text that parses as TOML
 //! with a handled key is a TOML manifest. Anything else is a requirements file.
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 use taplo::dom::Node;
@@ -12,6 +13,7 @@ use taplo::syntax::SyntaxElement;
 
 use super::spans::LineIndex;
 use crate::model::{Dependency, Span};
+use crate::registries::pypi::normalize_name;
 
 /// PEP 440 operators that may start a version constraint.
 const OPERATORS: [&str; 8] = ["===", "==", ">=", "<=", "!=", "~=", ">", "<"];
@@ -56,11 +58,59 @@ fn has_handled_key(dom: &Node) -> bool {
         || dom.get("envs").as_table().is_some()
 }
 
+/// Option names whose value is a package source. `-i` and `-f` are the short forms.
+const SOURCE_OPTIONS: [&str; 6] = [
+    "-i",
+    "--index-url",
+    "--extra-index-url",
+    "-f",
+    "--find-links",
+    "--no-index",
+];
+
+/// Index URLs that name the public PyPI index.
+const PUBLIC_INDEX_URLS: [&str; 2] = ["https://pypi.org/simple", "https://pypi.python.org/simple"];
+
+/// Returns `true` when a requirements line sets a package source other than the public PyPI index.
+///
+/// A pip option applies to the whole file, so such a line makes every package of the
+/// file a possible private package.
+fn sets_private_source(line: &str) -> bool {
+    // A comment starts at `#` after whitespace. A final `\` joins the value of the next line.
+    let option_text = line
+        .split_once(" #")
+        .map_or(line, |(before_comment, _)| before_comment)
+        .trim()
+        .trim_end_matches('\\')
+        .trim_end();
+    // A short option may hold its value, as in `-ihttps://host/simple` or `-fwheels`.
+    let (option, value) = if option_text.starts_with(['-']) && !option_text.starts_with("--") {
+        option_text.split_at_checked(2).unwrap_or((option_text, ""))
+    } else {
+        // The value follows a space (`--index-url URL`) or an equals sign (`--index-url=URL`).
+        option_text
+            .split_once([' ', '\t', '='])
+            .unwrap_or((option_text, ""))
+    };
+    SOURCE_OPTIONS.contains(&option) && !is_public_index_url(value.trim_start_matches('=').trim())
+}
+
+/// Returns `true` when `url` is the public PyPI index, with or without a final `/`.
+fn is_public_index_url(url: &str) -> bool {
+    PUBLIC_INDEX_URLS
+        .iter()
+        .any(|public_url| url.trim_end_matches('/').eq_ignore_ascii_case(public_url))
+}
+
 /// Parses a requirements file, one requirement per line.
 ///
 /// Lines that are not requirements (options, comments, URLs, paths) fail
 /// [`parse_pep508`] and are skipped. Offsets are relative to each line, so no line table is needed.
+/// A line that sets a non-public index or a link source hides the whole file.
 fn parse_requirements(text: &str) -> Vec<Dependency> {
+    if text.lines().any(sets_private_source) {
+        return Vec::new();
+    }
     text.lines()
         .enumerate()
         .filter_map(|(line_index, line)| {
@@ -243,6 +293,9 @@ fn dependency_from_pep508(
 
 /// Parses a TOML manifest: PEP 621, PEP 735, Poetry and Hatch environments.
 fn parse_toml(text: &str, dom: &Node) -> Vec<Dependency> {
+    if has_private_index(dom) {
+        return Vec::new();
+    }
     let index = LineIndex::new(text);
     let mut dependencies = Vec::new();
     let project = dom.get("project");
@@ -282,7 +335,78 @@ fn parse_toml(text: &str, dom: &Node) -> Vec<Dependency> {
     );
     collect_poetry_groups(&index, &poetry.get("group"), &mut dependencies);
     collect_hatch_envs(&index, &dom.get("envs"), &mut dependencies);
+    exclude_uv_sources(dom, &mut dependencies);
     dependencies
+}
+
+/// Removes the packages that `[tool.uv.sources]` takes from a path, a git URL, a workspace or an index.
+///
+/// Names are compared in the PEP 503 normal form, so `Internal_Two` matches `internal-two`.
+fn exclude_uv_sources(dom: &Node, dependencies: &mut Vec<Dependency>) {
+    let sources = dom.get("tool").get("uv").get("sources");
+    let Some(table) = sources.as_table() else {
+        return;
+    };
+    let source_names: HashSet<String> = table
+        .entries()
+        .read()
+        .iter()
+        .map(|(key, _)| normalize_name(key.value()))
+        .collect();
+    dependencies.retain(|dependency| !source_names.contains(&normalize_name(&dependency.name)));
+}
+
+/// Returns `true` when a uv or Poetry setting adds a package index other than the public PyPI one.
+///
+/// Such an index may serve any package of the manifest, like a pip `--index-url`. An
+/// `explicit` uv index and an `explicit` Poetry source serve only the packages that name them,
+/// and those are already skipped.
+fn has_private_index(dom: &Node) -> bool {
+    let tool = dom.get("tool");
+    let uv = tool.get("uv");
+    // `[tool.uv.pip]` holds the same settings for the `uv pip` commands.
+    let uv_pip = uv.get("pip");
+    holds_private_url(&uv.get("index-url"))
+        || holds_private_url(&uv.get("extra-index-url"))
+        || holds_private_url(&uv.get("find-links"))
+        || holds_private_url(&uv_pip.get("index-url"))
+        || holds_private_url(&uv_pip.get("extra-index-url"))
+        || holds_private_url(&uv_pip.get("find-links"))
+        || holds_private_index_table(&uv.get("index"), |table| {
+            table.get("explicit").as_bool().is_some_and(Bool::value)
+        })
+        || holds_private_index_table(&tool.get("poetry").get("source"), |table| {
+            table
+                .get("priority")
+                .as_str()
+                .is_some_and(|priority| priority.value() == "explicit")
+        })
+}
+
+/// Returns `true` when a string node, or an array of string nodes, holds a URL that is not public PyPI.
+fn holds_private_url(node: &Node) -> bool {
+    if let Some(url) = node.as_str() {
+        return !is_public_index_url(url.value());
+    }
+    node.as_array().is_some_and(|array| {
+        array.items().read().iter().any(|item| {
+            item.as_str()
+                .is_some_and(|url| !is_public_index_url(url.value()))
+        })
+    })
+}
+
+/// Returns `true` when an array of index tables holds a table that is not explicit and has a non-public `url`.
+fn holds_private_index_table(node: &Node, is_explicit: impl Fn(&Node) -> bool) -> bool {
+    node.as_array().is_some_and(|array| {
+        array.items().read().iter().any(|table| {
+            !is_explicit(table)
+                && table
+                    .get("url")
+                    .as_str()
+                    .is_some_and(|url| !is_public_index_url(url.value()))
+        })
+    })
 }
 
 /// Appends the dependencies of a PEP 508 string array. Ignores other nodes.
@@ -894,5 +1018,120 @@ internal = { version = \"^1.0\", source = \"private\" }
         let dependencies = parse(manifest);
         assert_eq!(dependencies.len(), 1);
         assert_eq!(dependencies[0].name, "requests");
+    }
+
+    #[test]
+    fn requirements_with_a_non_public_index_or_link_source_return_nothing() {
+        for option in [
+            "-i https://pypi.acme.internal/simple",
+            "--index-url https://pypi.acme.internal/simple",
+            "--index-url=https://pypi.acme.internal/simple",
+            "--extra-index-url https://pypi.acme.internal/simple",
+            "--extra-index-url=https://pypi.acme.internal/simple  # private",
+            "-f ./wheels",
+            "--find-links=https://example.com/wheels",
+        ] {
+            let manifest = format!("{option}\ninternal-lib==1.0\nrequests==2.0\n");
+            assert!(parse(&manifest).is_empty(), "{option} must hide the file");
+        }
+    }
+
+    #[test]
+    fn requirements_with_the_public_index_or_unrelated_options_are_kept() {
+        let manifest = "\
+--index-url https://pypi.org/simple
+--extra-index-url=https://pypi.org/simple/
+# --index-url https://pypi.acme.internal/simple
+-r other.txt
+--no-binary :all:
+requests==2.0
+";
+        let dependencies = parse(manifest);
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].name, "requests");
+    }
+
+    #[test]
+    fn uv_sources_exclude_the_packages_they_name() {
+        let manifest = "\
+[project]
+dependencies = [\"internal>=1.0\", \"Internal_Two==1.0\", \"third.party==1.0\", \"requests==2.28.0\"]
+
+[dependency-groups]
+dev = [\"internal-dev==1.0\"]
+
+[tool.uv.sources]
+internal = { path = \"../internal\" }
+internal-two = { index = \"acme\" }
+third-party = [{ git = \"https://example.com/x.git\", marker = \"sys_platform == 'linux'\" }]
+internal-dev = { workspace = true }
+";
+        let dependencies = parse(manifest);
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].name, "requests");
+    }
+
+    #[test]
+    fn attached_short_options_and_continuations_are_private_sources() {
+        for option in [
+            "-ihttps://pypi.acme.internal/simple",
+            "-fwheels",
+            "--index-url\\",
+            "--extra-index-url=https://pypi.acme.internal/simple\\",
+        ] {
+            let manifest = format!("{option}\ninternal-lib==1.0\n");
+            assert!(parse(&manifest).is_empty(), "{option} must hide the file");
+        }
+        assert_eq!(parse("-ihttps://pypi.org/simple\nrequests==2.0\n").len(), 1);
+    }
+
+    #[test]
+    fn a_private_uv_or_poetry_index_hides_the_manifest() {
+        for index_setting in [
+            "[tool.uv]\nindex-url = \"https://pypi.acme.internal/simple\"",
+            "[tool.uv]\nextra-index-url = [\"https://pypi.acme.internal/simple\"]",
+            "[tool.uv]\nfind-links = [\"./wheels\"]",
+            "[[tool.uv.index]]\nname = \"acme\"\nurl = \"https://pypi.acme.internal/simple\"",
+            "[[tool.poetry.source]]\nname = \"acme\"\nurl = \"https://pypi.acme.internal/simple\"",
+        ] {
+            let manifest =
+                format!("[project]\ndependencies = [\"internal==1.0\"]\n\n{index_setting}\n");
+            assert!(
+                parse(&manifest).is_empty(),
+                "{index_setting} must hide the file"
+            );
+        }
+    }
+
+    #[test]
+    fn public_or_explicit_indexes_do_not_hide_the_manifest() {
+        for index_setting in [
+            "[tool.uv]\nindex-url = \"https://pypi.org/simple/\"",
+            "[[tool.uv.index]]\nname = \"pypi\"\nurl = \"https://pypi.org/simple\"",
+            "[[tool.uv.index]]\nname = \"acme\"\nurl = \"https://pypi.acme.internal/simple\"\nexplicit = true",
+            "[[tool.poetry.source]]\nname = \"acme\"\nurl = \"https://pypi.acme.internal/simple\"\npriority = \"explicit\"",
+        ] {
+            let manifest =
+                format!("[project]\ndependencies = [\"requests==2.28.0\"]\n\n{index_setting}\n");
+            assert_eq!(
+                parse(&manifest).len(),
+                1,
+                "{index_setting} must keep the file"
+            );
+        }
+    }
+
+    #[test]
+    fn a_private_uv_pip_index_hides_the_manifest() {
+        for setting in [
+            "index-url = \"https://pypi.acme.internal/simple\"",
+            "extra-index-url = [\"https://pypi.acme.internal/simple\"]",
+            "find-links = [\"./wheels\"]",
+        ] {
+            let manifest = format!(
+                "[project]\ndependencies = [\"internal==1.0\"]\n\n[tool.uv.pip]\n{setting}\n"
+            );
+            assert!(parse(&manifest).is_empty(), "{setting} must hide the file");
+        }
     }
 }

@@ -2,7 +2,7 @@
 
 use crate::model::{Dependency, Ecosystem};
 use crate::osv::declared_version_for_osv;
-use crate::registries::dotted::{DottedVersion, is_dev_branch, segment};
+use crate::registries::dotted::{DottedVersion, PubVersion, is_dev_branch, segment};
 use crate::registries::gem_version::GemVersion;
 use crate::registries::pep440::Pep440;
 use std::borrow::Cow;
@@ -62,6 +62,20 @@ impl UpdateVersion for DottedVersion {
     }
 }
 
+impl UpdateVersion for PubVersion {
+    fn parse_version(text: &str) -> Option<Self> {
+        PubVersion::parse(text)
+    }
+
+    fn is_prerelease_version(&self) -> bool {
+        self.is_prerelease()
+    }
+
+    fn release_segments(&self) -> Cow<'_, [u64]> {
+        Cow::Borrowed(self.release())
+    }
+}
+
 impl UpdateVersion for GemVersion {
     fn parse_version(text: &str) -> Option<Self> {
         GemVersion::parse(text)
@@ -80,9 +94,8 @@ impl UpdateVersion for GemVersion {
 pub fn update_kind(eco: Ecosystem, current: &str, latest: &str) -> Option<UpdateKind> {
     match eco {
         Ecosystem::PyPI => update_kind_of::<Pep440>(current, latest),
-        Ecosystem::Packagist | Ecosystem::Pub | Ecosystem::NuGet => {
-            update_kind_of::<DottedVersion>(current, latest)
-        }
+        Ecosystem::Packagist | Ecosystem::NuGet => update_kind_of::<DottedVersion>(current, latest),
+        Ecosystem::Pub => update_kind_of::<PubVersion>(current, latest),
         Ecosystem::RubyGems => update_kind_of::<GemVersion>(current, latest),
         _ => None,
     }
@@ -92,9 +105,10 @@ pub fn update_kind(eco: Ecosystem, current: &str, latest: &str) -> Option<Update
 pub fn is_outdated(eco: Ecosystem, declared: &str, latest: &str) -> bool {
     match eco {
         Ecosystem::PyPI => is_outdated_of::<Pep440>(declared, latest),
-        Ecosystem::Packagist | Ecosystem::Pub | Ecosystem::NuGet => {
+        Ecosystem::Packagist | Ecosystem::NuGet => {
             is_outdated_of::<DottedVersion>(declared, latest)
         }
+        Ecosystem::Pub => is_outdated_of::<PubVersion>(declared, latest),
         Ecosystem::RubyGems => is_outdated_of::<GemVersion>(declared, latest),
         _ => false,
     }
@@ -104,7 +118,8 @@ pub fn is_outdated(eco: Ecosystem, declared: &str, latest: &str) -> bool {
 pub fn render_update(eco: Ecosystem, dep: &Dependency, latest: &str) -> Option<String> {
     match eco {
         Ecosystem::PyPI => pep440_render_update(dep, latest),
-        Ecosystem::Packagist | Ecosystem::Pub => dotted_render_update(dep, latest),
+        Ecosystem::Packagist => dotted_render_update(dep, latest, false),
+        Ecosystem::Pub => dotted_render_update(dep, latest, true),
         Ecosystem::NuGet => full_latest_render_update::<DottedVersion>(dep, latest),
         // A second constraint stays in the line after the rewrite, so such a gem is left alone.
         Ecosystem::RubyGems if dep.has_additional_version_constraints => None,
@@ -190,8 +205,8 @@ fn full_latest_render_update<V: UpdateVersion>(dep: &Dependency, latest: &str) -
 
 /// Rewrites a Composer or pub.dev requirement to `latest`. It keeps the operator and
 /// writes as many release segments as the declared text has, so `^8.1` takes `8.2`
-/// from `8.2.3`.
-fn dotted_render_update(dep: &Dependency, latest: &str) -> Option<String> {
+/// from `8.2.3`. With `keeps_build`, a build number of `latest` follows the release, as in pub.dev's `0.4.0+9`.
+fn dotted_render_update(dep: &Dependency, latest: &str, keeps_build: bool) -> Option<String> {
     if dep.version.is_empty()
         || dep.version.contains(char::is_whitespace)
         || dep.version.contains(['*', '@', '|'])
@@ -205,8 +220,14 @@ fn dotted_render_update(dep: &Dependency, latest: &str) -> Option<String> {
     if latest_version.is_prerelease() {
         return None;
     }
-    // A latest version with fewer segments than declared is written in full.
-    let precision = declared.release().len();
+    // A latest version with fewer segments than declared is written in full. A build number only
+    // follows a full release, so `^0.4` and `0.4.1+2` give `^0.4.1+2`, never `^0.4+2`.
+    let has_build = keeps_build && latest.contains('+');
+    let precision = if has_build {
+        declared.release().len().max(latest_version.release().len())
+    } else {
+        declared.release().len()
+    };
     let rendered_release = latest_version
         .release()
         .iter()
@@ -214,7 +235,11 @@ fn dotted_render_update(dep: &Dependency, latest: &str) -> Option<String> {
         .map(u64::to_string)
         .collect::<Vec<_>>()
         .join(".");
-    let rendered = format!("{operator}{rendered_release}");
+    let build = latest
+        .split_once('+')
+        .filter(|_| has_build)
+        .map_or(String::new(), |(_, build_text)| format!("+{build_text}"));
+    let rendered = format!("{operator}{rendered_release}{build}");
     (rendered != dep.version).then_some(rendered)
 }
 
@@ -543,5 +568,73 @@ mod tests {
     fn unimplemented_ecosystems_render_nothing() {
         let dependency = first_dependency("requests==2.28.0\n");
         assert_eq!(render_update(Ecosystem::Cargo, &dependency, "2.31.0"), None);
+    }
+
+    #[test]
+    fn pub_build_numbers_count_but_other_ecosystems_ignore_them() {
+        assert!(is_outdated(Ecosystem::Pub, "0.4.0+1", "0.4.0+9"));
+        assert!(is_outdated(Ecosystem::Pub, "0.4.0", "0.4.0+1"));
+        assert!(!is_outdated(Ecosystem::Pub, "0.4.0+9", "0.4.0+9"));
+        assert!(!is_outdated(Ecosystem::Pub, "0.4.0+9", "0.4.0"));
+        // Semver says build metadata never changes precedence, and NuGet and Composer follow it.
+        assert!(!is_outdated(Ecosystem::NuGet, "1.0.0+1", "1.0.0+9"));
+        assert!(!is_outdated(Ecosystem::Packagist, "1.0.0+1", "1.0.0+9"));
+    }
+
+    #[test]
+    fn pub_update_keeps_the_build_number_of_the_latest_version() {
+        let dependency = Dependency {
+            name: "demo".to_owned(),
+            version: "^0.4.0+1".to_owned(),
+            name_span: crate::model::Span {
+                line: 0,
+                line_start: 0,
+                line_end: 4,
+            },
+            version_span: crate::model::Span {
+                line: 0,
+                line_start: 6,
+                line_end: 14,
+            },
+            dev: false,
+            optional: false,
+            has_additional_version_constraints: false,
+        };
+        assert_eq!(
+            render_update(Ecosystem::Pub, &dependency, "0.4.0+9").as_deref(),
+            Some("^0.4.0+9")
+        );
+    }
+
+    #[test]
+    fn pub_update_with_a_build_number_writes_the_full_release() {
+        for (declared, latest, expected) in [
+            ("^0.4", "0.4.1+2", "^0.4.1+2"),
+            ("^1", "2.0.0+3", "^2.0.0+3"),
+            ("^0.4.0+1", "0.4.0+9", "^0.4.0+9"),
+        ] {
+            let dependency = Dependency {
+                name: "demo".to_owned(),
+                version: declared.to_owned(),
+                name_span: crate::model::Span {
+                    line: 0,
+                    line_start: 0,
+                    line_end: 4,
+                },
+                version_span: crate::model::Span {
+                    line: 0,
+                    line_start: 6,
+                    line_end: 14,
+                },
+                dev: false,
+                optional: false,
+                has_additional_version_constraints: false,
+            };
+            assert_eq!(
+                render_update(Ecosystem::Pub, &dependency, latest).as_deref(),
+                Some(expected),
+                "{declared} -> {latest}"
+            );
+        }
     }
 }

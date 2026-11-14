@@ -228,6 +228,25 @@ fn files_that_are_not_manifests_are_never_read_or_queried() {
 }
 
 #[test]
+fn a_project_under_a_skipped_folder_name_is_still_analyzed() {
+    // Only folders inside the project are skipped. The project itself may sit under `vendor`.
+    let host = host_counting_fetches(Rc::new(Cell::new(0)));
+    host.set_project_root(Some("/srv/vendor/app"));
+    host.add_file("Cargo.toml", MANIFEST);
+    host.add_file("target/Cargo.toml", MANIFEST);
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[
+            Event::FileOpened("/srv/vendor/app/Cargo.toml".to_owned()),
+            Event::FileOpened("/srv/vendor/app/target/Cargo.toml".to_owned()),
+        ],
+        &host.invocation(),
+    );
+    assert_eq!(diagnostics_of(&host, "/srv/vendor/app/Cargo.toml").len(), 1);
+    assert!(diagnostics_of(&host, "/srv/vendor/app/target/Cargo.toml").is_empty());
+}
+
+#[test]
 fn opening_an_unchanged_manifest_again_makes_no_request() {
     let fetches = Rc::new(Cell::new(0));
     let host = host_counting_fetches(fetches.clone());
@@ -357,6 +376,65 @@ fn settings_changed_event_disables_an_ecosystem_for_later_opens() {
 
     open_manifest(&host, &mut plugin);
     assert_eq!(fetches.get(), 0);
+}
+
+/// Sends one `settings-changed` event for `key`.
+fn send_settings_changed(host: &MockHost, plugin: &mut DependencyLens, key: &str) {
+    plugin.handle_events(
+        &[Event::Other {
+            kind: "settings-changed".to_owned(),
+            data: format!(r#"["{key}"]"#),
+        }],
+        &host.invocation(),
+    );
+}
+
+#[test]
+fn disabling_an_ecosystem_clears_the_manifests_already_shown() {
+    let host = host_counting_fetches(Rc::new(Cell::new(0)));
+    let mut plugin = DependencyLens::default();
+    plugin.activate(&host.context(PLUGIN_ID)).unwrap();
+    open_manifest(&host, &mut plugin);
+    assert_eq!(decorations_of(&host, MANIFEST_PATH).len(), 1);
+
+    host.set_setting("ecosystems.cargo.enabled", "false");
+    send_settings_changed(&host, &mut plugin, "ecosystems.cargo.enabled");
+    assert!(decorations_of(&host, MANIFEST_PATH).is_empty());
+    assert!(diagnostics_of(&host, MANIFEST_PATH).is_empty());
+}
+
+#[test]
+fn raising_the_minimum_severity_republishes_from_the_cache_without_a_request() {
+    let host = host_counting_fetches(Rc::new(Cell::new(0)));
+    let mut plugin = DependencyLens::default();
+    plugin.activate(&host.context(PLUGIN_ID)).unwrap();
+    open_manifest(&host, &mut plugin);
+    assert_eq!(diagnostics_of(&host, MANIFEST_PATH).len(), 1);
+    assert_eq!(osv_batch_requests(&host), 1);
+
+    host.set_setting("minimumSeverity", "\"critical\"");
+    send_settings_changed(&host, &mut plugin, "minimumSeverity");
+    assert!(diagnostics_of(&host, MANIFEST_PATH).is_empty());
+    assert_eq!(osv_batch_requests(&host), 1);
+}
+
+#[test]
+fn a_removed_manifest_is_not_republished_after_a_settings_change() {
+    let host = host_counting_fetches(Rc::new(Cell::new(0)));
+    let mut plugin = DependencyLens::default();
+    plugin.activate(&host.context(PLUGIN_ID)).unwrap();
+    open_manifest(&host, &mut plugin);
+    plugin.handle_events(
+        &[Event::FilesChanged(FilesChanged {
+            created: Vec::new(),
+            modified: Vec::new(),
+            removed: vec![MANIFEST_PATH.to_owned()],
+        })],
+        &host.invocation(),
+    );
+    send_settings_changed(&host, &mut plugin, "minimumSeverity");
+    assert!(decorations_of(&host, MANIFEST_PATH).is_empty());
+    assert_eq!(osv_batch_requests(&host), 1);
 }
 
 #[test]

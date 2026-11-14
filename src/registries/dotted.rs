@@ -20,11 +20,16 @@ enum PreId {
     Alphanumeric(String),
 }
 
-/// A parsed version such as `1.2.3`, `v2.0`, or `3.0.0-RC1`. Build metadata is dropped.
+/// A parsed version such as `1.2.3`, `v2.0`, or `3.0.0-RC1`.
+///
+/// Build metadata (`+7`) is kept but never changes the ordering, as semver says. Only
+/// [`PubVersion`] reads it.
 #[derive(Clone, Debug)]
 pub struct DottedVersion {
     release: Vec<u64>,
     pre: Option<Vec<PreId>>,
+    /// The identifiers after `+`. Empty when the version has none, or when they are malformed.
+    build: Vec<PreId>,
 }
 
 impl DottedVersion {
@@ -32,10 +37,11 @@ impl DottedVersion {
     pub fn parse(text: &str) -> Option<DottedVersion> {
         let trimmed = text.trim();
         let without_v = trimmed.strip_prefix(['v', 'V']).unwrap_or(trimmed);
-        // Build metadata never changes precedence, so it is cut before the release and prerelease split.
-        let without_build = without_v
-            .split_once('+')
-            .map_or(without_v, |(head, _)| head);
+        // The build part is cut before the release and prerelease split.
+        let (without_build, build_text) = match without_v.split_once('+') {
+            Some((head, build_text)) => (head, Some(build_text)),
+            None => (without_v, None),
+        };
         let (release_text, pre_text) = match without_build.split_once('-') {
             Some((release_text, pre_text)) => (release_text, Some(pre_text)),
             None => (without_build, None),
@@ -46,6 +52,8 @@ impl DottedVersion {
                 Some(text) => Some(parse_prerelease(text)?),
                 None => None,
             },
+            // A malformed build never rejects the version: it only loses its tie-break.
+            build: build_text.and_then(parse_prerelease).unwrap_or_default(),
         })
     }
 
@@ -81,6 +89,57 @@ pub fn is_dev_branch(version: &str) -> bool {
 /// its parsed version, so the sort compares stored values without parsing again.
 pub fn rank_versions(texts: impl IntoIterator<Item = String>) -> VersionInfo {
     rank_with(texts, DottedVersion::parse, DottedVersion::is_prerelease)
+}
+
+/// A pub.dev version. It orders like [`DottedVersion`], and a build number breaks a tie:
+/// `0.4.0+2` is newer than `0.4.0+1`, and both are newer than `0.4.0`.
+#[derive(Clone, Debug)]
+pub struct PubVersion(DottedVersion);
+
+impl PubVersion {
+    /// Parses `text`. Returns `None` when [`DottedVersion::parse`] does.
+    pub fn parse(text: &str) -> Option<PubVersion> {
+        DottedVersion::parse(text).map(PubVersion)
+    }
+
+    /// Returns `true` when the version has a `-prerelease` part.
+    pub fn is_prerelease(&self) -> bool {
+        self.0.is_prerelease()
+    }
+
+    /// Returns the release segments, such as `[1, 2, 3]` for `1.2.3`.
+    pub fn release(&self) -> &[u64] {
+        self.0.release()
+    }
+}
+
+impl Ord for PubVersion {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // An empty build is below every build, so a plain version sorts before its builds.
+        self.0
+            .cmp(&other.0)
+            .then_with(|| self.0.build.cmp(&other.0.build))
+    }
+}
+
+impl PartialOrd for PubVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for PubVersion {
+    // Equality follows the ordering, so it counts the build number too.
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for PubVersion {}
+
+/// Ranks pub.dev version texts newest first, like [`rank_versions`], with build numbers counted.
+pub fn rank_pub_versions(texts: impl IntoIterator<Item = String>) -> VersionInfo {
+    rank_with(texts, PubVersion::parse, PubVersion::is_prerelease)
 }
 
 impl Ord for DottedVersion {

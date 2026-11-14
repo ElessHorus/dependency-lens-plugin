@@ -1,6 +1,6 @@
 //! pub.dev registry client: request building and response parsing (pub.dev package API).
 
-use super::dotted::{DottedVersion, rank_versions};
+use super::dotted::{PubVersion, rank_pub_versions};
 use crate::model::VersionInfo;
 use openidea_plugin::HttpRequest;
 use serde::Deserialize;
@@ -44,7 +44,7 @@ pub fn parse(body: &str) -> Result<VersionInfo, String> {
     let response: RegistryResponse =
         serde_json::from_str(body).map_err(|_| INVALID_RESPONSE.to_string())?;
     let reported_latest = response.latest;
-    let mut info = rank_versions(
+    let mut info = rank_pub_versions(
         response
             .versions
             .into_iter()
@@ -55,7 +55,7 @@ pub fn parse(body: &str) -> Result<VersionInfo, String> {
     info.latest = info.latest.or_else(|| {
         reported_latest
             .map(|entry| entry.version)
-            .filter(|text| DottedVersion::parse(text).is_some())
+            .filter(|text| PubVersion::parse(text).is_some())
     });
     Ok(info)
 }
@@ -123,5 +123,17 @@ mod tests {
         let request = request("http");
         assert_eq!(request.method, "GET");
         assert_eq!(request.url, "https://pub.dev/api/packages/http");
+    }
+
+    #[test]
+    fn build_numbers_rank_a_version_above_the_same_version_without_one() {
+        // pub.dev lists the oldest first, so the plain version comes before its builds.
+        let body = r#"{"latest":{"version":"0.4.0+9"},"versions":[{"version":"0.3.0"},{"version":"0.4.0"},{"version":"0.4.0+1"},{"version":"0.4.0+9"},{"version":"0.4.0+10"}]}"#;
+        let info = parse(body).expect("body must parse");
+        assert_eq!(info.latest.as_deref(), Some("0.4.0+10"));
+        assert_eq!(
+            info.versions,
+            ["0.4.0+10", "0.4.0+9", "0.4.0+1", "0.4.0", "0.3.0"]
+        );
     }
 }

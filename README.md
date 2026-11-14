@@ -75,6 +75,16 @@ Setting `ecosystems.<id>.enabled` to `false` turns an ecosystem off. Its manifes
 
 The plugin sends only package names, the OSV ecosystem names and the declared versions. Packages of disabled ecosystems and packages in `ignore` are not sent. The plugin sends no secrets and no account data, and it has no telemetry.
 
+### Private and local packages
+
+The plugin does not send a package that the manifest takes from a source other than the public registry. It reads these signs:
+
+- An entry with a local or private source is skipped: `path`, `git`, `hosted` (not pub.dev), `registry` and `source` (not the public index) options, `[tool.uv.sources]`, a Go `replace`, a Maven `system` scope, and Gemfile `path`, `git` and `source` blocks, `git_source` keys and `**options`.
+- A manifest-wide private source hides the whole file, because any of its packages can come from that source: a pip `--index-url`, `--extra-index-url` or `--find-links` that is not the public PyPI index, a uv `index`, `index-url`, `extra-index-url` or `find-links` setting or a Poetry `[[tool.poetry.source]]` that is not explicit and not the public index, a Composer repository other than Packagist, a Maven `<repositories>` entry other than Maven Central, and a Gemfile `source` other than `https://rubygems.org`.
+- A public source does not hide anything: `source 'https://rubygems.org'`, `hosted: https://pub.dev`, `source = "pypi"`, and the public Packagist or PyPI URLs.
+
+The plugin reads only the text of the manifest. A private source that a tool sets outside the manifest, such as a pip configuration file or an environment variable, is not seen.
+
 ## Settings
 
 | Key | Type | Default | Meaning |
@@ -99,7 +109,7 @@ Add the package name to `ignore`, for example `["serde", "left-pad"]`. The name 
 - The IDE unloads an idle plugin after about five minutes, and the in-memory cache is then empty. The "→ x" decorations stay on screen, but the update quick fix is unavailable until the next save or "Dependency Lens: Refresh".
 - "Dependency Lens: Refresh" reads the file again, but it answers from the cache while the entries are younger than `cacheTtlSeconds`.
 - The update quick fix writes the exact latest version. A compatible-release requirement such as `~=2.28` (Python) or `~> 7.0` (Ruby) becomes narrower after the fix (`~=2.31.0`).
-- Unlisted and deprecated package states are not shown.
+- Unlisted and deprecated package states are not shown. For NuGet, the latest release can be a version that its author unlisted, because the version index does not tell them apart.
 - The Maven parser reads the `project/properties` block only, for `${name}` version placeholders.
 - Composer `-p1` and `-patch` stabilities count as prereleases.
 
