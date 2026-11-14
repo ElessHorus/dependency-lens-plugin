@@ -118,6 +118,10 @@ pub fn parse(text: &str) -> Vec<Dependency> {
     let mut tokens = Vec::new();
     let mut open_blocks: Vec<OpenBlock> = Vec::new();
     let mut pending_gem: Option<PendingGem<'_>> = None;
+    // Option keys that `git_source(:name)` defines. Each one names a non-registry source.
+    let mut custom_source_keys: Vec<&str> = Vec::new();
+    // A non-public global `source` may serve any gem, so it hides the whole file.
+    let mut has_private_global_source = false;
     for (index, line) in text.lines().enumerate() {
         let Ok(line_number) = u32::try_from(index) else {
             break;
@@ -132,7 +136,7 @@ pub fn parse(text: &str) -> Vec<Dependency> {
             }
             gem.open_brackets += bracket_balance(&tokens);
             if !continues_on_next_line(&tokens, gem.open_brackets) {
-                finish_gem(pending_gem.take(), &mut dependencies);
+                finish_gem(pending_gem.take(), &custom_source_keys, &mut dependencies);
             }
         } else if is_gem_line(&tokens) {
             // A gem line never opens a block, so the stack is read but not changed.
@@ -154,9 +158,18 @@ pub fn parse(text: &str) -> Vec<Dependency> {
                     open_brackets,
                 });
             } else if !is_hidden {
-                dependencies.extend(parse_gem(&tokens, tokens.len(), line_number, in_dev_block));
+                dependencies.extend(parse_gem(
+                    &tokens,
+                    tokens.len(),
+                    line_number,
+                    in_dev_block,
+                    &custom_source_keys,
+                ));
             }
         } else {
+            custom_source_keys.extend(git_source_key(&tokens));
+            has_private_global_source |=
+                is_global_source_call(&tokens) && opens_custom_source(&tokens);
             // A close with no open block is ignored. A line such as `end.each do |x|`
             // closes one block and opens the next, so the close comes first.
             if starts_with_closer(&tokens) {
@@ -176,12 +189,44 @@ pub fn parse(text: &str) -> Vec<Dependency> {
             }
         }
     }
-    finish_gem(pending_gem, &mut dependencies);
+    finish_gem(pending_gem, &custom_source_keys, &mut dependencies);
+    if has_private_global_source {
+        return Vec::new();
+    }
     dependencies
 }
 
+/// Returns the option key that a `git_source(:name)` line defines.
+fn git_source_key<'a>(tokens: &[Token<'a>]) -> Option<&'a str> {
+    if tokens.first()?.kind != Kind::Word("git_source") {
+        return None;
+    }
+    let argument = tokens
+        .get(1..)?
+        .iter()
+        .find(|token| !is_punct(token, b'('))?;
+    match argument.kind {
+        Kind::Symbol(key) | Kind::Str(key) => Some(key),
+        _ => None,
+    }
+}
+
+/// Returns `true` for a `source` call that is not a block, such as `source 'https://rubygems.org'`.
+fn is_global_source_call(tokens: &[Token<'_>]) -> bool {
+    tokens
+        .first()
+        .is_some_and(|token| token.kind == Kind::Word("source"))
+        && !tokens
+            .iter()
+            .any(|token| token.kind == Kind::Word("do") || is_punct(token, b'{'))
+}
+
 /// Returns the gem of a finished declaration, unless it is hidden.
-fn finish_gem(gem: Option<PendingGem<'_>>, dependencies: &mut Vec<Dependency>) {
+fn finish_gem(
+    gem: Option<PendingGem<'_>>,
+    custom_source_keys: &[&str],
+    dependencies: &mut Vec<Dependency>,
+) {
     if let Some(gem) = gem
         && !gem.is_hidden
     {
@@ -190,6 +235,7 @@ fn finish_gem(gem: Option<PendingGem<'_>>, dependencies: &mut Vec<Dependency>) {
             gem.first_line_length,
             gem.line_number,
             gem.in_dev_block,
+            custom_source_keys,
         ));
     }
 }
@@ -441,12 +487,13 @@ fn opens_development_group(tokens: &[Token<'_>]) -> bool {
 /// `first_line_length` is the number of tokens on the first line. The name and the
 /// constraints come from them alone, because a span needs the line of its token.
 /// The options come from all tokens. `in_dev_block` tells whether an open block is a
-/// development group.
+/// development group. `custom_source_keys` are the option keys that `git_source` defines.
 fn parse_gem(
     tokens: &[Token<'_>],
     first_line_length: usize,
     line_number: u32,
     in_dev_block: bool,
+    custom_source_keys: &[&str],
 ) -> Option<Dependency> {
     let first_line = tokens.get(..first_line_length)?;
     let mut cursor = 1;
@@ -493,10 +540,16 @@ fn parse_gem(
 
     let mut is_group_dev = false;
     for option_index in index..tokens.len() {
+        // `**options` may hold any source option, so the gem is not read.
+        if punct_at(tokens, option_index, b'*') && punct_at(tokens, option_index + 1, b'*') {
+            return None;
+        }
         let Some(key) = option_key(tokens, option_index) else {
             continue;
         };
-        if names_custom_source(key, option_value(tokens, option_index)) {
+        if names_custom_source(key, option_value(tokens, option_index))
+            || custom_source_keys.contains(&key)
+        {
             return None;
         }
         if GROUP_OPTION_KEYS.contains(&key) {
@@ -546,11 +599,18 @@ fn parse_requirement(content: &str) -> Option<Requirement<'_>> {
     })
 }
 
-/// Returns the key of an option at `index`, for `key: value` and `:key => value`.
+/// Returns the key of an option at `index`, for `key: value`, `:key => value`,
+/// `'key' => value` and `"key": value`.
 fn option_key<'a>(tokens: &[Token<'a>], index: usize) -> Option<&'a str> {
     let token = tokens.get(index)?;
     match token.kind {
         Kind::Word(key) if punct_at(tokens, index + 1, b':') => Some(key),
+        Kind::Str(key)
+            if punct_at(tokens, index + 1, b':')
+                || (punct_at(tokens, index + 1, b'=') && punct_at(tokens, index + 2, b'>')) =>
+        {
+            Some(key)
+        }
         Kind::Symbol(key)
             if punct_at(tokens, index + 1, b'=') && punct_at(tokens, index + 2, b'>') =>
         {
@@ -1217,6 +1277,70 @@ gem 'outside', '2.0'
         assert_eq!(
             summary(&parse(manifest)),
             [("outside", "2.0", false, false)]
+        );
+    }
+
+    #[test]
+    fn a_non_public_global_source_hides_every_gem_of_the_file() {
+        for source_line in [
+            "source 'https://gems.example.com'",
+            "source ENV['GEM_SOURCE']",
+            "source(\"https://gems.example.com\")",
+        ] {
+            // The order does not matter: Bundler may take any gem from any global source.
+            for manifest in [
+                format!("source 'https://rubygems.org'\n{source_line}\ngem 'a', '1.0'\n"),
+                format!("source 'https://rubygems.org'\ngem 'a', '1.0'\n{source_line}\n"),
+            ] {
+                assert!(
+                    parse(&manifest).is_empty(),
+                    "{source_line} must hide the file"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn public_global_sources_and_one_line_source_blocks_do_not_hide_the_file() {
+        let manifest = "\
+source 'https://rubygems.org'
+source('https://gems.example.com') { gem 'hidden_by_the_line', '1.0' }
+gem 'kept', '2.0'
+";
+        assert_eq!(summary(&parse(manifest)), [("kept", "2.0", false, false)]);
+    }
+
+    #[test]
+    fn keys_defined_by_git_source_make_a_gem_non_registry() {
+        let manifest = "\
+git_source(:acme) { |repo| \"https://git.acme.internal/#{repo}.git\" }
+git_source :corp do |repo|
+  \"https://git.corp.internal/#{repo}.git\"
+end
+gem 'secret', '1.0', acme: 'org/secret'
+gem 'secret_rocket', '1.0', :corp => 'org/secret'
+gem 'kept', '2.0', other: 'value'
+";
+        assert_eq!(summary(&parse(manifest)), [("kept", "2.0", false, false)]);
+    }
+
+    #[test]
+    fn string_keys_and_option_splats_are_read_as_source_options() {
+        let manifest = "\
+gem 'a', '1.0', 'git' => 'https://example.com/a.git'
+gem 'b', '1.0', \"path\": '../b'
+gem 'c', '1.0', 'source' => 'https://gems.example.com'
+gem 'd', '1.0', **OPTIONS
+gem 'e', '1.0', require: false, **{ git: 'https://example.com/e.git' }
+gem 'public', '1.0', 'source' => 'https://rubygems.org'
+gem 'plain', '1.0', 'require' => false
+";
+        assert_eq!(
+            summary(&parse(manifest)),
+            [
+                ("public", "1.0", false, false),
+                ("plain", "1.0", false, false)
+            ]
         );
     }
 }
