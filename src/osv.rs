@@ -12,6 +12,10 @@ use std::time::Instant;
 /// Most advisory details fetched during one call to [`query_batch`].
 pub const MAX_DETAIL_FETCHES_PER_RUN: usize = 100;
 
+/// Advisories per queried package version whose details load without a request from the user.
+/// The others are deferred (see [`is_deferred`]) and load on demand.
+pub const DEFAULT_DETAILS_PER_QUERY: usize = 10;
+
 /// Most queries that OSV accepts in one `querybatch` request.
 const MAX_BATCH_QUERIES: usize = 1000;
 
@@ -23,6 +27,8 @@ const DETAIL_URL_PREFIX: &str = "https://api.osv.dev/v1/vulns/";
 const ADVISORY_URL_PREFIX: &str = "https://osv.dev/vulnerability/";
 /// Summary of the placeholder shown while the details of an advisory are not loaded.
 pub const PLACEHOLDER_SUMMARY: &str = "Details not loaded yet";
+/// Summary of an advisory whose details are left unloaded until the user asks for them.
+pub const DEFERRED_SUMMARY: &str = "Details load on request";
 /// Longest advisory summary kept, in characters.
 const SUMMARY_MAX_CHARS: usize = 200;
 const INVALID_RESPONSE: &str = "OSV: invalid response";
@@ -208,18 +214,49 @@ pub fn query_batch(
     now: u64,
     deadline: Option<Instant>,
 ) -> Result<Vec<Vec<Vulnerability>>, String> {
+    query_batch_limited(http, cache, queries, now, deadline, usize::MAX)
+}
+
+/// Like [`query_batch`], but only the first `details_per_query` advisories of each query load
+/// their details. The others come back as deferred advisories and cost no request.
+///
+/// # Errors
+///
+/// Returns an error when a `querybatch` request fails or its answer is malformed.
+pub fn query_batch_limited(
+    http: &dyn Http,
+    cache: &mut Cache,
+    queries: &[OsvQuery],
+    now: u64,
+    deadline: Option<Instant>,
+    details_per_query: usize,
+) -> Result<Vec<Vec<Vulnerability>>, String> {
     let mut advisory_ids_per_query: Vec<Vec<String>> = Vec::with_capacity(queries.len());
     for chunk in queries.chunks(MAX_BATCH_QUERIES) {
         advisory_ids_per_query.extend(query_chunk(http, chunk)?);
     }
-    let fetched = fetch_missing_details(http, cache, &advisory_ids_per_query, now, deadline);
+    let fetched = fetch_missing_details(
+        http,
+        cache,
+        &advisory_ids_per_query,
+        now,
+        deadline,
+        details_per_query,
+    );
     let cache: &Cache = cache;
     Ok(advisory_ids_per_query
         .iter()
         .map(|advisory_ids| {
             advisory_ids
                 .iter()
-                .map(|id| resolve_advisory(id, &fetched, cache, now))
+                .enumerate()
+                .map(|(position, id)| {
+                    if position >= details_per_query {
+                        deferred(id)
+                    } else {
+                        resolve_advisory(id, &fetched, cache, now)
+                    }
+                })
                 .collect()
         })
         .collect())
@@ -270,7 +307,8 @@ fn query_chunk(http: &dyn Http, chunk: &[OsvQuery]) -> Result<Vec<Vec<String>>, 
 
 /// Fetches the details of uncached advisory ids, at most [`MAX_DETAIL_FETCHES_PER_RUN`].
 ///
-/// Stops before the first request that would start at or after `deadline`.
+/// Only the first `details_per_query` ids of each query count. Stops before the first
+/// request that would start at or after `deadline`.
 /// Stores each fetched advisory in `cache` and returns the fetched advisories by id.
 fn fetch_missing_details<'a>(
     http: &dyn Http,
@@ -278,12 +316,13 @@ fn fetch_missing_details<'a>(
     advisory_ids_per_query: &'a [Vec<String>],
     now: u64,
     deadline: Option<Instant>,
+    details_per_query: usize,
 ) -> HashMap<&'a str, Vulnerability> {
     // One pass: `seen` drops repeats, and `take` stops the scan at the cap.
     let mut seen: HashSet<&str> = HashSet::new();
     let missing_ids: Vec<&str> = advisory_ids_per_query
         .iter()
-        .flatten()
+        .flat_map(|advisory_ids| advisory_ids.iter().take(details_per_query))
         .map(String::as_str)
         .filter(|id| cache.advisory(id, now).is_none() && seen.insert(*id))
         .take(MAX_DETAIL_FETCHES_PER_RUN)
@@ -337,6 +376,19 @@ fn placeholder(id: &str) -> Vulnerability {
         summary: PLACEHOLDER_SUMMARY.to_owned(),
         url: Some(advisory_url(id)),
     }
+}
+
+/// Returns the advisory shown for an id whose details wait for a request from the user.
+fn deferred(id: &str) -> Vulnerability {
+    Vulnerability {
+        summary: DEFERRED_SUMMARY.to_owned(),
+        ..placeholder(id)
+    }
+}
+
+/// Returns `true` when `vulnerability` is a deferred advisory: its details load on request.
+pub fn is_deferred(vulnerability: &Vulnerability) -> bool {
+    vulnerability.summary == DEFERRED_SUMMARY
 }
 
 /// Returns `true` when `vulnerability` is the placeholder of an advisory whose details are not loaded.
@@ -1223,5 +1275,90 @@ mod tests {
 
         assert_eq!(results.len(), queries.len());
         assert_eq!(*http.batch_sizes.borrow(), vec![MAX_BATCH_QUERIES, 1]);
+    }
+
+    // details_per_query
+
+    /// `count` advisory ids, in the order OSV would return them.
+    fn advisory_ids(count: usize) -> Vec<String> {
+        (0..count)
+            .map(|number| format!("GHSA-{number:04}"))
+            .collect()
+    }
+
+    /// Answers one query with all of `ids`, and every detail request with a minimal record.
+    fn http_with_advisories(ids: &[String]) -> FakeHttp {
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mut http = FakeHttp::new().route("POST", BATCH_URL, 200, &batch_body(&[&id_refs]));
+        for id in ids {
+            http = http.route("GET", &detail_url(id), 200, &detail_body(id));
+        }
+        http
+    }
+
+    #[test]
+    fn only_the_first_advisories_of_a_query_load_their_details() {
+        let ids = advisory_ids(15);
+        let http = http_with_advisories(&ids);
+        let mut cache = Cache::new(TTL_SECS);
+        let queries = [query("nokogiri", "1.10.0")];
+        let results = query_batch_limited(
+            &http,
+            &mut cache,
+            &queries,
+            NOW,
+            None,
+            DEFAULT_DETAILS_PER_QUERY,
+        )
+        .unwrap();
+
+        let list = &results[0];
+        assert_eq!(list.len(), 15);
+        assert!(
+            list[..10]
+                .iter()
+                .all(|advisory| !is_placeholder(advisory) && !is_deferred(advisory))
+        );
+        assert!(list[10..].iter().all(is_deferred));
+        // A deferred advisory is not a retry placeholder: nothing is waiting to be fetched for it.
+        assert!(list[10..].iter().all(|advisory| !is_placeholder(advisory)));
+        assert_eq!(http.count(DETAIL_URL_PREFIX), 10);
+    }
+
+    #[test]
+    fn a_larger_limit_loads_the_deferred_advisories_and_keeps_the_cached_ones() {
+        let ids = advisory_ids(15);
+        let http = http_with_advisories(&ids);
+        let mut cache = Cache::new(TTL_SECS);
+        let queries = [query("nokogiri", "1.10.0")];
+        query_batch_limited(
+            &http,
+            &mut cache,
+            &queries,
+            NOW,
+            None,
+            DEFAULT_DETAILS_PER_QUERY,
+        )
+        .unwrap();
+        let results =
+            query_batch_limited(&http, &mut cache, &queries, NOW, None, usize::MAX).unwrap();
+        assert!(
+            results[0]
+                .iter()
+                .all(|advisory| !is_placeholder(advisory) && !is_deferred(advisory))
+        );
+        // The ten loaded advisories are read from the cache, so only five more requests go out.
+        assert_eq!(http.count(DETAIL_URL_PREFIX), 15);
+    }
+
+    #[test]
+    fn the_unlimited_query_batch_loads_every_advisory() {
+        let ids = advisory_ids(15);
+        let http = http_with_advisories(&ids);
+        let mut cache = Cache::new(TTL_SECS);
+        let results =
+            query_batch(&http, &mut cache, &[query("nokogiri", "1.10.0")], NOW, None).unwrap();
+        assert!(results[0].iter().all(|advisory| !is_deferred(advisory)));
+        assert_eq!(http.count(DETAIL_URL_PREFIX), 15);
     }
 }

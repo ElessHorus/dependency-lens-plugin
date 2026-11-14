@@ -42,6 +42,12 @@ Example: `→ 2.31.0 · ⚠ 2 vulnerabilities`.
 
 The hover shows the package name and the declared version. It adds the latest version when one is newer, and the reason when a check failed. When advisories exist, it adds the checked version and one line per advisory. Each advisory line links to its OSV page when OSV gives a link.
 
+### Many advisories
+
+The plugin loads the details of the first 10 advisories of each package version. This keeps the first open of an old package fast, because each detail is one request. The decoration and the problem still show the exact number of advisories. The hover lists the 10 loaded advisories and adds one line, for example `15 more not loaded`. Advisories that are not loaded have an unknown severity, so the `minimumSeverity` setting does not hide them, and they do not set the problem severity.
+
+To load the others, run "Dependency Lens: Load all vulnerabilities" in the open manifest. One run loads up to 100 details. Run it again when more are left. The loaded details stay in the cache for `cacheTtlSeconds`. After that, the manifest shows 10 advisories again.
+
 ### Problems view
 
 Each dependency with advisories gets one problem, on its version text. The source is `Dependency Lens`. The code is the id of the most severe advisory. The message names the package, the version and the number of advisories.

@@ -3,7 +3,10 @@
 use crate::cache::{Cache, FailureKind};
 use crate::http::Http;
 use crate::model::{Dependency, Ecosystem, VersionInfo, Vulnerability};
-use crate::osv::{OsvQuery, declared_version_for_osv, is_placeholder, query_batch};
+use crate::osv::{
+    DEFAULT_DETAILS_PER_QUERY, OsvQuery, declared_version_for_osv, is_deferred, is_placeholder,
+    query_batch_limited,
+};
 use crate::settings::Settings;
 use crate::update::is_outdated;
 use openidea_plugin::HttpRequest;
@@ -50,10 +53,13 @@ pub struct Analysis {
     pub pending: usize,
 }
 
-/// Limits the registry lookups of one run, by count and by deadline.
+/// Limits the work of one run: registry lookups by count and by deadline, and the advisory
+/// details that load for each package version.
 pub struct Budget {
     lookups_left: usize,
     deadline: Option<Instant>,
+    /// Advisories per package version whose details load. The others are deferred.
+    details_per_query: usize,
 }
 
 impl Budget {
@@ -62,7 +68,19 @@ impl Budget {
         Self {
             lookups_left: max_lookups,
             deadline,
+            details_per_query: DEFAULT_DETAILS_PER_QUERY,
         }
+    }
+
+    /// Sets how many advisories per package version load their details. `usize::MAX` loads all.
+    pub fn with_detail_limit(mut self, details_per_query: usize) -> Self {
+        self.details_per_query = details_per_query;
+        self
+    }
+
+    /// Advisories per package version whose details load in this run.
+    pub(crate) fn details_per_query(&self) -> usize {
+        self.details_per_query
     }
 
     /// The instant at which the run must stop starting slow work, when one is set.
@@ -120,15 +138,7 @@ pub fn analyze(
         .map(|dependency| declared_version_for_osv(&dependency.version))
         .collect();
     let fresh_osv = if settings.vulnerabilities {
-        query_missing_vulnerabilities(
-            eco,
-            &kept,
-            &checked_versions,
-            cache,
-            http,
-            now,
-            budget.deadline(),
-        )
+        query_missing_vulnerabilities(eco, &kept, &checked_versions, cache, http, now, budget)
     } else {
         FreshOsv::default()
     };
@@ -274,10 +284,20 @@ fn request_version_info(
 const DETAILS_NOT_LOADED: &str = "OSV: advisory details not loaded";
 
 /// Counts the placeholders of `list` whose real record is not in the advisory cache.
-fn unresolved_count(list: &[Vulnerability], cache: &Cache, now: u64) -> usize {
+///
+/// A deferred advisory counts only when `loads_deferred` is set, that is when this run is
+/// allowed to load more than the default number of details.
+fn unresolved_count(
+    list: &[Vulnerability],
+    cache: &Cache,
+    now: u64,
+    loads_deferred: bool,
+) -> usize {
     list.iter()
         .filter(|vulnerability| {
-            is_placeholder(vulnerability) && cache.advisory(&vulnerability.id, now).is_none()
+            let waits_for_details =
+                is_placeholder(vulnerability) || (loads_deferred && is_deferred(vulnerability));
+            waits_for_details && cache.advisory(&vulnerability.id, now).is_none()
         })
         .count()
 }
@@ -297,8 +317,10 @@ fn query_missing_vulnerabilities(
     cache: &mut Cache,
     http: &dyn Http,
     now: u64,
-    deadline: Option<Instant>,
+    budget: &Budget,
 ) -> FreshOsv {
+    let details_per_query = budget.details_per_query();
+    let loads_deferred = details_per_query > DEFAULT_DETAILS_PER_QUERY;
     let mut fresh = FreshOsv::default();
     // Borrowed pairs: duplicates are found without copying the names.
     let mut seen: HashSet<(&str, &str)> = HashSet::new();
@@ -310,7 +332,7 @@ fn query_missing_vulnerabilities(
             continue;
         };
         let unresolved = match cache.vulnerabilities(eco, &dependency.name, version, now) {
-            Some(list) => match unresolved_count(list, cache, now) {
+            Some(list) => match unresolved_count(list, cache, now, loads_deferred) {
                 0 => continue,
                 count => Some(count),
             },
@@ -333,12 +355,20 @@ fn query_missing_vulnerabilities(
     if queries.is_empty() {
         return fresh;
     }
-    match query_batch(http, cache, &queries, now, deadline) {
+    match query_batch_limited(
+        http,
+        cache,
+        &queries,
+        now,
+        budget.deadline(),
+        details_per_query,
+    ) {
         Ok(results) => {
             for ((query, before), vulnerabilities) in
                 queries.iter().zip(unresolved_before).zip(results)
             {
-                let unresolved_after = unresolved_count(&vulnerabilities, cache, now);
+                let unresolved_after =
+                    unresolved_count(&vulnerabilities, cache, now, loads_deferred);
                 // A pair never queried starts with every advisory unresolved.
                 let made_no_progress = unresolved_after > 0
                     && unresolved_after >= before.unwrap_or(vulnerabilities.len());
@@ -399,8 +429,8 @@ impl FreshOsv {
 ///
 /// Advisories below `minimum_severity` are filtered here, at read time, so a
 /// change of the setting applies to answers that are already cached. A placeholder
-/// is replaced by its advisory once that is cached, and is never filtered: its
-/// severity is unknown, so it must stay visible.
+/// is replaced by its advisory once that is cached. A placeholder and a deferred advisory
+/// are never filtered: their severity is unknown, so they must stay visible.
 fn build_entry(
     eco: Ecosystem,
     dependency: Dependency,
@@ -433,7 +463,9 @@ fn build_entry(
             } else {
                 cached
             };
-            (is_placeholder(current) || current.severity >= settings.minimum_severity)
+            (is_placeholder(current)
+                || is_deferred(current)
+                || current.severity >= settings.minimum_severity)
                 .then(|| current.clone())
         })
         .collect();
@@ -1699,11 +1731,23 @@ mod tests {
                 .count()
         };
 
-        let first = run(&mut cache, &http, &Settings::default(), NOW, SINGLE_SERDE);
+        // The run loads every advisory, so the cap of 100 details per run is what limits it.
+        let run_unlimited = |cache: &mut Cache| {
+            analyze(
+                Ecosystem::Cargo,
+                parsers::cargo::parse(SINGLE_SERDE),
+                cache,
+                &http,
+                &Settings::default(),
+                NOW,
+                &mut Budget::new(usize::MAX, None).with_detail_limit(usize::MAX),
+            )
+        };
+        let first = run_unlimited(&mut cache);
         assert_eq!(http.count(DETAIL_PREFIX), 100);
         assert_eq!(count_placeholders(&first), 20);
 
-        let second = run(&mut cache, &http, &Settings::default(), NOW, SINGLE_SERDE);
+        let second = run_unlimited(&mut cache);
         assert_eq!(http.count(DETAIL_PREFIX), 120);
         assert_eq!(count_placeholders(&second), 0);
         assert_eq!(entry(&second, "serde").vulnerabilities.len(), 120);
@@ -1758,5 +1802,106 @@ mod tests {
         // expire, the second chunk refetches them, and the pending count stays the same.
         let pending = pending_after_each_chunk(5, 10, 3);
         assert_eq!(pending[0], pending[1]);
+    }
+
+    /// A manifest with one crate whose OSV answer lists `count` advisories, each with a detail route.
+    fn http_with_many_advisories(count: usize) -> FakeHttp {
+        let ids: Vec<String> = (0..count)
+            .map(|number| format!("GHSA-{number:04}"))
+            .collect();
+        let vulns: Vec<String> = ids.iter().map(|id| format!(r#"{{"id":"{id}"}}"#)).collect();
+        let mut http = FakeHttp::new().route(
+            "POST",
+            BATCH_URL,
+            200,
+            &format!(r#"{{"results":[{{"vulns":[{}]}}]}}"#, vulns.join(",")),
+        );
+        for id in &ids {
+            http = http.route(
+                "GET",
+                &format!("{DETAIL_PREFIX}{id}"),
+                200,
+                &detail_body(id, "HIGH"),
+            );
+        }
+        http
+    }
+
+    const OLD_CRATE: &str = "[dependencies]\nold = \"1.0.0\"\n";
+
+    #[test]
+    fn only_ten_advisories_load_their_details_and_the_rest_wait_for_a_request() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = http_with_many_advisories(15);
+        let analysis = run(&mut cache, &http, &Settings::default(), NOW, OLD_CRATE);
+        let old = entry(&analysis, "old");
+        assert_eq!(old.vulnerabilities.len(), 15);
+        let deferred = old
+            .vulnerabilities
+            .iter()
+            .filter(|v| crate::osv::is_deferred(v))
+            .count();
+        assert_eq!(deferred, 5);
+        assert_eq!(http.count(DETAIL_PREFIX), 10);
+        // Deferred advisories are not a failure, so the status stays clean.
+        assert_eq!(old.status, Status::NotChecked);
+
+        // A second run reads the cache: no new OSV request, and no retry of the deferred ones.
+        let again = run(&mut cache, &http, &Settings::default(), NOW + 1, OLD_CRATE);
+        assert_eq!(entry(&again, "old").vulnerabilities.len(), 15);
+        assert_eq!(http.count(BATCH_URL), 1);
+        assert_eq!(http.count(DETAIL_PREFIX), 10);
+    }
+
+    #[test]
+    fn a_larger_detail_limit_loads_the_deferred_advisories() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = http_with_many_advisories(15);
+        run(&mut cache, &http, &Settings::default(), NOW, OLD_CRATE);
+
+        let mut budget = Budget::new(usize::MAX, None).with_detail_limit(usize::MAX);
+        let analysis = analyze(
+            Ecosystem::Cargo,
+            parsers::cargo::parse(OLD_CRATE),
+            &mut cache,
+            &http,
+            &Settings::default(),
+            NOW + 1,
+            &mut budget,
+        );
+        let old = entry(&analysis, "old");
+        assert!(
+            old.vulnerabilities
+                .iter()
+                .all(|v| !crate::osv::is_deferred(v))
+        );
+        assert_eq!(old.vulnerabilities.len(), 15);
+        assert_eq!(http.count(DETAIL_PREFIX), 15);
+
+        // The complete list is cached, so a default run keeps it.
+        let after = run(&mut cache, &http, &Settings::default(), NOW + 2, OLD_CRATE);
+        assert!(
+            entry(&after, "old")
+                .vulnerabilities
+                .iter()
+                .all(|v| !crate::osv::is_deferred(v))
+        );
+        assert_eq!(http.count(BATCH_URL), 2);
+    }
+
+    #[test]
+    fn deferred_advisories_stay_visible_under_a_high_minimum_severity() {
+        // Their severity is unknown until they load, so the filter cannot hide them.
+        let mut cache = Cache::new(TTL_SECS);
+        let http = http_with_many_advisories(15);
+        let settings = Settings {
+            minimum_severity: AdvisorySeverity::Critical,
+            ..Settings::default()
+        };
+        let analysis = run(&mut cache, &http, &settings, NOW, OLD_CRATE);
+        let old = entry(&analysis, "old");
+        // The ten loaded advisories are High, so only the five deferred ones remain.
+        assert_eq!(old.vulnerabilities.len(), 5);
+        assert!(old.vulnerabilities.iter().all(crate::osv::is_deferred));
     }
 }

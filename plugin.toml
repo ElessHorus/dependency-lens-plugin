@@ -29,6 +29,11 @@ id = "refresh"
 title = "Dependency Lens: Refresh"
 category = "Dependency Lens"
 
+[[contributes.commands]]
+id = "load-vulnerabilities"
+title = "Dependency Lens: Load all vulnerabilities"
+category = "Dependency Lens"
+
 [[contributes.providers]]
 kinds = ["code-actions"]
 languages = ["*"]
