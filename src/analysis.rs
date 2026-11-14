@@ -1713,4 +1713,55 @@ mod tests {
         assert_eq!(count_placeholders(&second), 0);
         assert_eq!(entry(&second, "serde").vulnerabilities.len(), 120);
     }
+
+    /// Runs `chunk_count` chunks of two registry lookups each over four gems and returns the pending count after each.
+    ///
+    /// `clock_step_secs` moves the clock between chunks, like a slow chunk does.
+    fn pending_after_each_chunk(
+        ttl_secs: u64,
+        clock_step_secs: u64,
+        chunk_count: usize,
+    ) -> Vec<usize> {
+        const GEMFILE: &str = "gem 'a', '1.0'\ngem 'b', '1.0'\ngem 'c', '1.0'\ngem 'd', '1.0'\n";
+        let mut http = FakeHttp::new().route("POST", BATCH_URL, 200, &batch_body(4));
+        for name in ["a", "b", "c", "d"] {
+            http = http.route(
+                "GET",
+                &format!("https://rubygems.org/api/v1/versions/{name}.json"),
+                200,
+                r#"[{"number":"2.0","prerelease":false}]"#,
+            );
+        }
+        let mut cache = Cache::new(ttl_secs);
+        (0..chunk_count)
+            .map(|chunk_index| {
+                let mut budget = Budget::new(2, None);
+                let now = NOW + clock_step_secs * chunk_index as u64;
+                let analysis = analyze(
+                    Ecosystem::RubyGems,
+                    parsers::ruby::parse(GEMFILE),
+                    &mut cache,
+                    &http,
+                    &Settings::default(),
+                    now,
+                    &mut budget,
+                );
+                analysis.pending
+            })
+            .collect()
+    }
+
+    #[test]
+    fn chunks_that_share_one_clock_reading_resolve_every_gem_with_a_short_ttl() {
+        // The plugin reads the clock once per run, so entries of an earlier chunk stay fresh.
+        assert_eq!(pending_after_each_chunk(5, 0, 3), [2, 0, 0]);
+    }
+
+    #[test]
+    fn a_clock_that_passes_the_ttl_between_chunks_makes_no_progress() {
+        // This is why the run must not read the clock again per chunk: the first two answers
+        // expire, the second chunk refetches them, and the pending count stays the same.
+        let pending = pending_after_each_chunk(5, 10, 3);
+        assert_eq!(pending[0], pending[1]);
+    }
 }

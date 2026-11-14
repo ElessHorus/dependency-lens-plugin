@@ -1,7 +1,7 @@
 //! Code actions: quick fixes that bump an outdated requirement to the latest registry release.
 
 use crate::cache::Cache;
-use crate::is_manifest;
+use crate::is_manifest_in;
 use crate::model::{Dependency, Ecosystem};
 use crate::osv::declared_version_for_osv;
 use crate::settings::Settings;
@@ -17,11 +17,12 @@ pub fn code_actions(
     cache: &Cache,
     settings: &Settings,
     doc_path: &str,
+    project_root: Option<&str>,
     doc_text: &str,
     selection: Range,
     now: u64,
 ) -> Vec<CodeAction> {
-    if !is_manifest(doc_path) {
+    if !is_manifest_in(doc_path, project_root) {
         return Vec::new();
     }
     let Some(eco) = Ecosystem::detect(doc_path) else {
@@ -120,7 +121,15 @@ mod tests {
     }
 
     fn actions_for(cache: &Cache, settings: &Settings, selection: Range) -> Vec<CodeAction> {
-        code_actions(cache, settings, DOC_PATH, DOC_TEXT, selection, NOW)
+        code_actions(
+            cache,
+            settings,
+            DOC_PATH,
+            Some("/p"),
+            DOC_TEXT,
+            selection,
+            NOW,
+        )
     }
 
     #[test]
@@ -193,6 +202,7 @@ mod tests {
             &cache,
             &Settings::default(),
             DOC_PATH,
+            Some("/p"),
             DOC_TEXT,
             cursor_on(0),
             NOW + 60,
@@ -212,6 +222,7 @@ mod tests {
                 &cache,
                 &Settings::default(),
                 path,
+                Some("/p"),
                 DOC_TEXT,
                 cursor_on(0),
                 NOW,

@@ -228,6 +228,25 @@ fn files_that_are_not_manifests_are_never_read_or_queried() {
 }
 
 #[test]
+fn a_project_under_a_skipped_folder_name_is_still_analyzed() {
+    // Only folders inside the project are skipped. The project itself may sit under `vendor`.
+    let host = host_counting_fetches(Rc::new(Cell::new(0)));
+    host.set_project_root(Some("/srv/vendor/app"));
+    host.add_file("Cargo.toml", MANIFEST);
+    host.add_file("target/Cargo.toml", MANIFEST);
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[
+            Event::FileOpened("/srv/vendor/app/Cargo.toml".to_owned()),
+            Event::FileOpened("/srv/vendor/app/target/Cargo.toml".to_owned()),
+        ],
+        &host.invocation(),
+    );
+    assert_eq!(diagnostics_of(&host, "/srv/vendor/app/Cargo.toml").len(), 1);
+    assert!(diagnostics_of(&host, "/srv/vendor/app/target/Cargo.toml").is_empty());
+}
+
+#[test]
 fn opening_an_unchanged_manifest_again_makes_no_request() {
     let fetches = Rc::new(Cell::new(0));
     let host = host_counting_fetches(fetches.clone());

@@ -129,10 +129,13 @@ impl DependencyLens {
         deadline: Instant,
     ) {
         let chunk = self.chunk_size();
+        // One clock reading serves the whole run. With a cache lifetime shorter than a chunk, a
+        // fresh reading per chunk would expire the answers of the chunk before and repeat its work.
+        let run_started_at = now_secs();
         let mut previous_pending = None;
         loop {
             // The dependency vector is cloned per chunk; the parse is not repeated.
-            // Each chunk gets its own deadline. The first registry lookup of a chunk always runs,
+            // Each chunk gets its own deadline. The first registry lookup of a chunk runs unless the deadline has passed,
             // and the OSV phase stops fetching advisory details once the deadline has passed.
             let mut budget = Budget::new(chunk, Some(Instant::now() + CHUNK_LIMIT));
             let analysis = analyze(
@@ -141,7 +144,7 @@ impl DependencyLens {
                 &mut self.cache,
                 &HostHttp,
                 &self.settings,
-                now_secs(),
+                run_started_at,
                 &mut budget,
             );
             publish_analysis(path, text, &analysis);
@@ -231,11 +234,34 @@ fn now_secs() -> u64 {
 }
 
 /// Whether `path` is a manifest the plugin analyzes, outside dependency and build folders.
+///
+/// Only the folders inside the project count as skipped, so a project that sits under a
+/// folder named `vendor` or `target` is still analyzed.
 pub(crate) fn is_manifest(path: &str) -> bool {
-    Ecosystem::detect(path).is_some()
-        && !path
-            .split(['/', '\\'])
-            .any(|part| SKIPPED_DIRECTORIES.contains(&part))
+    // `&&` stops at the cheap name check, so the host is asked only for real manifest names.
+    Ecosystem::detect(path).is_some() && is_manifest_in(path, project_root_of(path).as_deref())
+}
+
+/// The root of the open project that holds `path`, when the host knows one.
+fn project_root_of(path: &str) -> Option<String> {
+    host::project_of(path)?.root().ok()
+}
+
+/// Whether `path` is a manifest of the project at `project_root`. It does not ask the host.
+pub(crate) fn is_manifest_in(path: &str, project_root: Option<&str>) -> bool {
+    Ecosystem::detect(path).is_some() && !is_in_skipped_directory(path, project_root)
+}
+
+/// Whether `path` lies in a skipped folder, looking only at the part below `project_root`.
+///
+/// Without a project root, the whole path is checked.
+fn is_in_skipped_directory(path: &str, project_root: Option<&str>) -> bool {
+    let relative_path = project_root
+        .and_then(|root| path.strip_prefix(root.trim_end_matches(['/', '\\'])))
+        .unwrap_or(path);
+    relative_path
+        .split(['/', '\\'])
+        .any(|part| SKIPPED_DIRECTORIES.contains(&part))
 }
 
 impl Plugin for DependencyLens {
@@ -317,6 +343,7 @@ impl Providers for DependencyLens {
             &self.cache,
             &self.settings,
             &doc.path,
+            project_root_of(&doc.path).as_deref(),
             &doc.text,
             selection,
             now_secs(),
