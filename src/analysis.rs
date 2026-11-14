@@ -1,0 +1,1716 @@
+//! Analysis pipeline: turns parsed dependencies into entries with status and advisories.
+
+use crate::cache::{Cache, FailureKind};
+use crate::http::Http;
+use crate::model::{Dependency, Ecosystem, VersionInfo, Vulnerability};
+use crate::osv::{OsvQuery, declared_version_for_osv, is_placeholder, query_batch};
+use crate::settings::Settings;
+use crate::update::is_outdated;
+use openidea_plugin::HttpRequest;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+
+/// Result of checking one dependency.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Status {
+    /// The registry lookup is still running.
+    Pending,
+    /// The declared version is the newest release.
+    UpToDate,
+    /// A newer release exists.
+    Outdated {
+        /// Newest release reported by the registry.
+        latest: String,
+    },
+    /// The check failed, with the reason.
+    Unknown(String),
+    /// The check did not run.
+    NotChecked,
+}
+
+/// One analyzed dependency.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entry {
+    /// The dependency as declared in the manifest.
+    pub dependency: Dependency,
+    /// Result of the check.
+    pub status: Status,
+    /// Advisories that affect the checked version, at or above the minimum severity.
+    pub vulnerabilities: Vec<Vulnerability>,
+    /// Version that was checked, or `None` when the requirement names no registry version.
+    pub checked_version: Option<String>,
+}
+
+/// Analysis result for one manifest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Analysis {
+    /// One entry per analyzed dependency, in manifest order.
+    pub entries: Vec<Entry>,
+    /// Number of entries whose check is still running.
+    pub pending: usize,
+}
+
+/// Limits the registry lookups of one run, by count and by deadline.
+pub struct Budget {
+    lookups_left: usize,
+    deadline: Option<Instant>,
+}
+
+impl Budget {
+    /// Creates a budget for `max_lookups` lookups that ends at `deadline`, when one is set.
+    pub fn new(max_lookups: usize, deadline: Option<Instant>) -> Self {
+        Self {
+            lookups_left: max_lookups,
+            deadline,
+        }
+    }
+
+    /// The instant at which the run must stop starting slow work, when one is set.
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// Consumes one registry lookup; false when none is left or the deadline passed.
+    pub fn take(&mut self) -> bool {
+        // Count first: a spent budget never reads the clock.
+        if self.lookups_left == 0 {
+            return false;
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return false;
+        }
+        self.lookups_left -= 1;
+        true
+    }
+}
+
+/// Analyzes the dependencies of one manifest of ecosystem `eco`.
+///
+/// Queries OSV.dev once for every uncached `(name, version)` pair and stores the
+/// answers and failures in `cache`. For ecosystems that offer updates, looks up
+/// the registry for every checked dependency. Each registry lookup takes one unit
+/// of `budget`; entries past the budget stay [`Status::Pending`].
+pub fn analyze(
+    eco: Ecosystem,
+    deps: Vec<Dependency>,
+    cache: &mut Cache,
+    http: &dyn Http,
+    settings: &Settings,
+    now: u64,
+    budget: &mut Budget,
+) -> Analysis {
+    if !settings.is_enabled(eco) {
+        return Analysis {
+            entries: Vec::new(),
+            pending: 0,
+        };
+    }
+    // The ignore list is normalised once per call, so each dependency name is the only per-item work.
+    let ignored: HashSet<Cow<'_, str>> = settings
+        .ignore
+        .iter()
+        .map(|entry| eco.normalize_package(entry))
+        .collect();
+    let kept: Vec<Dependency> = deps
+        .into_iter()
+        .filter(|dependency| !ignored.contains(&eco.normalize_package(&dependency.name)))
+        .collect();
+    // Each declared version is parsed once; the query and the entry both reuse it.
+    let checked_versions: Vec<Option<String>> = kept
+        .iter()
+        .map(|dependency| declared_version_for_osv(&dependency.version))
+        .collect();
+    let fresh_osv = if settings.vulnerabilities {
+        query_missing_vulnerabilities(
+            eco,
+            &kept,
+            &checked_versions,
+            cache,
+            http,
+            now,
+            budget.deadline(),
+        )
+    } else {
+        FreshOsv::default()
+    };
+    let mut entries: Vec<Entry> = {
+        let cache_view: &Cache = cache;
+        kept.into_iter()
+            .zip(checked_versions)
+            .map(|(dependency, checked_version)| {
+                build_entry(
+                    eco,
+                    dependency,
+                    checked_version,
+                    cache_view,
+                    &fresh_osv,
+                    settings,
+                    now,
+                )
+            })
+            .collect()
+    };
+    let pending = if eco.offers_updates() {
+        resolve_registry(eco, &mut entries, cache, http, budget, now)
+    } else {
+        0
+    };
+    Analysis { entries, pending }
+}
+
+/// Registry outcome of one package name: the newest release, or the failure reason.
+type Lookup = Result<Option<String>, String>;
+
+/// Sets the registry status of every entry with a checked version. Returns how many stay pending.
+///
+/// An entry that already is [`Status::Unknown`] (an OSV failure) keeps that status and costs no request.
+///
+/// Each entry reads the cache first. A name that is missing from the cache gets one request
+/// per call, and the call-local map answers its duplicates even when the cache keeps nothing.
+fn resolve_registry(
+    eco: Ecosystem,
+    entries: &mut [Entry],
+    cache: &mut Cache,
+    http: &dyn Http,
+    budget: &mut Budget,
+    now: u64,
+) -> usize {
+    let mut fresh: HashMap<String, Lookup> = HashMap::new();
+    let mut pending_count = 0;
+    for entry in entries.iter_mut().filter(|entry| {
+        entry.checked_version.is_some() && !matches!(entry.status, Status::Unknown(_))
+    }) {
+        let name = eco.normalize_package(&entry.dependency.name);
+        let declared = entry.dependency.version.as_str();
+        let status = if let Some(info) = cache.version_info(eco, &name, now) {
+            status_from_lookup(eco, declared, Ok(info.latest.as_deref()))
+        } else if let Some(reason) = cache.failure(FailureKind::Registry, eco, &name, now) {
+            status_from_lookup(eco, declared, Err(reason))
+        } else if let Some(lookup) = fresh.get(&*name) {
+            status_from_lookup(eco, declared, lookup_view(lookup))
+        } else {
+            // The request is built before the budget is spent, so an invalid name costs no lookup.
+            // Its status is not cached, so a later fix of the manifest takes effect at once.
+            let Some(request) = eco.registry_request(&entry.dependency.name) else {
+                entry.status = Status::Unknown("registry: invalid package name".to_owned());
+                continue;
+            };
+            if budget.take() {
+                let lookup = lookup_registry(eco, request, &name, http, cache, now);
+                let status = status_from_lookup(eco, declared, lookup_view(&lookup));
+                fresh.insert(name.into_owned(), lookup);
+                status
+            } else {
+                pending_count += 1;
+                Status::Pending
+            }
+        };
+        entry.status = status;
+    }
+    pending_count
+}
+
+/// Borrows the parts of a lookup that the status needs.
+fn lookup_view(lookup: &Lookup) -> Result<Option<&str>, &str> {
+    lookup
+        .as_ref()
+        .map(|latest| latest.as_deref())
+        .map_err(String::as_str)
+}
+
+/// Builds the registry status of one entry from its lookup outcome.
+fn status_from_lookup(
+    eco: Ecosystem,
+    declared: &str,
+    lookup: Result<Option<&str>, &str>,
+) -> Status {
+    match lookup {
+        Err(reason) => Status::Unknown(reason.to_owned()),
+        Ok(None) => Status::Unknown("registry: no version found".to_owned()),
+        Ok(Some(latest)) if is_outdated(eco, declared, latest) => Status::Outdated {
+            latest: latest.to_owned(),
+        },
+        Ok(Some(_)) => Status::UpToDate,
+    }
+}
+
+/// Sends `request` to the registry, stores the answer or the failure under `name`, and returns the outcome.
+fn lookup_registry(
+    eco: Ecosystem,
+    request: HttpRequest,
+    name: &str,
+    http: &dyn Http,
+    cache: &mut Cache,
+    now: u64,
+) -> Lookup {
+    match request_version_info(eco, &request, http) {
+        Ok(info) => {
+            let latest = info.latest.clone();
+            cache.put_version_info(eco, name, info, now);
+            Ok(latest)
+        }
+        Err(reason) => {
+            cache.put_failure(FailureKind::Registry, eco, name, reason.clone(), now);
+            Err(reason)
+        }
+    }
+}
+
+/// Sends the registry `request` and reads the answer. Errors carry the `registry:` prefix.
+fn request_version_info(
+    eco: Ecosystem,
+    request: &HttpRequest,
+    http: &dyn Http,
+) -> Result<VersionInfo, String> {
+    let response = http
+        .send(request)
+        .map_err(|message| format!("registry: {message}"))?;
+    if !(200..=299).contains(&response.status) {
+        return Err(format!("registry: HTTP {}", response.status));
+    }
+    eco.parse_registry(&String::from_utf8_lossy(&response.body))
+}
+
+/// Reason stored when an OSV re-query loads no advisory detail.
+const DETAILS_NOT_LOADED: &str = "OSV: advisory details not loaded";
+
+/// Counts the placeholders of `list` whose real record is not in the advisory cache.
+fn unresolved_count(list: &[Vulnerability], cache: &Cache, now: u64) -> usize {
+    list.iter()
+        .filter(|vulnerability| {
+            is_placeholder(vulnerability) && cache.advisory(&vulnerability.id, now).is_none()
+        })
+        .count()
+}
+
+/// Sends one OSV batch for the checked pairs that have no usable cached answer and no recent failure.
+///
+/// A cached answer is not usable while it holds a placeholder without a cached advisory (ruling
+/// R35): the pair is queried again, and `fetch_missing_details` loads the details within its cap.
+/// A query that leaves as many unresolved placeholders as it started with stores a 60 s failure,
+/// so the package is not queried again at once. A query that makes progress stores none, so the
+/// next chunk continues at once. Stores each answer, or the failure reason for every queried package,
+/// in the cache and in the returned [`FreshOsv`].
+fn query_missing_vulnerabilities(
+    eco: Ecosystem,
+    deps: &[Dependency],
+    checked_versions: &[Option<String>],
+    cache: &mut Cache,
+    http: &dyn Http,
+    now: u64,
+    deadline: Option<Instant>,
+) -> FreshOsv {
+    let mut fresh = FreshOsv::default();
+    // Borrowed pairs: duplicates are found without copying the names.
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    let mut queries: Vec<OsvQuery> = Vec::new();
+    // Unresolved placeholders of a cached pair before its re-query; `None` for a pair never queried.
+    let mut unresolved_before: Vec<Option<usize>> = Vec::new();
+    for (dependency, checked_version) in deps.iter().zip(checked_versions) {
+        let Some(version) = checked_version.as_deref() else {
+            continue;
+        };
+        let unresolved = match cache.vulnerabilities(eco, &dependency.name, version, now) {
+            Some(list) => match unresolved_count(list, cache, now) {
+                0 => continue,
+                count => Some(count),
+            },
+            None => None,
+        };
+        if cache
+            .failure(FailureKind::Osv, eco, &dependency.name, now)
+            .is_some()
+            || !seen.insert((dependency.name.as_str(), version))
+        {
+            continue;
+        }
+        queries.push(OsvQuery {
+            ecosystem: eco,
+            name: dependency.name.clone(),
+            version: version.to_owned(),
+        });
+        unresolved_before.push(unresolved);
+    }
+    if queries.is_empty() {
+        return fresh;
+    }
+    match query_batch(http, cache, &queries, now, deadline) {
+        Ok(results) => {
+            for ((query, before), vulnerabilities) in
+                queries.iter().zip(unresolved_before).zip(results)
+            {
+                let unresolved_after = unresolved_count(&vulnerabilities, cache, now);
+                // A pair never queried starts with every advisory unresolved.
+                let made_no_progress = unresolved_after > 0
+                    && unresolved_after >= before.unwrap_or(vulnerabilities.len());
+                fresh
+                    .found
+                    .entry(query.name.clone())
+                    .or_default()
+                    .insert(query.version.clone(), vulnerabilities.clone());
+                cache.put_vulnerabilities(eco, &query.name, &query.version, vulnerabilities, now);
+                if made_no_progress {
+                    fresh
+                        .failed
+                        .insert(query.name.clone(), DETAILS_NOT_LOADED.to_owned());
+                    cache.put_failure(
+                        FailureKind::Osv,
+                        eco,
+                        &query.name,
+                        DETAILS_NOT_LOADED.to_owned(),
+                        now,
+                    );
+                }
+            }
+        }
+        Err(reason) => {
+            for query in &queries {
+                fresh.failed.insert(query.name.clone(), reason.clone());
+                cache.put_failure(FailureKind::Osv, eco, &query.name, reason.clone(), now);
+            }
+        }
+    }
+    fresh
+}
+
+/// What the OSV phase of one `analyze` call learned, kept for that call.
+///
+/// The cache stores nothing when `cacheTtlSeconds` is zero, so reading the answers back from the
+/// cache alone would hide every advisory and every OSV failure. Entries are built from this first.
+/// The maps are nested so a lookup borrows the name and the version instead of building a key.
+#[derive(Default)]
+struct FreshOsv {
+    /// Package name, then declared version, to the advisories OSV returned.
+    found: HashMap<String, HashMap<String, Vec<Vulnerability>>>,
+    /// Package name to the reason its OSV answer is missing or incomplete.
+    failed: HashMap<String, String>,
+}
+
+impl FreshOsv {
+    fn vulnerabilities(&self, name: &str, version: &str) -> Option<&[Vulnerability]> {
+        self.found.get(name)?.get(version).map(Vec::as_slice)
+    }
+
+    fn failure(&self, name: &str) -> Option<&str> {
+        self.failed.get(name).map(String::as_str)
+    }
+}
+
+/// Builds the entry of one dependency from cached data.
+///
+/// Advisories below `minimum_severity` are filtered here, at read time, so a
+/// change of the setting applies to answers that are already cached. A placeholder
+/// is replaced by its advisory once that is cached, and is never filtered: its
+/// severity is unknown, so it must stay visible.
+fn build_entry(
+    eco: Ecosystem,
+    dependency: Dependency,
+    checked_version: Option<String>,
+    cache: &Cache,
+    fresh: &FreshOsv,
+    settings: &Settings,
+    now: u64,
+) -> Entry {
+    if !settings.vulnerabilities {
+        return Entry {
+            dependency,
+            status: Status::NotChecked,
+            vulnerabilities: Vec::new(),
+            checked_version,
+        };
+    }
+    let vulnerabilities = checked_version
+        .as_deref()
+        .and_then(|version| {
+            fresh
+                .vulnerabilities(&dependency.name, version)
+                .or_else(|| cache.vulnerabilities(eco, &dependency.name, version, now))
+        })
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|cached| {
+            let current = if is_placeholder(cached) {
+                cache.advisory(&cached.id, now).unwrap_or(cached)
+            } else {
+                cached
+            };
+            (is_placeholder(current) || current.severity >= settings.minimum_severity)
+                .then(|| current.clone())
+        })
+        .collect();
+    let status = match fresh
+        .failure(&dependency.name)
+        .or_else(|| cache.failure(FailureKind::Osv, eco, &dependency.name, now))
+    {
+        Some(reason) => Status::Unknown(reason.to_owned()),
+        None => Status::NotChecked,
+    };
+    Entry {
+        dependency,
+        status,
+        vulnerabilities,
+        checked_version,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::FakeHttp;
+    use crate::model::{AdvisorySeverity, Span};
+    use crate::parsers;
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    const NOW: u64 = 1_000;
+    const TTL_SECS: u64 = 3600;
+    const BATCH_URL: &str = "https://api.osv.dev/v1/querybatch";
+    const DETAIL_PREFIX: &str = "https://api.osv.dev/v1/vulns/";
+    const MANIFEST: &str =
+        "[dependencies]\nserde = \"1.0.0\"\nanyhow = \"1.0.80\"\ntokio = \"1.37.0\"\n";
+
+    /// Builds an OSV detail record with a `database_specific.severity` label.
+    fn detail_body(id: &str, severity_label: &str) -> String {
+        format!(
+            r#"{{"id":"{id}","summary":"Summary of {id}","database_specific":{{"severity":"{severity_label}"}}}}"#
+        )
+    }
+
+    /// Parses `manifest` and runs `analyze` for Cargo with an unlimited budget.
+    fn run(
+        cache: &mut Cache,
+        http: &dyn Http,
+        settings: &Settings,
+        now: u64,
+        manifest: &str,
+    ) -> Analysis {
+        let mut budget = Budget::new(usize::MAX, None);
+        analyze(
+            Ecosystem::Cargo,
+            parsers::cargo::parse(manifest),
+            cache,
+            http,
+            settings,
+            now,
+            &mut budget,
+        )
+    }
+
+    /// Returns the entry of the dependency named `name`.
+    fn entry<'a>(analysis: &'a Analysis, name: &str) -> &'a Entry {
+        analysis
+            .entries
+            .iter()
+            .find(|entry| entry.dependency.name == name)
+            .unwrap_or_else(|| panic!("missing entry {name}"))
+    }
+
+    /// Answers the batch for three queries, where only the first (serde) has one advisory.
+    fn serde_high_http() -> FakeHttp {
+        FakeHttp::new()
+            .route(
+                "POST",
+                BATCH_URL,
+                200,
+                r#"{"results":[{"vulns":[{"id":"GHSA-high-0001"}]},{"vulns":[]},{"vulns":[]}]}"#,
+            )
+            .route(
+                "GET",
+                &format!("{DETAIL_PREFIX}GHSA-high-0001"),
+                200,
+                &detail_body("GHSA-high-0001", "HIGH"),
+            )
+    }
+
+    #[test]
+    fn attaches_high_advisory_to_serde_with_one_batch_request() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = serde_high_http();
+        let analysis = run(&mut cache, &http, &Settings::default(), NOW, MANIFEST);
+        assert_eq!(analysis.pending, 0);
+        assert_eq!(http.count(BATCH_URL), 1);
+        let serde = entry(&analysis, "serde");
+        assert_eq!(serde.status, Status::NotChecked);
+        assert_eq!(serde.checked_version.as_deref(), Some("1.0.0"));
+        assert_eq!(serde.vulnerabilities.len(), 1);
+        assert_eq!(serde.vulnerabilities[0].id, "GHSA-high-0001");
+        assert_eq!(serde.vulnerabilities[0].severity, AdvisorySeverity::High);
+        assert!(entry(&analysis, "anyhow").vulnerabilities.is_empty());
+        assert!(entry(&analysis, "tokio").vulnerabilities.is_empty());
+    }
+
+    #[test]
+    fn reports_advisories_when_the_cache_stores_nothing() {
+        // A cache lifetime of zero keeps nothing between calls, but one call must still show its answers.
+        let mut cache = Cache::new(0);
+        let http = serde_high_http();
+        let analysis = run(&mut cache, &http, &Settings::default(), NOW, MANIFEST);
+        let serde = entry(&analysis, "serde");
+        assert_eq!(serde.status, Status::NotChecked);
+        assert_eq!(serde.vulnerabilities.len(), 1);
+        assert_eq!(serde.vulnerabilities[0].id, "GHSA-high-0001");
+        assert_eq!(serde.vulnerabilities[0].severity, AdvisorySeverity::High);
+        assert!(entry(&analysis, "anyhow").vulnerabilities.is_empty());
+        assert_eq!(http.count(BATCH_URL), 1);
+    }
+
+    #[test]
+    fn reports_an_osv_failure_when_the_cache_stores_nothing() {
+        let mut cache = Cache::new(0);
+        let http = FakeHttp::new().route("POST", BATCH_URL, 500, "");
+        let analysis = run(&mut cache, &http, &Settings::default(), NOW, MANIFEST);
+        for name in ["serde", "anyhow", "tokio"] {
+            assert_eq!(
+                entry(&analysis, name).status,
+                Status::Unknown("OSV: HTTP 500".to_owned()),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn minimum_severity_still_filters_when_the_cache_stores_nothing() {
+        let mut cache = Cache::new(0);
+        let settings = Settings {
+            minimum_severity: AdvisorySeverity::Critical,
+            ..Settings::default()
+        };
+        let analysis = run(&mut cache, &serde_high_http(), &settings, NOW, MANIFEST);
+        assert!(entry(&analysis, "serde").vulnerabilities.is_empty());
+    }
+
+    #[test]
+    fn keeps_manifest_order() {
+        let mut cache = Cache::new(TTL_SECS);
+        let analysis = run(
+            &mut cache,
+            &serde_high_http(),
+            &Settings::default(),
+            NOW,
+            MANIFEST,
+        );
+        let names: Vec<&str> = analysis
+            .entries
+            .iter()
+            .map(|entry| entry.dependency.name.as_str())
+            .collect();
+        assert_eq!(names, ["serde", "anyhow", "tokio"]);
+    }
+
+    #[test]
+    fn second_run_with_same_cache_makes_no_request() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = serde_high_http();
+        let first = run(&mut cache, &http, &Settings::default(), NOW, MANIFEST);
+        let requests_after_first = http.requests().len();
+        let second = run(&mut cache, &http, &Settings::default(), NOW, MANIFEST);
+        assert_eq!(http.requests().len(), requests_after_first);
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn wildcard_version_is_never_queried() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new().route("POST", BATCH_URL, 200, r#"{"results":[{"vulns":[]}]}"#);
+        let manifest = "[dependencies]\nserde = \"*\"\nanyhow = \"1.0.80\"\n";
+        let analysis = run(&mut cache, &http, &Settings::default(), NOW, manifest);
+        let bodies = http.request_bodies();
+        assert_eq!(bodies.len(), 1);
+        assert!(!bodies[0].contains("\"serde\""));
+        assert!(bodies[0].contains("\"anyhow\""));
+        let serde = entry(&analysis, "serde");
+        assert_eq!(serde.checked_version, None);
+        assert!(serde.vulnerabilities.is_empty());
+    }
+
+    #[test]
+    fn manifest_of_only_wildcards_sends_no_batch() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new();
+        let manifest = "[dependencies]\nserde = \"*\"\n";
+        run(&mut cache, &http, &Settings::default(), NOW, manifest);
+        assert_eq!(http.count(BATCH_URL), 0);
+    }
+
+    #[test]
+    fn duplicate_name_and_version_is_queried_once() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new().route("POST", BATCH_URL, 200, r#"{"results":[{"vulns":[]}]}"#);
+        let manifest = "[dependencies]\nserde = \"1.0.0\"\n[dev-dependencies]\nserde = \"1.0.0\"\n";
+        let analysis = run(&mut cache, &http, &Settings::default(), NOW, manifest);
+        assert_eq!(analysis.entries.len(), 2);
+        let bodies = http.request_bodies();
+        assert_eq!(bodies[0].matches("\"name\":\"serde\"").count(), 1);
+    }
+
+    #[test]
+    fn osv_error_marks_queried_packages_unknown_and_retries_after_60_seconds() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new().route("POST", BATCH_URL, 500, "{}");
+        let settings = Settings::default();
+        let first = run(&mut cache, &http, &settings, NOW, MANIFEST);
+        for name in ["serde", "anyhow", "tokio"] {
+            let found = entry(&first, name);
+            assert_eq!(found.status, Status::Unknown("OSV: HTTP 500".to_string()));
+            assert!(found.vulnerabilities.is_empty());
+        }
+        assert_eq!(http.count(BATCH_URL), 1);
+
+        // Within 60 seconds the failure is served from the cache.
+        let within_window = run(&mut cache, &http, &settings, NOW + 59, MANIFEST);
+        assert_eq!(http.count(BATCH_URL), 1);
+        assert_eq!(
+            entry(&within_window, "serde").status,
+            Status::Unknown("OSV: HTTP 500".to_string())
+        );
+
+        // After 60 seconds the query runs again.
+        let after_window = run(&mut cache, &http, &settings, NOW + 60, MANIFEST);
+        assert_eq!(http.count(BATCH_URL), 2);
+        assert_eq!(
+            entry(&after_window, "serde").status,
+            Status::Unknown("OSV: HTTP 500".to_string())
+        );
+    }
+
+    /// Runs `analyze` for `eco` on `text` with `ignore` and no advisory checks, and returns the kept names.
+    fn kept_names(eco: Ecosystem, text: &str, ignore: &[&str]) -> Vec<String> {
+        let settings = Settings {
+            vulnerabilities: false,
+            ignore: ignore.iter().map(|name| (*name).to_owned()).collect(),
+            ..Settings::default()
+        };
+        let mut cache = Cache::new(TTL_SECS);
+        let analysis = analyze(
+            eco,
+            eco.parse(text),
+            &mut cache,
+            &FakeHttp::new(),
+            &settings,
+            NOW,
+            &mut Budget::new(usize::MAX, None),
+        );
+        analysis
+            .entries
+            .into_iter()
+            .map(|entry| entry.dependency.name)
+            .collect()
+    }
+
+    #[test]
+    fn ignore_entry_matches_a_pypi_name_after_normalisation() {
+        let text = "flask-login==0.6.0\nrequests==2.28.0\n";
+        assert_eq!(
+            kept_names(Ecosystem::PyPI, text, &["Flask_Login"]),
+            ["requests"]
+        );
+    }
+
+    #[test]
+    fn ignore_entry_matches_a_packagist_name_case_insensitively() {
+        let text = r#"{"require":{"monolog/monolog":"^3.0","psr/log":"^3.0"}}"#;
+        assert_eq!(
+            kept_names(Ecosystem::Packagist, text, &["Monolog/Monolog"]),
+            ["psr/log"]
+        );
+    }
+
+    #[test]
+    fn ignore_entry_that_differs_after_normalisation_keeps_the_dependency() {
+        let text = "flask-login==0.6.0\n";
+        assert_eq!(
+            kept_names(Ecosystem::PyPI, text, &["flask-logins"]),
+            ["flask-login"]
+        );
+    }
+
+    #[test]
+    fn ignored_name_is_removed_and_not_queried() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new().route(
+            "POST",
+            BATCH_URL,
+            200,
+            r#"{"results":[{"vulns":[]},{"vulns":[]}]}"#,
+        );
+        let settings = Settings {
+            ignore: vec!["serde".to_owned()],
+            ..Settings::default()
+        };
+        let analysis = run(&mut cache, &http, &settings, NOW, MANIFEST);
+        let names: Vec<&str> = analysis
+            .entries
+            .iter()
+            .map(|entry| entry.dependency.name.as_str())
+            .collect();
+        assert_eq!(names, ["anyhow", "tokio"]);
+        assert!(!http.request_bodies()[0].contains("\"serde\""));
+    }
+
+    #[test]
+    fn minimum_severity_filters_at_read_time_on_cached_answers() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route(
+                "POST",
+                BATCH_URL,
+                200,
+                r#"{"results":[{"vulns":[{"id":"GHSA-medium-0001"}]},{"vulns":[{"id":"GHSA-high-0001"}]},{"vulns":[]}]}"#,
+            )
+            .route(
+                "GET",
+                &format!("{DETAIL_PREFIX}GHSA-medium-0001"),
+                200,
+                &detail_body("GHSA-medium-0001", "MEDIUM"),
+            )
+            .route(
+                "GET",
+                &format!("{DETAIL_PREFIX}GHSA-high-0001"),
+                200,
+                &detail_body("GHSA-high-0001", "HIGH"),
+            );
+        let low = run(&mut cache, &http, &Settings::default(), NOW, MANIFEST);
+        assert_eq!(entry(&low, "serde").vulnerabilities.len(), 1);
+        assert_eq!(entry(&low, "anyhow").vulnerabilities.len(), 1);
+
+        let high_only = Settings {
+            minimum_severity: AdvisorySeverity::High,
+            ..Settings::default()
+        };
+        let high = run(&mut cache, &http, &high_only, NOW, MANIFEST);
+        assert!(entry(&high, "serde").vulnerabilities.is_empty());
+        assert_eq!(
+            entry(&high, "anyhow").vulnerabilities[0].severity,
+            AdvisorySeverity::High
+        );
+        assert_eq!(http.count(BATCH_URL), 1);
+    }
+
+    #[test]
+    fn disabled_vulnerability_checks_send_no_request() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = serde_high_http();
+        let settings = Settings {
+            vulnerabilities: false,
+            ..Settings::default()
+        };
+        let analysis = run(&mut cache, &http, &settings, NOW, MANIFEST);
+        assert!(http.requests().is_empty());
+        assert!(analysis.entries.iter().all(|entry| {
+            entry.status == Status::NotChecked && entry.vulnerabilities.is_empty()
+        }));
+    }
+
+    #[test]
+    fn disabled_ecosystem_returns_empty_analysis_without_request() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = serde_high_http();
+        let settings = Settings {
+            enabled: BTreeSet::new(),
+            ..Settings::default()
+        };
+        let analysis = run(&mut cache, &http, &settings, NOW, MANIFEST);
+        assert_eq!(
+            analysis,
+            Analysis {
+                entries: Vec::new(),
+                pending: 0,
+            }
+        );
+        assert!(http.requests().is_empty());
+    }
+
+    #[test]
+    fn budget_allows_exactly_the_given_number_of_lookups() {
+        let mut budget = Budget::new(2, None);
+        assert!(budget.take());
+        assert!(budget.take());
+        assert!(!budget.take());
+    }
+
+    #[test]
+    fn budget_refuses_lookups_after_a_past_deadline() {
+        let past = Instant::now() - Duration::from_secs(1);
+        let mut budget = Budget::new(5, Some(past));
+        assert!(!budget.take());
+    }
+
+    #[test]
+    fn budget_allows_lookups_before_a_future_deadline() {
+        let future = Instant::now() + Duration::from_secs(3600);
+        let mut budget = Budget::new(1, Some(future));
+        assert!(budget.take());
+        assert!(!budget.take());
+    }
+
+    const MONOLOG_URL: &str = "https://repo.packagist.org/p2/monolog/monolog.json";
+    const CURRENT_URL: &str = "https://repo.packagist.org/p2/acme/current.json";
+    const MONOLOG_BODY: &str = r#"{"minified":"composer/2.0","packages":{"monolog/monolog":[{"version":"3.12.1"},{"version":"3.0.0-RC1"}]}}"#;
+    const CURRENT_BODY: &str =
+        r#"{"minified":"composer/2.0","packages":{"acme/current":[{"version":"3.12.1"}]}}"#;
+
+    /// Parses a `composer.json` text and runs `analyze` for Packagist.
+    fn analyze_composer(
+        cache: &mut Cache,
+        http: &dyn Http,
+        text: &str,
+        budget: &mut Budget,
+    ) -> Analysis {
+        analyze(
+            Ecosystem::Packagist,
+            parsers::php::parse(text),
+            cache,
+            http,
+            &Settings::default(),
+            NOW,
+            budget,
+        )
+    }
+
+    #[test]
+    fn packagist_requirements_are_outdated_or_up_to_date_from_the_registry() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("GET", MONOLOG_URL, 200, MONOLOG_BODY)
+            .route("GET", CURRENT_URL, 200, CURRENT_BODY);
+        let analysis = analyze_composer(
+            &mut cache,
+            &http,
+            r#"{"require":{"monolog/monolog":"^3.0","acme/current":"^3.12.1"}}"#,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(analysis.pending, 0);
+        assert_eq!(
+            entry(&analysis, "monolog/monolog").status,
+            Status::Outdated {
+                latest: "3.12.1".to_owned()
+            }
+        );
+        assert_eq!(entry(&analysis, "acme/current").status, Status::UpToDate);
+    }
+
+    #[test]
+    fn packagist_http_404_is_reported_as_unknown() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", MONOLOG_URL, 404, "");
+        let analysis = analyze_composer(
+            &mut cache,
+            &http,
+            r#"{"require":{"monolog/monolog":"^3.0"}}"#,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(
+            entry(&analysis, "monolog/monolog").status,
+            Status::Unknown("registry: HTTP 404".to_owned())
+        );
+    }
+
+    #[test]
+    fn packagist_names_are_lowercased_and_looked_up_once_per_call() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("GET", MONOLOG_URL, 200, MONOLOG_BODY);
+        let analysis = analyze_composer(
+            &mut cache,
+            &http,
+            r#"{"require":{"Monolog/Monolog":"^3.0","monolog/monolog":"^3.0"}}"#,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(http.count(MONOLOG_URL), 1);
+        assert!(matches!(
+            entry(&analysis, "Monolog/Monolog").status,
+            Status::Outdated { .. }
+        ));
+        assert!(matches!(
+            entry(&analysis, "monolog/monolog").status,
+            Status::Outdated { .. }
+        ));
+    }
+
+    const PUB_HTTP_URL: &str = "https://pub.dev/api/packages/http";
+    const PUB_CURRENT_URL: &str = "https://pub.dev/api/packages/current";
+    const PUB_INTL_PREFIX: &str = "https://pub.dev/api/packages/intl";
+    const PUB_HTTP_BODY: &str = r#"{"name":"http","latest":{"version":"1.2.0"},"versions":[{"version":"1.0.0"},{"version":"1.2.0"}]}"#;
+    const PUB_CURRENT_BODY: &str =
+        r#"{"name":"current","latest":{"version":"1.2.0"},"versions":[{"version":"1.2.0"}]}"#;
+
+    /// Parses a `pubspec.yaml` text and runs `analyze` for Pub.
+    fn analyze_pubspec(
+        cache: &mut Cache,
+        http: &dyn Http,
+        text: &str,
+        budget: &mut Budget,
+    ) -> Analysis {
+        analyze(
+            Ecosystem::Pub,
+            parsers::dart::parse(text),
+            cache,
+            http,
+            &Settings::default(),
+            NOW,
+            budget,
+        )
+    }
+
+    #[test]
+    fn pub_requirements_are_outdated_or_up_to_date_from_the_registry() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("GET", PUB_HTTP_URL, 200, PUB_HTTP_BODY)
+            .route("GET", PUB_CURRENT_URL, 200, PUB_CURRENT_BODY);
+        let analysis = analyze_pubspec(
+            &mut cache,
+            &http,
+            "dependencies:\n  http: ^1.0.0\n  current: ^1.2.0\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(analysis.pending, 0);
+        assert_eq!(
+            entry(&analysis, "http").status,
+            Status::Outdated {
+                latest: "1.2.0".to_owned()
+            }
+        );
+        assert_eq!(entry(&analysis, "current").status, Status::UpToDate);
+    }
+
+    #[test]
+    fn pub_http_404_is_reported_as_unknown() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", PUB_HTTP_URL, 404, "");
+        let analysis = analyze_pubspec(
+            &mut cache,
+            &http,
+            "dependencies:\n  http: ^1.0.0\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(
+            entry(&analysis, "http").status,
+            Status::Unknown("registry: HTTP 404".to_owned())
+        );
+    }
+
+    #[test]
+    fn pub_any_requirement_is_not_checked_and_makes_no_registry_request() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", PUB_HTTP_URL, 200, PUB_HTTP_BODY);
+        let analysis = analyze_pubspec(
+            &mut cache,
+            &http,
+            "dependencies:\n  http: ^1.0.0\n  intl: any\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        let intl = entry(&analysis, "intl");
+        assert_eq!(intl.status, Status::NotChecked);
+        assert_eq!(intl.checked_version, None);
+        assert_eq!(http.count(PUB_INTL_PREFIX), 0);
+    }
+
+    const NUGET_PREFIX: &str = "https://api.nuget.org/v3-flatcontainer/";
+    const NEWTONSOFT_URL: &str =
+        "https://api.nuget.org/v3-flatcontainer/newtonsoft.json/index.json";
+    const SERILOG_URL: &str = "https://api.nuget.org/v3-flatcontainer/serilog/index.json";
+    const NEWTONSOFT_BODY: &str = r#"{"versions":["13.0.3","13.0.4"]}"#;
+    const SERILOG_BODY: &str = r#"{"versions":["3.1.1"]}"#;
+
+    /// Parses a `.csproj` text and runs `analyze` for NuGet.
+    fn analyze_csproj(
+        cache: &mut Cache,
+        http: &dyn Http,
+        text: &str,
+        budget: &mut Budget,
+    ) -> Analysis {
+        analyze(
+            Ecosystem::NuGet,
+            parsers::csharp::parse(text),
+            cache,
+            http,
+            &Settings::default(),
+            NOW,
+            budget,
+        )
+    }
+
+    /// Builds a `.csproj` text with one `PackageReference` per `(name, version)` pair.
+    fn csproj_with(references: &[(&str, &str)]) -> String {
+        let items: String = references
+            .iter()
+            .map(|(name, version)| {
+                format!(r#"<PackageReference Include="{name}" Version="{version}" />"#)
+            })
+            .collect();
+        format!("<Project><ItemGroup>{items}</ItemGroup></Project>")
+    }
+
+    #[test]
+    fn nuget_packages_are_outdated_or_up_to_date_from_the_registry() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("GET", NEWTONSOFT_URL, 200, NEWTONSOFT_BODY)
+            .route("GET", SERILOG_URL, 200, SERILOG_BODY);
+        let analysis = analyze_csproj(
+            &mut cache,
+            &http,
+            &csproj_with(&[("Newtonsoft.Json", "13.0.3"), ("Serilog", "3.1.1")]),
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(analysis.pending, 0);
+        assert_eq!(
+            entry(&analysis, "Newtonsoft.Json").status,
+            Status::Outdated {
+                latest: "13.0.4".to_owned()
+            }
+        );
+        assert_eq!(entry(&analysis, "Serilog").status, Status::UpToDate);
+    }
+
+    #[test]
+    fn nuget_http_404_is_reported_as_unknown() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", NEWTONSOFT_URL, 404, "");
+        let analysis = analyze_csproj(
+            &mut cache,
+            &http,
+            &csproj_with(&[("Newtonsoft.Json", "13.0.3")]),
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(
+            entry(&analysis, "Newtonsoft.Json").status,
+            Status::Unknown("registry: HTTP 404".to_owned())
+        );
+    }
+
+    #[test]
+    fn nuget_names_are_lowercased_and_looked_up_once_per_call() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("GET", NEWTONSOFT_URL, 200, NEWTONSOFT_BODY);
+        let analysis = analyze_csproj(
+            &mut cache,
+            &http,
+            &csproj_with(&[("Newtonsoft.Json", "13.0.3"), ("newtonsoft.json", "13.0.3")]),
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(http.count(NEWTONSOFT_URL), 1);
+        assert!(matches!(
+            entry(&analysis, "Newtonsoft.Json").status,
+            Status::Outdated { .. }
+        ));
+        assert!(matches!(
+            entry(&analysis, "newtonsoft.json").status,
+            Status::Outdated { .. }
+        ));
+    }
+
+    #[test]
+    fn nuget_floating_version_is_not_checked_and_makes_no_registry_request() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", NEWTONSOFT_URL, 200, NEWTONSOFT_BODY);
+        let analysis = analyze_csproj(
+            &mut cache,
+            &http,
+            &csproj_with(&[("Floating", "1.*")]),
+            &mut Budget::new(usize::MAX, None),
+        );
+        let floating = entry(&analysis, "Floating");
+        assert_eq!(floating.status, Status::NotChecked);
+        assert_eq!(floating.checked_version, None);
+        assert_eq!(http.count(NUGET_PREFIX), 0);
+    }
+
+    /// Parses a `Gemfile` text and runs `analyze` for RubyGems.
+    fn analyze_gemfile(
+        cache: &mut Cache,
+        http: &dyn Http,
+        text: &str,
+        budget: &mut Budget,
+    ) -> Analysis {
+        analyze(
+            Ecosystem::RubyGems,
+            parsers::ruby::parse(text),
+            cache,
+            http,
+            &Settings::default(),
+            NOW,
+            budget,
+        )
+    }
+
+    #[test]
+    fn rubygems_gems_are_checked_from_the_registry_including_development_gems() {
+        const GEMFILE: &str = "gem 'rails', '~> 7.0.4'\ngem 'rack', '2.2.4'\ngroup :development do\n  gem 'rspec-rails', '~> 6.0'\nend\n";
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(3))
+            .route(
+                "GET",
+                "https://rubygems.org/api/v1/versions/rails.json",
+                200,
+                r#"[{"number":"8.1.4.1","prerelease":false},{"number":"7.0.4","prerelease":false}]"#,
+            )
+            .route(
+                "GET",
+                "https://rubygems.org/api/v1/versions/rack.json",
+                404,
+                "",
+            )
+            .route(
+                "GET",
+                "https://rubygems.org/api/v1/versions/rspec-rails.json",
+                200,
+                r#"[{"number":"6.0.4","prerelease":false},{"number":"6.0.3","prerelease":false}]"#,
+            );
+        let analysis = analyze_gemfile(
+            &mut cache,
+            &http,
+            GEMFILE,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(analysis.pending, 0);
+        assert_eq!(
+            entry(&analysis, "rails").status,
+            Status::Outdated {
+                latest: "8.1.4.1".to_owned()
+            }
+        );
+        assert_eq!(
+            entry(&analysis, "rack").status,
+            Status::Unknown("registry: HTTP 404".to_owned())
+        );
+        assert_eq!(
+            entry(&analysis, "rspec-rails").status,
+            Status::Outdated {
+                latest: "6.0.4".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn rubygems_pinned_at_the_latest_release_is_up_to_date() {
+        const GEMFILE: &str = "gem 'rails', '8.1.4.1'\n";
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route(
+                "GET",
+                "https://rubygems.org/api/v1/versions/rails.json",
+                200,
+                r#"[{"number":"8.1.4.1","prerelease":false}]"#,
+            );
+        let analysis = analyze_gemfile(
+            &mut cache,
+            &http,
+            GEMFILE,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(entry(&analysis, "rails").status, Status::UpToDate);
+    }
+
+    const PYPI_PREFIX: &str = "https://pypi.org/pypi/";
+    const REQUESTS_URL: &str = "https://pypi.org/pypi/requests/json";
+    const FLASK_URL: &str = "https://pypi.org/pypi/flask/json";
+    const FLASK_LOGIN_URL: &str = "https://pypi.org/pypi/flask-login/json";
+    const REQUESTS_BODY: &str = r#"{"info":{"version":"2.31.0"},"releases":{"2.28.0":[{"yanked":false}],"2.31.0":[{"yanked":false}]}}"#;
+    const FLASK_BODY: &str =
+        r#"{"info":{"version":"2.31.0"},"releases":{"2.31.0":[{"yanked":false}]}}"#;
+    const LOGIN_BODY: &str =
+        r#"{"info":{"version":"0.6.0"},"releases":{"0.6.0":[{"yanked":false}]}}"#;
+    const PACKAGE_BODY: &str = r#"{"info":{"version":"2.0"},"releases":{"1.0":[{"yanked":false}],"2.0":[{"yanked":false}]}}"#;
+
+    /// Builds an OSV batch answer with `query_count` empty results.
+    fn batch_body(query_count: usize) -> String {
+        let results = vec!["{}"; query_count].join(",");
+        format!(r#"{{"results":[{results}]}}"#)
+    }
+
+    /// Parses a requirements text and runs `analyze` for PyPI.
+    fn analyze_python(
+        cache: &mut Cache,
+        http: &dyn Http,
+        now: u64,
+        text: &str,
+        budget: &mut Budget,
+    ) -> Analysis {
+        analyze(
+            Ecosystem::PyPI,
+            parsers::python::parse(text),
+            cache,
+            http,
+            &Settings::default(),
+            now,
+            budget,
+        )
+    }
+
+    #[test]
+    fn pypi_pins_are_outdated_or_up_to_date_from_the_registry() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("GET", REQUESTS_URL, 200, REQUESTS_BODY)
+            .route("GET", FLASK_URL, 200, FLASK_BODY);
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            "requests==2.28.0\nflask==2.31.0\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(analysis.pending, 0);
+        assert_eq!(
+            entry(&analysis, "requests").status,
+            Status::Outdated {
+                latest: "2.31.0".to_owned()
+            }
+        );
+        assert_eq!(entry(&analysis, "flask").status, Status::UpToDate);
+    }
+
+    #[test]
+    fn registry_http_error_is_cached_for_60_seconds() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", REQUESTS_URL, 404, "");
+        let text = "requests==2.28.0\n";
+        let first = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            text,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(
+            entry(&first, "requests").status,
+            Status::Unknown("registry: HTTP 404".to_owned())
+        );
+
+        analyze_python(
+            &mut cache,
+            &http,
+            NOW + 59,
+            text,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(http.count(REQUESTS_URL), 1);
+
+        let after = analyze_python(
+            &mut cache,
+            &http,
+            NOW + 60,
+            text,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(http.count(REQUESTS_URL), 2);
+        assert_eq!(
+            entry(&after, "requests").status,
+            Status::Unknown("registry: HTTP 404".to_owned())
+        );
+    }
+
+    #[test]
+    fn registry_body_that_is_not_json_is_an_invalid_response() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", REQUESTS_URL, 200, "not json");
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            "requests==2.28.0\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(
+            entry(&analysis, "requests").status,
+            Status::Unknown("registry: invalid response".to_owned())
+        );
+    }
+
+    #[test]
+    fn registry_transport_error_is_reported_with_its_message() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .transport_error("GET", REQUESTS_URL, "connection refused");
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            "requests==2.28.0\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(
+            entry(&analysis, "requests").status,
+            Status::Unknown("registry: connection refused".to_owned())
+        );
+    }
+
+    #[test]
+    fn package_names_are_normalised_and_looked_up_once_per_call() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("GET", FLASK_LOGIN_URL, 200, LOGIN_BODY);
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            "Flask_Login==0.6.0\nflask-login==0.6.0\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(http.count(FLASK_LOGIN_URL), 1);
+        assert_eq!(entry(&analysis, "Flask_Login").status, Status::UpToDate);
+        assert_eq!(entry(&analysis, "flask-login").status, Status::UpToDate);
+    }
+
+    #[test]
+    fn duplicate_lookups_stay_once_per_call_even_without_cache_storage() {
+        let mut cache = Cache::new(0);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("GET", FLASK_LOGIN_URL, 200, LOGIN_BODY);
+        analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            "Flask_Login==0.6.0\nflask-login==0.6.0\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(http.count(FLASK_LOGIN_URL), 1);
+    }
+
+    #[test]
+    fn dependency_without_a_checked_version_makes_no_registry_request() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new();
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            "[tool.poetry.dependencies]\nrequests = \"*\"\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert!(http.requests().is_empty());
+        let requests = entry(&analysis, "requests");
+        assert_eq!(requests.checked_version, None);
+        assert_eq!(requests.status, Status::NotChecked);
+    }
+
+    #[test]
+    fn budget_caps_registry_lookups_and_leaves_the_rest_pending() {
+        let text: String = (0..300).map(|index| format!("pkg{index}==1.0\n")).collect();
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(300))
+            .route("GET", PYPI_PREFIX, 200, PACKAGE_BODY);
+
+        let first = analyze_python(&mut cache, &http, NOW, &text, &mut Budget::new(2, None));
+        assert_eq!(http.count(PYPI_PREFIX), 2);
+        assert_eq!(first.pending, 298);
+        let outdated_count = first
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.status
+                    == Status::Outdated {
+                        latest: "2.0".to_owned(),
+                    }
+            })
+            .count();
+        let pending_count = first
+            .entries
+            .iter()
+            .filter(|entry| entry.status == Status::Pending)
+            .count();
+        assert_eq!(outdated_count, 2);
+        assert_eq!(pending_count, 298);
+        assert_eq!(http.count(BATCH_URL), 1);
+
+        let second = analyze_python(&mut cache, &http, NOW, &text, &mut Budget::new(2, None));
+        assert_eq!(http.count(PYPI_PREFIX), 4);
+        assert_eq!(http.count(BATCH_URL), 1);
+        assert_eq!(second.pending, 296);
+    }
+
+    #[test]
+    fn unlimited_budget_completes_every_registry_lookup() {
+        let text: String = (0..300).map(|index| format!("pkg{index}==1.0\n")).collect();
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(300))
+            .route("GET", PYPI_PREFIX, 200, PACKAGE_BODY);
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            &text,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(analysis.pending, 0);
+        assert_eq!(http.count(PYPI_PREFIX), 300);
+    }
+
+    /// Builds a PyPI dependency literal. The parser would cut names such as `bad?name` short, so the tests skip it.
+    fn pypi_dependency(name: &str, version: &str) -> Dependency {
+        let span = Span {
+            line: 0,
+            line_start: 0,
+            line_end: 0,
+        };
+        Dependency {
+            name: name.to_owned(),
+            version: version.to_owned(),
+            name_span: span,
+            version_span: span,
+            dev: false,
+            optional: false,
+            has_additional_version_constraints: false,
+        }
+    }
+
+    #[test]
+    fn invalid_package_name_is_unknown_without_registry_request_or_cache_entry() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new().route("POST", BATCH_URL, 200, &batch_body(1));
+        let first = analyze(
+            Ecosystem::PyPI,
+            vec![pypi_dependency("bad?name", "1.0")],
+            &mut cache,
+            &http,
+            &Settings::default(),
+            NOW,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(
+            entry(&first, "bad?name").status,
+            Status::Unknown("registry: invalid package name".to_string())
+        );
+        assert_eq!(http.count(PYPI_PREFIX), 0);
+        assert!(
+            cache
+                .version_info(Ecosystem::PyPI, "bad?name", NOW)
+                .is_none()
+        );
+        assert!(
+            cache
+                .failure(FailureKind::Registry, Ecosystem::PyPI, "bad?name", NOW)
+                .is_none()
+        );
+
+        let second = analyze(
+            Ecosystem::PyPI,
+            vec![pypi_dependency("bad?name", "1.0")],
+            &mut cache,
+            &http,
+            &Settings::default(),
+            NOW,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(entry(&second, "bad?name").status, first.entries[0].status);
+        assert_eq!(http.count(PYPI_PREFIX), 0);
+    }
+
+    #[test]
+    fn invalid_package_name_consumes_no_budget() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("GET", REQUESTS_URL, 200, REQUESTS_BODY);
+        let analysis = analyze(
+            Ecosystem::PyPI,
+            vec![
+                pypi_dependency("bad?name", "1.0"),
+                pypi_dependency("requests", "2.28.0"),
+            ],
+            &mut cache,
+            &http,
+            &Settings::default(),
+            NOW,
+            &mut Budget::new(1, None),
+        );
+        assert_eq!(analysis.pending, 0);
+        assert_eq!(
+            entry(&analysis, "requests").status,
+            Status::Outdated {
+                latest: "2.31.0".to_owned()
+            }
+        );
+        assert_eq!(http.count(REQUESTS_URL), 1);
+    }
+
+    // OSV failure and advisory placeholders
+
+    const SINGLE_SERDE: &str = "[dependencies]\nserde = \"1.0.0\"\n";
+    const CRIT_DETAIL_URL: &str = "https://api.osv.dev/v1/vulns/GHSA-crit";
+
+    /// Settings that keep only advisories of High severity or above.
+    fn high_only() -> Settings {
+        Settings {
+            minimum_severity: AdvisorySeverity::High,
+            ..Settings::default()
+        }
+    }
+
+    /// Answers the batch with one advisory id for the only query.
+    fn one_advisory_batch(id: &str) -> String {
+        format!(r#"{{"results":[{{"vulns":[{{"id":"{id}"}}]}}]}}"#)
+    }
+
+    #[test]
+    fn osv_failure_keeps_a_packagist_dependency_unknown_without_registry_request() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new().route("POST", BATCH_URL, 500, "{}").route(
+            "GET",
+            CURRENT_URL,
+            200,
+            CURRENT_BODY,
+        );
+        let analysis = analyze_composer(
+            &mut cache,
+            &http,
+            r#"{"require":{"acme/current":"3.12.1"}}"#,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(
+            entry(&analysis, "acme/current").status,
+            Status::Unknown("OSV: HTTP 500".to_string())
+        );
+        assert_eq!(analysis.pending, 0);
+        assert_eq!(http.count("https://repo.packagist.org/"), 0);
+    }
+
+    #[test]
+    fn osv_failure_keeps_a_pypi_dependency_unknown_without_registry_request() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 500, "{}")
+            .route("GET", FLASK_URL, 200, FLASK_BODY);
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            "flask==2.31.0\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(
+            entry(&analysis, "flask").status,
+            Status::Unknown("OSV: HTTP 500".to_string())
+        );
+        assert_eq!(analysis.pending, 0);
+        assert_eq!(http.count(PYPI_PREFIX), 0);
+    }
+
+    #[test]
+    fn failed_detail_fetch_keeps_the_placeholder_despite_the_minimum_severity() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &one_advisory_batch("GHSA-crit"))
+            .route("GET", CRIT_DETAIL_URL, 503, "");
+        let analysis = run(&mut cache, &http, &high_only(), NOW, SINGLE_SERDE);
+        let vulnerabilities = &entry(&analysis, "serde").vulnerabilities;
+        assert_eq!(vulnerabilities.len(), 1);
+        assert_eq!(vulnerabilities[0].id, "GHSA-crit");
+        assert!(crate::osv::is_placeholder(&vulnerabilities[0]));
+    }
+
+    #[test]
+    fn placeholder_is_queried_again_after_the_failure_window() {
+        let mut cache = Cache::new(TTL_SECS);
+        let failing = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &one_advisory_batch("GHSA-crit"))
+            .route("GET", CRIT_DETAIL_URL, 503, "");
+        run(&mut cache, &failing, &high_only(), NOW, SINGLE_SERDE);
+        assert_eq!(failing.count(CRIT_DETAIL_URL), 1);
+
+        let working = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &one_advisory_batch("GHSA-crit"))
+            .route(
+                "GET",
+                CRIT_DETAIL_URL,
+                200,
+                &detail_body("GHSA-crit", "CRITICAL"),
+            );
+        let second = run(&mut cache, &working, &high_only(), NOW + 61, SINGLE_SERDE);
+        let vulnerabilities = &entry(&second, "serde").vulnerabilities;
+        assert_eq!(vulnerabilities.len(), 1);
+        assert_eq!(vulnerabilities[0].severity, AdvisorySeverity::Critical);
+        assert!(!crate::osv::is_placeholder(&vulnerabilities[0]));
+        assert_eq!(working.count(CRIT_DETAIL_URL), 1);
+        assert_eq!(working.count(BATCH_URL), 1);
+        assert_eq!(entry(&second, "serde").status, Status::NotChecked);
+    }
+
+    #[test]
+    fn placeholder_is_not_queried_again_inside_the_failure_window() {
+        let mut cache = Cache::new(TTL_SECS);
+        let failing = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &one_advisory_batch("GHSA-crit"))
+            .route("GET", CRIT_DETAIL_URL, 503, "");
+        run(&mut cache, &failing, &high_only(), NOW, SINGLE_SERDE);
+
+        let working = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &one_advisory_batch("GHSA-crit"))
+            .route(
+                "GET",
+                CRIT_DETAIL_URL,
+                200,
+                &detail_body("GHSA-crit", "CRITICAL"),
+            );
+        let second = run(&mut cache, &working, &high_only(), NOW + 5, SINGLE_SERDE);
+        assert!(working.requests().is_empty());
+        assert_eq!(entry(&second, "serde").vulnerabilities.len(), 1);
+    }
+
+    #[test]
+    fn more_advisories_than_the_detail_cap_complete_on_the_next_call_without_delay() {
+        let ids: Vec<String> = (0..120).map(|index| format!("TEST-{index:03}")).collect();
+        let list: Vec<String> = ids.iter().map(|id| format!(r#"{{"id":"{id}"}}"#)).collect();
+        let batch = format!(r#"{{"results":[{{"vulns":[{}]}}]}}"#, list.join(","));
+        let mut http = FakeHttp::new().route("POST", BATCH_URL, 200, &batch);
+        for id in &ids {
+            http = http.route(
+                "GET",
+                &format!("{DETAIL_PREFIX}{id}"),
+                200,
+                &detail_body(id, "LOW"),
+            );
+        }
+        let mut cache = Cache::new(TTL_SECS);
+        let count_placeholders = |analysis: &Analysis| {
+            entry(analysis, "serde")
+                .vulnerabilities
+                .iter()
+                .filter(|vulnerability| crate::osv::is_placeholder(vulnerability))
+                .count()
+        };
+
+        let first = run(&mut cache, &http, &Settings::default(), NOW, SINGLE_SERDE);
+        assert_eq!(http.count(DETAIL_PREFIX), 100);
+        assert_eq!(count_placeholders(&first), 20);
+
+        let second = run(&mut cache, &http, &Settings::default(), NOW, SINGLE_SERDE);
+        assert_eq!(http.count(DETAIL_PREFIX), 120);
+        assert_eq!(count_placeholders(&second), 0);
+        assert_eq!(entry(&second, "serde").vulnerabilities.len(), 120);
+    }
+}

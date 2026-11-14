@@ -1,0 +1,72 @@
+{
+  "properties": {
+    "vulnerabilities": {
+      "type": "boolean",
+      "title": "Show known vulnerabilities",
+      "default": true
+    },
+    "minimumSeverity": {
+      "type": "string",
+      "title": "Minimum advisory severity",
+      "enum": ["low", "medium", "high", "critical"],
+      "default": "low"
+    },
+    "ignore": {
+      "type": "array",
+      "title": "Ignored packages",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "ecosystems.cargo.enabled": {
+      "type": "boolean",
+      "title": "Check Cargo manifests",
+      "default": true
+    },
+    "ecosystems.npm.enabled": {
+      "type": "boolean",
+      "title": "Check npm manifests",
+      "default": true
+    },
+    "ecosystems.pypi.enabled": {
+      "type": "boolean",
+      "title": "Check Python manifests",
+      "default": true
+    },
+    "ecosystems.go.enabled": {
+      "type": "boolean",
+      "title": "Check Go manifests",
+      "default": true
+    },
+    "ecosystems.packagist.enabled": {
+      "type": "boolean",
+      "title": "Check Composer manifests",
+      "default": true
+    },
+    "ecosystems.pub.enabled": {
+      "type": "boolean",
+      "title": "Check Dart and Flutter manifests",
+      "default": true
+    },
+    "ecosystems.nuget.enabled": {
+      "type": "boolean",
+      "title": "Check .NET manifests",
+      "default": true
+    },
+    "ecosystems.rubygems.enabled": {
+      "type": "boolean",
+      "title": "Check Ruby manifests",
+      "default": true
+    },
+    "ecosystems.maven.enabled": {
+      "type": "boolean",
+      "title": "Check Maven manifests",
+      "default": true
+    },
+    "cacheTtlSeconds": {
+      "type": "integer",
+      "title": "Cache lifetime (seconds)",
+      "minimum": 0,
+      "default": 3600
+    }
+  }
+}
