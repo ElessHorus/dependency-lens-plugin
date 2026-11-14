@@ -4,7 +4,7 @@
 
 Dependency Lens is an OpenIDEA plugin. It shows, after the version of each declared dependency, the known OSV vulnerabilities of that version and, for some ecosystems, the newest registry release.
 
-OpenIDEA's built-in "Newer dependency version available" inspection covers Cargo, npm, Go and Maven. This plugin adds OSV vulnerabilities for all nine ecosystems. It also adds version hints and an update quick fix for Python, PHP, Dart, C# and Ruby.
+OpenIDEA's built-in outdated-dependency inspection covers Cargo only. This plugin adds OSV vulnerabilities for all nine ecosystems. It also adds version hints and an update quick fix for Python, PHP, Dart, C# and Ruby. For npm, Go and Maven it shows vulnerabilities only.
 
 ## Supported files
 
@@ -71,6 +71,8 @@ The plugin contacts these six hosts. Each host is listed in the capabilities of 
 
 Cargo, npm, Go and Maven use only OSV. The registry hosts are used only for the ecosystems that show version hints.
 
+Setting `ecosystems.<id>.enabled` to `false` turns an ecosystem off. Its manifests are not analyzed, so no request goes to OSV or to its registry.
+
 The plugin sends only package names, the OSV ecosystem names and the declared versions. Packages of disabled ecosystems and packages in `ignore` are not sent. The plugin sends no secrets and no account data, and it has no telemetry.
 
 ## Settings
@@ -89,6 +91,7 @@ Add the package name to `ignore`, for example `["serde", "left-pad"]`. The name 
 
 ## Limitations
 
+- For npm, Go and Maven, the plugin shows vulnerabilities only. It shows no version hint and no quick fix.
 - The plugin checks the version declared in the manifest, not a lockfile.
 - For a requirement with a range (`^1.2`, `>=2.0`, `||`), the plugin checks the lower bound of the first alternative. A newer release is then shown as outdated against that bound.
 - The first lookup of a large manifest takes seconds. The lookups run one after another. The status bar shows the progress, and you can cancel the task. Each chunk of 20 lookups shows its results before the next chunk starts. After a five-minute soft cap, the entries that still show `…` finish on the next open, save or "Dependency Lens: Refresh" of their manifest.
@@ -97,48 +100,13 @@ Add the package name to `ignore`, for example `["serde", "left-pad"]`. The name 
 - The Maven parser reads the `project/properties` block only, for `${name}` version placeholders.
 - Composer `-p1` and `-patch` stabilities count as prereleases.
 
-## Verifying in OpenIDEA
+## Building
 
-These checks need the IDE GUI. The automated agents of this project cannot run them.
+1. Build the plugin: `openidea-plugin build`.
+2. Link the plugin folder into OpenIDEA: `openidea-plugin link <plugin folder>`.
+3. In OpenIDEA, open Settings › Plugins and choose Reload.
 
-1. Build and link the plugin: `openidea-plugin build`, then `openidea-plugin link <plugin folder>`, then Settings › Plugins › Reload.
-2. Open `fixtures/rust-app/Cargo.toml`, `ts-app/package.json`, `go-app/go.mod`, `python-app/requirements.txt` (or `pyproject.toml`) and `java-app/pom.xml` in the OpenIDEA checkout. Check the decorations, the hover, the Problems view and the quick fix.
-3. Measure the time from opening a manifest to its final decoration. Do this cold and warm, on a manifest with 50 or more dependencies.
-4. Open a manifest of a project that is not the main project of the window, in a multi-project window. Confirm that the decorations and the problems appear. The SDK mock could not show decorations for files of other projects.
-5. Open a manifest saved with a UTF-8 byte order mark. Check that the decoration columns are correct.
-6. Disable one ecosystem in the settings and confirm that no request is sent for its manifests.
-7. Confirm the claim about OpenIDEA's built-in "Newer dependency version available" inspection in the first paragraph of this README.
-
-## Publishing
-
-1. Choose your publisher id. It is the prefix of your plugin ids, for example `<publisher>.dependency-lens`.
-2. Create your signing key once: `openidea-plugin keygen <publisher>.key`. Keep the file secret and out of Git.
-3. In `plugin.toml`, replace `local.dependency-lens` by `<publisher>.dependency-lens` in `id`.
-4. In the GitHub repository, add the secret `OPENIDEA_PLUGIN_KEY` with the content of `<publisher>.key`. Add the variable `PUBLISHER` with the value `<publisher>`. The release workflow stops with a clear message when one of them is missing.
-5. Push the tag `v0.1.0`: `git tag v0.1.0` and then `git push origin v0.1.0`. The release workflow checks that the tag matches `version` in `plugin.toml`. It then packs and signs the plugin, attaches `<publisher>.dependency-lens-0.1.0.oiplugin` to the GitHub release, and prints its SHA-256 in the job summary.
-6. Open a pull request to `l0ng-ai/openidea-plugins`. It adds two files. First, `publishers/<publisher>.toml`:
-
-   ```toml
-   name = "<publisher>"
-   owners = ["<github-account>"]
-   keys = ["<public key>"]
-   revoked-keys = []
-   ```
-
-   Second, `plugins/<publisher>.dependency-lens.toml`:
-
-   ```toml
-   repository = "https://github.com/<owner>/<repo>"
-   suggest = ["Cargo.toml", "package.json", "go.mod", "pom.xml", "pyproject.toml", "requirements.txt", "composer.json", "pubspec.yaml"]
-
-   [[versions]]
-   version = "0.1.0"
-   package = "https://github.com/<owner>/<repo>/releases/download/v0.1.0/<publisher>.dependency-lens-0.1.0.oiplugin"
-   sha256 = "<SHA-256 from the job summary>"
-   ```
-
-   The `suggest` list holds at most eight project-relative paths, with no globs.
-7. Before the registry pull request, contact the author of `mpiton/zed-depsy` to confirm that the code base reused here is independent of Dependi. Keep the `NOTICE` file.
+The maintainer notes, with the manual checks in the IDE and the publishing steps, are in [docs/MAINTAINING.md](docs/MAINTAINING.md).
 
 ## Licence and credits
 

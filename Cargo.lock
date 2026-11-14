@@ -86,7 +86,6 @@ dependencies = [
  "json-spanned-value",
  "openidea-plugin",
  "quick-xml",
- "semver",
  "serde",
  "serde_json",
  "taplo",

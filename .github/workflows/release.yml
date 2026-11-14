@@ -16,11 +16,20 @@ jobs:
       # Third-party actions are pinned by major tag. The maintainer may pin them to commit SHAs.
       - uses: actions/checkout@v4
 
+      # Fail fast: a mismatched tag stops the job before any toolchain is installed.
+      - name: Check the tag against plugin.toml
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          manifest_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' plugin.toml | head -n 1)"
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "::error::The tag $GITHUB_REF_NAME does not match version $manifest_version in plugin.toml."
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-wasip2
-
-      - uses: Swatinem/rust-cache@v2
 
       # Same tool and SDK tag as the CI workflow. Keep both in sync when the SDK changes.
       - name: Install the plugin tool
@@ -41,18 +50,12 @@ jobs:
             exit 1
           fi
 
-      - name: Check the tag against plugin.toml
-        run: |
-          set -euo pipefail
-          tag_version="${GITHUB_REF_NAME#v}"
-          manifest_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' plugin.toml | head -n 1)"
-          if [ "$tag_version" != "$manifest_version" ]; then
-            echo "::error::The tag $GITHUB_REF_NAME does not match version $manifest_version in plugin.toml."
-            exit 1
-          fi
-
       - name: Build the plugin
         run: openidea-plugin build
+
+      # A signed release must not ship untested code.
+      - name: Test
+        run: cargo test --locked
 
       # The key is written to a private file, used once and deleted in the next step.
       # `umask 077` keeps the file readable by the runner user only. The secret is passed
