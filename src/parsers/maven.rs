@@ -2,7 +2,8 @@
 //!
 //! Reads `<dependency>` entries under `<dependencies>` in one streaming pass.
 //! Plugin dependencies, reporting sections, `system` scope entries (local JARs)
-//! and entries without a literal or resolvable version are not returned. Parent POMs, profiles and BOM imports
+//! and entries without a literal or resolvable version are not returned. A
+//! `<repositories>` entry other than Maven Central hides the whole manifest. Parent POMs, profiles and BOM imports
 //! are not resolved.
 
 use std::collections::HashMap;
@@ -27,11 +28,21 @@ enum FieldKind {
     Optional,
 }
 
+/// URLs that name Maven Central, without a final `/`.
+const MAVEN_CENTRAL_URLS: [&str; 4] = [
+    "https://repo.maven.apache.org/maven2",
+    "https://repo1.maven.org/maven2",
+    "http://repo.maven.apache.org/maven2",
+    "http://repo1.maven.org/maven2",
+];
+
 /// What the text of the currently open element is used for.
 #[derive(Clone, Copy)]
 enum Capture<'a> {
     Field(FieldKind),
     Property(&'a str),
+    /// The `<url>` of a `<repositories>` entry.
+    RepositoryUrl,
 }
 
 /// An element whose text is read when its end tag arrives.
@@ -71,6 +82,8 @@ pub fn parse(text: &str) -> Vec<Dependency> {
     let mut properties: HashMap<&str, &str> = HashMap::new();
     // Dependencies whose version is a `${name}` placeholder, with the property name.
     let mut placeholders: Vec<(usize, &str)> = Vec::new();
+    // A repository other than Maven Central may hold any artifact of the manifest.
+    let mut has_private_repository = false;
 
     // Events are contiguous, so the reader position before a read is where that event starts.
     while let Some(event_start) = byte_offset(reader.buffer_position()) {
@@ -100,6 +113,12 @@ pub fn parse(text: &str) -> Vec<Dependency> {
                     {
                         open_capture = Some(OpenCapture {
                             target: Capture::Property(name),
+                            depth: depth_before + 1,
+                            content_start,
+                        });
+                    } else if name == "url" && is_repository_entry(&stack) {
+                        open_capture = Some(OpenCapture {
+                            target: Capture::RepositoryUrl,
                             depth: depth_before + 1,
                             content_start,
                         });
@@ -133,6 +152,11 @@ pub fn parse(text: &str) -> Vec<Dependency> {
                                 properties.insert(property_name, field.text);
                             }
                         }
+                        Capture::RepositoryUrl => {
+                            if let Some(field) = value {
+                                has_private_repository |= !is_maven_central(field.text);
+                            }
+                        }
                     }
                 }
                 let closes_dependency = end.name().0 == "dependency"
@@ -159,6 +183,9 @@ pub fn parse(text: &str) -> Vec<Dependency> {
         }
     }
 
+    if has_private_repository {
+        return Vec::new();
+    }
     // Resolve placeholders last so that properties declared after a dependency still apply.
     for (dependency_index, property) in placeholders {
         let Some(value) = properties.get(property) else {
@@ -172,6 +199,20 @@ pub fn parse(text: &str) -> Vec<Dependency> {
         }
     }
     dependencies
+}
+
+/// Returns `true` when the open elements end with `<repositories><repository>`.
+///
+/// `<pluginRepositories>` and `<distributionManagement>` do not match: they never serve a dependency.
+fn is_repository_entry(stack: &[&str]) -> bool {
+    matches!(stack, [.., "repositories", "repository"])
+}
+
+/// Returns `true` when `url` is Maven Central, with or without a final `/`.
+fn is_maven_central(url: &str) -> bool {
+    MAVEN_CENTRAL_URLS
+        .iter()
+        .any(|central_url| url.trim_end_matches('/').eq_ignore_ascii_case(central_url))
 }
 
 /// Builds a dependency from its fields. Returns the property name as well when the
@@ -465,5 +506,44 @@ mod tests {
             .map(|dependency| dependency.name)
             .collect();
         assert_eq!(names, ["org.slf4j:slf4j-api"]);
+    }
+
+    /// A pom with one repository entry and one dependency.
+    fn pom_with_repository(repositories_block: &str) -> String {
+        format!(
+            "<project>\n{repositories_block}\n  <dependencies>\n    <dependency>\n      <groupId>com.acme</groupId>\n      <artifactId>internal</artifactId>\n      <version>1.0</version>\n    </dependency>\n  </dependencies>\n</project>\n"
+        )
+    }
+
+    #[test]
+    fn a_repository_other_than_maven_central_hides_every_dependency() {
+        for block in [
+            "<repositories><repository><id>acme</id><url>https://nexus.acme.internal/repo</url></repository></repositories>",
+            "<profiles><profile><repositories><repository><url>https://nexus.acme.internal/repo</url></repository></repositories></profile></profiles>",
+            "<repositories><repository><url>${repo.url}</url></repository></repositories>",
+            "<repositories><repository><url>https://repo.maven.apache.org/maven2</url></repository><repository><url>https://nexus.acme.internal/repo</url></repository></repositories>",
+        ] {
+            assert!(
+                parse(&pom_with_repository(block)).is_empty(),
+                "{block} must hide the file"
+            );
+        }
+    }
+
+    #[test]
+    fn maven_central_and_plugin_repositories_do_not_hide_the_dependencies() {
+        for block in [
+            "<repositories><repository><id>central</id><url>https://repo.maven.apache.org/maven2/</url></repository></repositories>",
+            "<repositories><repository><url>https://repo1.maven.org/maven2</url></repository></repositories>",
+            "<pluginRepositories><pluginRepository><url>https://nexus.acme.internal/repo</url></pluginRepository></pluginRepositories>",
+            "<distributionManagement><repository><url>https://nexus.acme.internal/deploy</url></repository></distributionManagement>",
+            "",
+        ] {
+            assert_eq!(
+                parse(&pom_with_repository(block)).len(),
+                1,
+                "{block} must keep the dependency"
+            );
+        }
     }
 }
