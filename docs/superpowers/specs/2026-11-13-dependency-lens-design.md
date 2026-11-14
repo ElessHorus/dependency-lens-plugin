@@ -277,3 +277,16 @@ severity mapping details, plugin icon, README wording (including the
 justification of each network host), whether to persist the cache, whether to
 react to `document-changed`, the plugin's display name, and the order of the
 ecosystems in the first commits.
+
+## Implementation notes (added after the build, 2026-11-14)
+
+The sections above are the original design. Where the code differs, the code and the README win. The differences:
+
+- **What the IDE covers.** OpenIDEA's "Newer dependency version available" inspection with a quick fix exists only for Cargo. Go has version completion; npm and Maven have completion sources. The plugin therefore shows vulnerabilities only (no version hint) for Cargo, npm, Go and Maven, and version hints plus the update quick fix for Python, PHP, Dart, C# and Ruby. Whether to add version hints for npm, Go and Maven (three more registries and hosts) is an open product decision.
+- **Network.** Six `net:` hosts: `api.osv.dev`, `pypi.org`, `repo.packagist.org`, `pub.dev`, `api.nuget.org`, `rubygems.org`. Package names are checked against a conservative grammar per ecosystem before they enter a URL; every request gets a 10 s timeout when none is set.
+- **Execution model (replaces the "time-boxed run" sections).** One continuous refresh per manifest in chunks of 20 lookups, publishing after every chunk. `Task::report` and `Task::is_cancelled` renew the host's call budget (verified in the host source), so a call is cut only after 60 s without a sign of life. Each chunk is bounded to 40 s (OSV advisory details included); a soft cap of 300 s stops further chunks, and entries still shown as `…` finish on the next open, save or "Dependency Lens: Refresh". There is no `on-schedule` activation: the host delivers `Scheduled` only to an inactive plugin.
+- **Manifest API.** `engines.openidea = "^1.4"` (the `settings-changed` event); the SDK is pinned at the tag `v0.1.44` (plugin API 1.7).
+- **Settings** are read in `activate` and on `settings-changed`; the ignore list compares normalised package names.
+- **OSV details.** `querybatch` returns only advisory ids; details come from `GET /v1/vulns/{id}` (at most 100 per call, cached). Severity comes from `database_specific.severity`, else from a CVSS v3.x base score computed from the vector. A placeholder ("Details not loaded yet") is kept visible and retried; a failed OSV call stays `?` and is never replaced by the registry status.
+- **Byte order mark** handling is central (`Ecosystem::parse`).
+- **Known limitations and follow-ups:** `cacheTtlSeconds = 0` currently hides vulnerabilities (results are read back from the cache, which stores nothing at TTL 0); the quick fix writes the exact latest version, so `~=` / `~>` requirements become narrower; `FilesChanged` analyses manifests nobody opened; the whole crate API is `pub` (only `DependencyLens` and `publish::DECORATION_SET` are needed outside); "outdated" for ranges compares the lower bound of the first alternative.
