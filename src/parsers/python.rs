@@ -20,8 +20,13 @@ const OPERATORS: [&str; 8] = ["===", "==", ">=", "<=", "!=", "~=", ">", "<"];
 const PIN_OPERATORS: [&str; 5] = ["===", "==", "~=", ">=", ">"];
 
 /// Source names that a Poetry dependency table can use instead of a registry version.
-// `source` names a private Poetry source, so the package is not on the public index.
-const POETRY_SOURCE_KEYS: [&str; 4] = ["path", "git", "url", "source"];
+///
+/// `source = "name"` is not in this list. It names a private Poetry source, except
+/// for the reserved name `pypi`, so it needs its own check.
+const POETRY_SOURCE_KEYS: [&str; 3] = ["path", "git", "url"];
+
+/// The reserved name of the public index in a Poetry `source` key.
+const POETRY_PUBLIC_SOURCE: &str = "pypi";
 
 /// Parses the dependencies of a PyPI manifest.
 ///
@@ -386,9 +391,15 @@ fn poetry_dependency(
     match value {
         Node::Str(version) => build_poetry_dependency(index, key, version, false, is_dev),
         Node::Table(table) => {
-            if POETRY_SOURCE_KEYS
-                .iter()
-                .any(|source_key| table.get(*source_key).is_some())
+            let names_private_source = table.get("source").is_some_and(|source_node| {
+                !source_node
+                    .as_str()
+                    .is_some_and(|name| name.value().eq_ignore_ascii_case(POETRY_PUBLIC_SOURCE))
+            });
+            if names_private_source
+                || POETRY_SOURCE_KEYS
+                    .iter()
+                    .any(|source_key| table.get(*source_key).is_some())
             {
                 return None;
             }
@@ -866,6 +877,19 @@ dependencies = ["\u0072equests==2.28.0"]
 python = \"^3.11\"
 internal = { version = \"^1.0\", source = \"private\" }
 requests = \"^2.28.0\"
+";
+        let dependencies = parse(manifest);
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].name, "requests");
+    }
+
+    #[test]
+    fn poetry_dependency_with_the_pypi_source_is_kept() {
+        let manifest = "\
+[tool.poetry.dependencies]
+python = \"^3.11\"
+requests = { version = \"^2.28.0\", source = \"pypi\" }
+internal = { version = \"^1.0\", source = \"private\" }
 ";
         let dependencies = parse(manifest);
         assert_eq!(dependencies.len(), 1);
