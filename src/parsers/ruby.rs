@@ -23,8 +23,8 @@ const SOURCE_OPTION_KEYS: [&str; 7] = [
     "source",
 ];
 
-/// The one registry URL that counts as the public RubyGems registry.
-const PUBLIC_REGISTRY_URL: &str = "https://rubygems.org";
+/// The registry URLs that count as the public RubyGems registry. Bundler accepts the plain HTTP one.
+const PUBLIC_REGISTRY_URLS: [&str; 2] = ["https://rubygems.org", "http://rubygems.org"];
 
 /// Keywords that open a construct which an `end` closes. `def` is handled apart,
 /// because its endless form has no `end`.
@@ -465,7 +465,9 @@ fn names_custom_source(key: &str, value: Option<&Token<'_>>) -> bool {
             && matches!(
                 value,
                 Some(Token { kind: Kind::Str(url), .. })
-                    if url.trim_end_matches('/').eq_ignore_ascii_case(PUBLIC_REGISTRY_URL)
+                    if PUBLIC_REGISTRY_URLS
+                        .iter()
+                        .any(|public_url| url.trim_end_matches('/').eq_ignore_ascii_case(public_url))
             ))
 }
 
@@ -1342,5 +1344,11 @@ gem 'plain', '1.0', 'require' => false
                 ("plain", "1.0", false, false)
             ]
         );
+    }
+
+    #[test]
+    fn a_plain_http_rubygems_source_is_public() {
+        let manifest = "source 'http://rubygems.org'\ngem 'rails', '1.0'\n";
+        assert_eq!(summary(&parse(manifest)), [("rails", "1.0", false, false)]);
     }
 }

@@ -7,6 +7,8 @@
 //! their blocks. Go modules have no registry version hint, so every entry has
 //! `dev = false` and no extra constraints.
 
+use std::collections::HashMap;
+
 use crate::model::{Dependency, Span};
 
 /// Directive whose block is open at the current line.
@@ -25,8 +27,8 @@ enum OpenBlock {
 /// line index is needed. Entries keep document order.
 pub fn parse(text: &str) -> Vec<Dependency> {
     let mut dependencies = Vec::new();
-    // Each replacement is a module path and, for `module version => ...`, one version.
-    let mut replacements: Vec<(&str, Option<&str>)> = Vec::new();
+    // Replaced modules by path. A path without a version replaces every version of the module.
+    let mut replacements: HashMap<&str, Replaced<'_>> = HashMap::new();
     let mut open_block = OpenBlock::None;
     for (index, line) in text.split_inclusive('\n').enumerate() {
         let Ok(line_number) = u32::try_from(index) else {
@@ -48,7 +50,7 @@ pub fn parse(text: &str) -> Vec<Dependency> {
                 dependencies.extend(parse_entry(code, comment, 0, line_number));
             }
             OpenBlock::Replace if keyword == ")" => open_block = OpenBlock::None,
-            OpenBlock::Replace => replacements.extend(parse_replacement(code, 0)),
+            OpenBlock::Replace => record_replacement(&mut replacements, parse_replacement(code, 0)),
             OpenBlock::None => {
                 let keyword_end = keyword_start + keyword.len();
                 let opens_block =
@@ -63,7 +65,7 @@ pub fn parse(text: &str) -> Vec<Dependency> {
                     if opens_block {
                         open_block = OpenBlock::Replace;
                     } else {
-                        replacements.extend(parse_replacement(code, keyword_end));
+                        record_replacement(&mut replacements, parse_replacement(code, keyword_end));
                     }
                 } else if opens_block {
                     open_block = OpenBlock::Other;
@@ -71,12 +73,41 @@ pub fn parse(text: &str) -> Vec<Dependency> {
             }
         }
     }
-    dependencies.retain(|dependency| {
-        !replacements.iter().any(|&(module, version)| {
-            module == dependency.name && version.is_none_or(|version| version == dependency.version)
-        })
-    });
+    if !replacements.is_empty() {
+        dependencies.retain(|dependency| {
+            !replacements
+                .get(dependency.name.as_str())
+                .is_some_and(|replaced| {
+                    replaced.is_whole_module
+                        || replaced.versions.contains(&dependency.version.as_str())
+                })
+        });
+    }
     dependencies
+}
+
+/// The `replace` directives of one module path.
+#[derive(Default)]
+struct Replaced<'a> {
+    /// A directive without a version replaces every version.
+    is_whole_module: bool,
+    /// The versions that `module version => ...` directives replace.
+    versions: Vec<&'a str>,
+}
+
+/// Adds one parsed `replace` directive to the replaced modules.
+fn record_replacement<'a>(
+    replacements: &mut HashMap<&'a str, Replaced<'a>>,
+    replacement: Option<(&'a str, Option<&'a str>)>,
+) {
+    let Some((module, version)) = replacement else {
+        return;
+    };
+    let replaced = replacements.entry(module).or_default();
+    match version {
+        Some(version) => replaced.versions.push(version),
+        None => replaced.is_whole_module = true,
+    }
 }
 
 /// Reads the replaced module of `module [version] => target` from `code`, starting at `from`.

@@ -220,8 +220,14 @@ fn dotted_render_update(dep: &Dependency, latest: &str, keeps_build: bool) -> Op
     if latest_version.is_prerelease() {
         return None;
     }
-    // A latest version with fewer segments than declared is written in full.
-    let precision = declared.release().len();
+    // A latest version with fewer segments than declared is written in full. A build number only
+    // follows a full release, so `^0.4` and `0.4.1+2` give `^0.4.1+2`, never `^0.4+2`.
+    let has_build = keeps_build && latest.contains('+');
+    let precision = if has_build {
+        declared.release().len().max(latest_version.release().len())
+    } else {
+        declared.release().len()
+    };
     let rendered_release = latest_version
         .release()
         .iter()
@@ -231,7 +237,7 @@ fn dotted_render_update(dep: &Dependency, latest: &str, keeps_build: bool) -> Op
         .join(".");
     let build = latest
         .split_once('+')
-        .filter(|_| keeps_build)
+        .filter(|_| has_build)
         .map_or(String::new(), |(_, build_text)| format!("+{build_text}"));
     let rendered = format!("{operator}{rendered_release}{build}");
     (rendered != dep.version).then_some(rendered)
@@ -598,5 +604,37 @@ mod tests {
             render_update(Ecosystem::Pub, &dependency, "0.4.0+9").as_deref(),
             Some("^0.4.0+9")
         );
+    }
+
+    #[test]
+    fn pub_update_with_a_build_number_writes_the_full_release() {
+        for (declared, latest, expected) in [
+            ("^0.4", "0.4.1+2", "^0.4.1+2"),
+            ("^1", "2.0.0+3", "^2.0.0+3"),
+            ("^0.4.0+1", "0.4.0+9", "^0.4.0+9"),
+        ] {
+            let dependency = Dependency {
+                name: "demo".to_owned(),
+                version: declared.to_owned(),
+                name_span: crate::model::Span {
+                    line: 0,
+                    line_start: 0,
+                    line_end: 4,
+                },
+                version_span: crate::model::Span {
+                    line: 0,
+                    line_start: 6,
+                    line_end: 14,
+                },
+                dev: false,
+                optional: false,
+                has_additional_version_constraints: false,
+            };
+            assert_eq!(
+                render_update(Ecosystem::Pub, &dependency, latest).as_deref(),
+                Some(expected),
+                "{declared} -> {latest}"
+            );
+        }
     }
 }

@@ -57,6 +57,10 @@ fn is_public_repository(repository: &Value) -> bool {
 /// The `repositories` key is an array or an object of named repositories. Composer
 /// searches them before Packagist, so any package name may come from one of them.
 fn has_private_repository(text: &str) -> bool {
+    // Most manifests have no `repositories` key, so the extra parse is skipped for them.
+    if !text.contains("\"repositories\"") {
+        return false;
+    }
     let Ok(Manifest {
         repositories: Some(repositories),
     }) = serde_json::from_str(text)

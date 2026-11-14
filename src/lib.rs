@@ -105,11 +105,14 @@ impl DependencyLens {
         };
         // The deepest open project holding the path wins; the window's project is only a fallback.
         let Some(project) = host::project_of(path).or_else(|| ctx.project()) else {
+            self.published_paths.remove(path);
             return;
         };
         let text = match project.read_file(path) {
             Ok(text) => text,
             Err(error) => {
+                // A manifest that cannot be read is no longer a shown one.
+                self.published_paths.remove(path);
                 host::log(LogLevel::Warn, &format!("cannot read {path}: {error}"));
                 return;
             }
@@ -261,12 +264,27 @@ pub(crate) fn is_manifest_in(path: &str, project_root: Option<&str>) -> bool {
 ///
 /// Without a project root, the whole path is checked.
 fn is_in_skipped_directory(path: &str, project_root: Option<&str>) -> bool {
-    let relative_path = project_root
-        .and_then(|root| path.strip_prefix(root.trim_end_matches(['/', '\\'])))
-        .unwrap_or(path);
-    relative_path
-        .split(['/', '\\'])
+    let path_parts = path_components(path);
+    // Whole components are compared, so `/p/app2` is not inside `/p/app`. Both separators and
+    // any case count, because the host may write a Windows path either way.
+    let below_root = project_root.and_then(|root| {
+        let mut remaining_parts = path_parts.clone();
+        path_components(root)
+            .all(|root_part| {
+                remaining_parts
+                    .next()
+                    .is_some_and(|part| part.eq_ignore_ascii_case(root_part))
+            })
+            .then_some(remaining_parts)
+    });
+    below_root
+        .unwrap_or(path_parts)
         .any(|part| SKIPPED_DIRECTORIES.contains(&part))
+}
+
+/// The non-empty parts of a path, split at `/` and `\`.
+fn path_components(path: &str) -> impl Iterator<Item = &str> + Clone {
+    path.split(['/', '\\']).filter(|part| !part.is_empty())
 }
 
 impl Plugin for DependencyLens {
@@ -448,5 +466,55 @@ mod loop_tests {
     fn deadline_after_saturates_instead_of_overflowing() {
         let before = Instant::now();
         assert!(deadline_after(Duration::MAX) > before);
+    }
+}
+
+#[cfg(test)]
+mod skipped_directory_tests {
+    use super::is_in_skipped_directory;
+
+    #[test]
+    fn only_folders_below_the_project_root_are_skipped() {
+        assert!(!is_in_skipped_directory(
+            "/srv/vendor/app/Cargo.toml",
+            Some("/srv/vendor/app")
+        ));
+        assert!(is_in_skipped_directory(
+            "/srv/vendor/app/target/Cargo.toml",
+            Some("/srv/vendor/app")
+        ));
+        assert!(is_in_skipped_directory(
+            "/p/node_modules/x/package.json",
+            None
+        ));
+    }
+
+    #[test]
+    fn the_root_must_end_at_a_path_boundary() {
+        // `/p/app2` is not inside `/p/app`, so the whole path is checked, and it holds no skipped folder.
+        assert!(!is_in_skipped_directory(
+            "/p/app2/Cargo.toml",
+            Some("/p/app")
+        ));
+        assert!(is_in_skipped_directory(
+            "/p/app2/vendor/Cargo.toml",
+            Some("/p/app")
+        ));
+    }
+
+    #[test]
+    fn mixed_separators_and_drive_letter_case_still_match_the_root() {
+        assert!(!is_in_skipped_directory(
+            "C:/work/vendor/app/Cargo.toml",
+            Some("C:\\work\\vendor\\app")
+        ));
+        assert!(!is_in_skipped_directory(
+            "c:\\work\\vendor\\app\\Cargo.toml",
+            Some("C:\\work\\vendor\\app\\")
+        ));
+        assert!(is_in_skipped_directory(
+            "C:/work/vendor/app/target/Cargo.toml",
+            Some("C:\\work\\vendor\\app")
+        ));
     }
 }
