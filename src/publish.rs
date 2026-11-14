@@ -13,6 +13,8 @@ pub const DECORATION_SET: &str = "dependency-lens";
 const PART_SEPARATOR: &str = " · ";
 /// Source name of the problems this plugin publishes.
 const DIAGNOSTIC_SOURCE: &str = "Dependency Lens";
+/// Code of the problem that reports a newer release.
+const OUTDATED_CODE: &str = "outdated";
 
 /// Visual strength of an annotation. Variants are ordered from weakest to strongest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -47,14 +49,23 @@ pub fn decorations(text: &str, analysis: &Analysis) -> Vec<Decoration> {
         .collect()
 }
 
-/// One problem per entry with advisories, placed on the version range.
-pub fn diagnostics(text: &str, analysis: &Analysis) -> Vec<Diagnostic> {
+/// The problems of every entry, placed on the version range.
+///
+/// An entry with advisories gets one problem. With `include_outdated`, an outdated
+/// entry gets a second, informational one after it. The editor offers a quick fix
+/// in the hover only where a problem exists, so this problem carries the update fix.
+pub fn diagnostics(text: &str, analysis: &Analysis, include_outdated: bool) -> Vec<Diagnostic> {
     analysis
         .entries
         .iter()
-        .filter_map(|entry| {
-            let range = to_range(text, entry.dependency.version_span)?;
-            diagnostic_of(range, entry)
+        .flat_map(|entry| {
+            let range = to_range(text, entry.dependency.version_span);
+            // One range lookup serves both problems of an entry.
+            let vulnerability = range.and_then(|range| diagnostic_of(range, entry));
+            let outdated = range
+                .filter(|_| include_outdated)
+                .and_then(|range| outdated_diagnostic_of(range, entry));
+            vulnerability.into_iter().chain(outdated)
         })
         .collect()
 }
@@ -178,6 +189,25 @@ fn diagnostic_of(range: Range, entry: &Entry) -> Option<Diagnostic> {
         severity_label(worst)
     );
     let mut diagnostic = Diagnostic::new(range, severity, message).code(first.id.clone());
+    diagnostic.source = Some(DIAGNOSTIC_SOURCE.to_owned());
+    Some(diagnostic)
+}
+
+/// Builds the informational problem of one entry, or `None` when it is not outdated.
+fn outdated_diagnostic_of(range: Range, entry: &Entry) -> Option<Diagnostic> {
+    let Status::Outdated { latest } = &entry.status else {
+        return None;
+    };
+    let version = entry
+        .checked_version
+        .as_deref()
+        .unwrap_or(&entry.dependency.version);
+    let message = format!(
+        "{} {version}: newer version {latest} available",
+        entry.dependency.name
+    );
+    let mut diagnostic =
+        Diagnostic::new(range, Severity::Info, message).code(OUTDATED_CODE.to_owned());
     diagnostic.source = Some(DIAGNOSTIC_SOURCE.to_owned());
     Some(diagnostic)
 }
@@ -491,7 +521,7 @@ mod tests {
         ];
         for (vulnerabilities, severity, message, code) in cases {
             let analysis = serde_entry(Status::NotChecked, vulnerabilities, Some("1.0.0"));
-            let diagnostics = diagnostics(SERDE_TEXT, &analysis);
+            let diagnostics = diagnostics(SERDE_TEXT, &analysis, false);
             assert_eq!(diagnostics.len(), 1, "{message}");
             let diagnostic = &diagnostics[0];
             assert_eq!(diagnostic.severity, severity, "{message}");
@@ -515,7 +545,7 @@ mod tests {
             vec![vulnerability("GHSA-high", AdvisorySeverity::High, None)],
             None,
         );
-        let diagnostics = diagnostics(SERDE_TEXT, &analysis);
+        let diagnostics = diagnostics(SERDE_TEXT, &analysis, false);
         assert_eq!(
             diagnostics[0].message,
             "serde 1.0.0: 1 known vulnerability (High)"
@@ -525,7 +555,7 @@ mod tests {
     #[test]
     fn no_diagnostic_without_advisories_or_resolvable_range() {
         let clean = serde_entry(Status::UpToDate, vec![], Some("1.0.0"));
-        assert!(diagnostics(SERDE_TEXT, &clean).is_empty());
+        assert!(diagnostics(SERDE_TEXT, &clean, false).is_empty());
 
         let unresolved = Analysis {
             entries: vec![Entry {
@@ -536,7 +566,7 @@ mod tests {
             }],
             pending: 0,
         };
-        assert!(diagnostics(SERDE_TEXT, &unresolved).is_empty());
+        assert!(diagnostics(SERDE_TEXT, &unresolved, false).is_empty());
     }
 
     #[test]
@@ -559,7 +589,7 @@ mod tests {
             pending: 0,
         };
         let text = "[dependencies]\nserde = \"1.0.0\"\nanyhow = \"1.0.0\"\n";
-        let messages: Vec<String> = diagnostics(text, &analysis)
+        let messages: Vec<String> = diagnostics(text, &analysis, false)
             .into_iter()
             .map(|diagnostic| diagnostic.message)
             .collect();
@@ -569,6 +599,70 @@ mod tests {
                 "anyhow 1.0.0: 1 known vulnerability (Low)",
                 "serde 1.0.0: 1 known vulnerability (High)",
             ]
+        );
+    }
+
+    /// An outdated `serde` entry on line 1 of `SERDE_TEXT`, with the given advisories.
+    fn outdated_serde(vulnerabilities: Vec<Vulnerability>) -> Analysis {
+        serde_entry(
+            Status::Outdated {
+                latest: "2.0.0".to_owned(),
+            },
+            vulnerabilities,
+            Some("1.0.0"),
+        )
+    }
+
+    #[test]
+    fn outdated_entry_gets_an_info_problem_on_its_version() {
+        let diagnostics = diagnostics(SERDE_TEXT, &outdated_serde(vec![]), true);
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.severity, Severity::Info);
+        assert_eq!(
+            diagnostic.message,
+            "serde 1.0.0: newer version 2.0.0 available"
+        );
+        assert_eq!(diagnostic.code.as_deref(), Some("outdated"));
+        assert_eq!(diagnostic.source.as_deref(), Some("Dependency Lens"));
+        assert_eq!(
+            diagnostic.range,
+            Range::new(Position::new(1, 9), Position::new(1, 14))
+        );
+    }
+
+    #[test]
+    fn outdated_problem_is_off_when_the_setting_is_off() {
+        assert!(diagnostics(SERDE_TEXT, &outdated_serde(vec![]), false).is_empty());
+    }
+
+    #[test]
+    fn only_outdated_entries_get_an_outdated_problem() {
+        for status in [
+            Status::UpToDate,
+            Status::Pending,
+            Status::NotChecked,
+            Status::Unknown("registry: HTTP 500".to_owned()),
+        ] {
+            let analysis = serde_entry(status, vec![], Some("1.0.0"));
+            assert!(diagnostics(SERDE_TEXT, &analysis, true).is_empty());
+        }
+    }
+
+    #[test]
+    fn outdated_problem_follows_the_vulnerability_problem_of_the_same_entry() {
+        let analysis = outdated_serde(vec![vulnerability(
+            "GHSA-high",
+            AdvisorySeverity::High,
+            None,
+        )]);
+        let codes: Vec<Option<String>> = diagnostics(SERDE_TEXT, &analysis, true)
+            .into_iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect();
+        assert_eq!(
+            codes,
+            [Some("GHSA-high".to_owned()), Some("outdated".to_owned())]
         );
     }
 }

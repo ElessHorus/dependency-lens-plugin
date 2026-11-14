@@ -101,6 +101,23 @@ fn diagnostics_of(host: &MockHost, path: &str) -> Vec<Diagnostic> {
     host.diagnostics().get(path).cloned().unwrap_or_default()
 }
 
+/// Asserts that `path` holds exactly one problem, the informational one for a newer release.
+fn assert_only_outdated_problem(host: &MockHost, path: &str, range: Range, latest: &str) {
+    let diagnostics = diagnostics_of(host, path);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    let problem = &diagnostics[0];
+    assert_eq!(problem.severity, Severity::Info);
+    assert_eq!(problem.code.as_deref(), Some("outdated"));
+    assert_eq!(problem.range, range);
+    assert!(
+        problem
+            .message
+            .ends_with(&format!("newer version {latest} available")),
+        "{}",
+        problem.message
+    );
+}
+
 /// Writes the manifest into the mock project and sends one `FileOpened` event for it.
 fn open_manifest(host: &MockHost, plugin: &mut DependencyLens) {
     host.add_file("Cargo.toml", MANIFEST);
@@ -451,7 +468,7 @@ fn host_with_pypi(fetches: Rc<Cell<u32>>) -> MockHost {
 }
 
 #[test]
-fn requirements_show_registry_versions_and_no_problems() {
+fn requirements_show_registry_versions_and_one_outdated_problem() {
     let host = host_with_pypi(Rc::new(Cell::new(0)));
     host.add_file("requirements.txt", REQUIREMENTS);
     let mut plugin = DependencyLens::default();
@@ -473,6 +490,25 @@ fn requirements_show_registry_versions_and_no_problems() {
         .expect("decoration on flask");
     assert_eq!(flask.after, Some("✓".to_string()));
     assert_eq!(flask.style, "muted");
+    assert_only_outdated_problem(&host, REQUIREMENTS_PATH, REQUESTS_VERSION_RANGE, "2.31.0");
+}
+
+#[test]
+fn outdated_problems_setting_off_publishes_no_problem_for_a_newer_release() {
+    let host = host_with_pypi(Rc::new(Cell::new(0)));
+    host.add_file("requirements.txt", REQUIREMENTS);
+    host.set_setting("outdatedProblems", "false");
+    let mut plugin = DependencyLens::default();
+    plugin.activate(&host.context(PLUGIN_ID)).unwrap();
+    plugin.handle_events(
+        &[Event::FileOpened(REQUIREMENTS_PATH.to_owned())],
+        &host.invocation(),
+    );
+    let requests_hint = decorations_of(&host, REQUIREMENTS_PATH)
+        .into_iter()
+        .find(|decoration| decoration.range == REQUESTS_VERSION_RANGE)
+        .expect("decoration on requests");
+    assert_eq!(requests_hint.after, Some("→ 2.31.0".to_string()));
     assert!(diagnostics_of(&host, REQUIREMENTS_PATH).is_empty());
 }
 
@@ -569,7 +605,7 @@ fn composer_requirement_shows_the_registry_version() {
         .expect("decoration on monolog");
     assert_eq!(monolog.after, Some("→ 3.12.1".to_string()));
     assert_eq!(monolog.style, "info");
-    assert!(diagnostics_of(&host, COMPOSER_PATH).is_empty());
+    assert_only_outdated_problem(&host, COMPOSER_PATH, MONOLOG_VERSION_RANGE, "3.12.1");
 }
 
 #[test]
@@ -638,7 +674,7 @@ fn pubspec_requirement_shows_the_registry_version() {
         .expect("decoration on http");
     assert_eq!(http.after, Some("→ 1.2.0".to_string()));
     assert_eq!(http.style, "info");
-    assert!(diagnostics_of(&host, PUBSPEC_PATH).is_empty());
+    assert_only_outdated_problem(&host, PUBSPEC_PATH, HTTP_VERSION_RANGE, "1.2.0");
 }
 
 #[test]
@@ -706,7 +742,7 @@ fn csproj_requirement_shows_the_registry_version() {
         .expect("decoration on Newtonsoft.Json");
     assert_eq!(newtonsoft.after, Some("→ 13.0.4".to_string()));
     assert_eq!(newtonsoft.style, "info");
-    assert!(diagnostics_of(&host, CSPROJ_PATH).is_empty());
+    assert_only_outdated_problem(&host, CSPROJ_PATH, NEWTONSOFT_VERSION_RANGE, "13.0.4");
 }
 
 #[test]
@@ -771,7 +807,7 @@ fn gemfile_requirement_shows_the_registry_version_and_offers_a_major_update() {
         .expect("decoration on rails");
     assert_eq!(rails.after, Some("→ 8.1.4.1".to_string()));
     assert_eq!(rails.style, "info");
-    assert!(diagnostics_of(&host, GEMFILE_PATH).is_empty());
+    assert_only_outdated_problem(&host, GEMFILE_PATH, RAILS_VERSION_RANGE, "8.1.4.1");
 
     let fetches_after_refresh = fetches.get();
     let document = Document {

@@ -52,6 +52,8 @@ Each dependency with advisories gets one problem, on its version text. The sourc
 | Medium | Warning |
 | Low | Info |
 
+A dependency with a newer stable release also gets an `Info` problem on its version text, with the code `outdated`. Its message is `<name> <version>: newer version <latest> available`. The editor shows a quick fix in the hover only where a problem exists, so this problem makes the update quick fix appear in the hover. This applies to the ecosystems that have a registry. Set `outdatedProblems` to `false` to turn it off. The inline hint and the quick fix stay.
+
 ### Quick fix
 
 On a line with an outdated requirement, the quick fix title is `Update <name> to <version> (major|minor|patch|prerelease)`. Minor and patch updates are marked as preferred. The quick fix appears only after the registry lookup of that package has run, because the code action reads the cache and never calls the network.
@@ -80,6 +82,7 @@ The plugin sends only package names, the OSV ecosystem names and the declared ve
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `vulnerabilities` | boolean | `true` | Query OSV.dev for known advisories. |
+| `outdatedProblems` | boolean | `true` | Add an `Info` problem on each outdated version, so the update quick fix shows in the hover. |
 | `minimumSeverity` | `low`, `medium`, `high` or `critical` | `low` | Hide advisories below this severity. |
 | `ignore` | array of strings | `[]` | Package names that are skipped. |
 | `ecosystems.<id>.enabled` | boolean | `true` | Analyze the manifests of one ecosystem. The ids are `cargo`, `npm`, `pypi`, `go`, `packagist`, `pub`, `nuget`, `rubygems` and `maven`. |

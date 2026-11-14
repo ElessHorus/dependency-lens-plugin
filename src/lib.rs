@@ -144,7 +144,7 @@ impl DependencyLens {
                 now_secs(),
                 &mut budget,
             );
-            publish_analysis(path, text, &analysis);
+            publish_analysis(path, text, &analysis, self.settings.outdated_problems);
             let pending = analysis.pending;
             // Pending entries are the only ones without a status, so the done count is a subtraction, not a scan.
             let total = analysis.entries.len();
@@ -195,9 +195,9 @@ fn should_continue(
 }
 
 /// Publishes the decorations and problems of one analysis of the manifest `text` at `path`.
-fn publish_analysis(path: &str, text: &str, analysis: &Analysis) {
+fn publish_analysis(path: &str, text: &str, analysis: &Analysis, outdated_problems: bool) {
     let editor_decorations = publish::decorations(text, analysis);
-    let problems = publish::diagnostics(text, analysis);
+    let problems = publish::diagnostics(text, analysis, outdated_problems);
     publish_results(path, &editor_decorations, &problems);
 }
 
