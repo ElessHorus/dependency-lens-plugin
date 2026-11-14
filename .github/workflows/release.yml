@@ -19,13 +19,18 @@ jobs:
           persist-credentials: false
 
       # Fail fast: a mismatched tag stops the job before any toolchain is installed.
-      - name: Check the tag against plugin.toml
+      - name: Check the tag against plugin.toml and Cargo.toml
         run: |
           set -euo pipefail
           tag_version="${GITHUB_REF_NAME#v}"
           manifest_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' plugin.toml | head -n 1)"
+          crate_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
           if [ "$tag_version" != "$manifest_version" ]; then
             echo "::error::The tag $GITHUB_REF_NAME does not match version $manifest_version in plugin.toml."
+            exit 1
+          fi
+          if [ "$tag_version" != "$crate_version" ]; then
+            echo "::error::The tag $GITHUB_REF_NAME does not match version $crate_version in Cargo.toml."
             exit 1
           fi
 

@@ -99,7 +99,7 @@ The plugin reads only the text of the manifest. A private source that a tool set
 | `minimumSeverity` | `low`, `medium`, `high` or `critical` | `low` | Hide advisories below this severity. |
 | `ignore` | array of strings | `[]` | Package names that are skipped. |
 | `ecosystems.<id>.enabled` | boolean | `true` | Analyze the manifests of one ecosystem. The ids are `cargo`, `npm`, `pypi`, `go`, `packagist`, `pub`, `nuget`, `rubygems` and `maven`. |
-| `cacheTtlSeconds` | integer | `3600` | Lifetime of cached answers. `0` turns the cache off. Values above one week (`604800`) are read as one week. |
+| `cacheTtlSeconds` | integer | `3600` | Lifetime of cached answers. `0` turns the cache off, and the quick fix then never appears, because it reads the cache. Values above one week (`604800`) are read as one week. |
 
 ### Ignoring a package
 
