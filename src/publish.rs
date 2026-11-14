@@ -3,7 +3,7 @@
 use crate::analysis::{Analysis, Entry, Status};
 use crate::model::{AdvisorySeverity, Vulnerability};
 use crate::osv::{is_deferred, is_placeholder};
-use crate::text::to_range;
+use crate::text::to_range_in_line;
 use openidea_plugin::{Decoration, Diagnostic, Range, Severity};
 use std::cmp::Reverse;
 
@@ -38,23 +38,32 @@ impl Tone {
 
 /// Editor decorations for every entry with a resolvable version range and something to show.
 pub fn decorations(text: &str, analysis: &Analysis) -> Vec<Decoration> {
+    // The lines are split once, so each entry finds its line without a walk from the text start.
+    let lines: Vec<&str> = text.lines().collect();
     analysis
         .entries
         .iter()
         .filter_map(|entry| {
-            let range = to_range(text, entry.dependency.version_span)?;
+            let range = range_of_version(&lines, entry)?;
             decoration_of(range, entry)
         })
         .collect()
 }
 
+/// The range of the version text of `entry`, found in the split `lines` of its manifest.
+fn range_of_version(lines: &[&str], entry: &Entry) -> Option<Range> {
+    let span = entry.dependency.version_span;
+    to_range_in_line(lines.get(span.line as usize)?, span)
+}
+
 /// One problem per entry with advisories, placed on the version range.
 pub fn diagnostics(text: &str, analysis: &Analysis) -> Vec<Diagnostic> {
+    let lines: Vec<&str> = text.lines().collect();
     analysis
         .entries
         .iter()
         .filter_map(|entry| {
-            let range = to_range(text, entry.dependency.version_span)?;
+            let range = range_of_version(&lines, entry)?;
             diagnostic_of(range, entry)
         })
         .collect()

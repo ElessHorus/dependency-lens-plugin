@@ -1,7 +1,7 @@
 //! OSV.dev client: batch queries for advisory ids, then advisory details, cached in [`Cache`].
 
 use crate::cache::Cache;
-use crate::http::Http;
+use crate::http::{Http, is_success};
 use crate::model::{AdvisorySeverity, Ecosystem, Vulnerability};
 use crate::registries::dotted::is_dev_branch;
 use openidea_plugin::{HttpRequest, HttpResponse};
@@ -398,10 +398,6 @@ pub fn is_placeholder(vulnerability: &Vulnerability) -> bool {
 
 fn advisory_url(id: &str) -> String {
     format!("{ADVISORY_URL_PREFIX}{id}")
-}
-
-fn is_success(status: u16) -> bool {
-    (200..300).contains(&status)
 }
 
 fn ensure_success(response: &HttpResponse) -> Result<(), String> {

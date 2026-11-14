@@ -6,6 +6,11 @@ use std::borrow::Cow;
 /// Timeout of a request that sets none. The host default (30 s) would let two hung requests fill a chunk.
 const DEFAULT_TIMEOUT_MS: u32 = 10_000;
 
+/// Returns `true` for a 2xx HTTP status.
+pub fn is_success(status: u16) -> bool {
+    (200..300).contains(&status)
+}
+
 /// Sends HTTP requests. Implemented by the host in production and by [`FakeHttp`] in tests.
 pub trait Http {
     /// Sends `request` and returns the response, or a transport error message.

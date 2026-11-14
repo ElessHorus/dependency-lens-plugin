@@ -1,7 +1,7 @@
 //! Analysis pipeline: turns parsed dependencies into entries with status and advisories.
 
 use crate::cache::{Cache, FailureKind};
-use crate::http::Http;
+use crate::http::{Http, is_success};
 use crate::model::{Dependency, Ecosystem, VersionInfo, Vulnerability};
 use crate::osv::{
     DEFAULT_DETAILS_PER_QUERY, OsvQuery, declared_version_for_osv, is_deferred, is_placeholder,
@@ -274,7 +274,7 @@ fn request_version_info(
     let response = http
         .send(request)
         .map_err(|message| format!("registry: {message}"))?;
-    if !(200..=299).contains(&response.status) {
+    if !is_success(response.status) {
         return Err(format!("registry: HTTP {}", response.status));
     }
     eco.parse_registry(&String::from_utf8_lossy(&response.body))
