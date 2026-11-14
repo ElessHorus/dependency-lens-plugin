@@ -161,6 +161,8 @@ fn pep440_render_update(dep: &Dependency, latest: &str) -> Option<String> {
     if dep.has_additional_version_constraints
         || dep.version.is_empty()
         || dep.version.contains(char::is_whitespace)
+        // Poetry writes `>=2.0,<3.0` and `^1.0|^2.0` without spaces; rewriting would drop a bound.
+        || dep.version.contains([',', '|'])
     {
         return None;
     }
@@ -306,6 +308,13 @@ mod tests {
             render_update(Ecosystem::PyPI, &dependency, "2.31.0"),
             Some("^2.31.0".to_owned())
         );
+    }
+
+    #[test]
+    fn poetry_range_with_an_upper_bound_is_not_rewritten() {
+        let dependency =
+            first_dependency("[tool.poetry.dependencies]\nrequests = \">=2.0,<3.0\"\n");
+        assert_eq!(render_update(Ecosystem::PyPI, &dependency, "2.31.0"), None);
     }
 
     /// Parses a `composer.json` with one `require` entry and returns that dependency.

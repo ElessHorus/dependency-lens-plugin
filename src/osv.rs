@@ -64,7 +64,12 @@ pub struct OsvQuery {
 /// a workspace, file or git source, or an unresolved `${...}` property.
 pub fn declared_version_for_osv(spec: &str) -> Option<String> {
     // Only the first alternative of the first comma-separated requirement names one version.
-    let first_requirement = spec.split(',').next()?.split("||").next()?.trim();
+    // A single `|` separates alternatives as well as `||` does.
+    let first_requirement = spec.split([',', '|']).next()?.trim();
+    // An exclusion or an upper bound names a version that the manifest rules out (ruling R17).
+    if first_requirement.starts_with('<') || first_requirement.starts_with("!=") {
+        return None;
+    }
     let without_operator = VERSION_OPERATORS
         .iter()
         .find_map(|operator| first_requirement.strip_prefix(*operator))
@@ -679,6 +684,40 @@ mod tests {
         );
         assert_eq!(
             declared_version_for_osv(">=1.0 <2.0").as_deref(),
+            Some("1.0")
+        );
+    }
+
+    #[test]
+    fn a_single_bar_cuts_the_alternatives() {
+        assert_eq!(
+            declared_version_for_osv("^1.0|^2.0").as_deref(),
+            Some("1.0")
+        );
+        assert_eq!(
+            declared_version_for_osv("^1.0 || ^2.0").as_deref(),
+            Some("1.0")
+        );
+    }
+
+    #[test]
+    fn exclusions_and_upper_bounds_name_no_declared_version() {
+        assert_eq!(declared_version_for_osv("<2.0.0"), None);
+        assert_eq!(declared_version_for_osv("<=1.5"), None);
+        assert_eq!(declared_version_for_osv("!=1.0"), None);
+        assert_eq!(
+            declared_version_for_osv(">=1.0, <2.0").as_deref(),
+            Some("1.0")
+        );
+        assert_eq!(declared_version_for_osv("~1.2.3").as_deref(), Some("1.2.3"));
+        assert_eq!(declared_version_for_osv("^1.0").as_deref(), Some("1.0"));
+        assert_eq!(
+            declared_version_for_osv("==1.2.3").as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(declared_version_for_osv("v1.2.3").as_deref(), Some("1.2.3"));
+        assert_eq!(
+            declared_version_for_osv("[1.0,2.0)").as_deref(),
             Some("1.0")
         );
     }
