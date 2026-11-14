@@ -53,6 +53,17 @@ pub struct Analysis {
     pub pending: usize,
 }
 
+impl Analysis {
+    /// Number of advisories whose details are not loaded: deferred ones and ones still waiting.
+    pub fn unloaded_advisory_count(&self) -> usize {
+        self.entries
+            .iter()
+            .flat_map(|entry| &entry.vulnerabilities)
+            .filter(|vulnerability| is_deferred(vulnerability) || is_placeholder(vulnerability))
+            .count()
+    }
+}
+
 /// Limits the work of one run: registry lookups by count and by deadline, and the advisory
 /// details that load for each package version.
 pub struct Budget {
@@ -280,6 +291,29 @@ fn request_version_info(
     eco.parse_registry(&String::from_utf8_lossy(&response.body))
 }
 
+/// Keeps the OSV failure of one queried package version, in this run and in the cache.
+fn record_osv_failure(
+    fresh: &mut FreshOsv,
+    cache: &mut Cache,
+    eco: Ecosystem,
+    query: &OsvQuery,
+    reason: &str,
+    now: u64,
+) {
+    fresh
+        .failed
+        .entry(query.name.clone())
+        .or_default()
+        .insert(query.version.clone(), reason.to_owned());
+    cache.put_failure(
+        FailureKind::Osv,
+        eco,
+        &osv_failure_key(&query.name, &query.version),
+        reason.to_owned(),
+        now,
+    );
+}
+
 /// The failure-cache key of one package version, so a failure of one version leaves the others alone.
 fn osv_failure_key(name: &str, version: &str) -> String {
     format!("{name}@{version}")
@@ -290,18 +324,19 @@ const DETAILS_NOT_LOADED: &str = "OSV: advisory details not loaded";
 
 /// Counts the placeholders of `list` whose real record is not in the advisory cache.
 ///
-/// A deferred advisory counts only when `loads_deferred` is set, that is when this run is
-/// allowed to load more than the default number of details.
+/// A deferred advisory counts only when its position in `list` is inside the window of
+/// `details_per_query`: this run would load it, so it still waits.
 fn unresolved_count(
     list: &[Vulnerability],
     cache: &Cache,
     now: u64,
-    loads_deferred: bool,
+    details_per_query: usize,
 ) -> usize {
     list.iter()
-        .filter(|vulnerability| {
-            let waits_for_details =
-                is_placeholder(vulnerability) || (loads_deferred && is_deferred(vulnerability));
+        .enumerate()
+        .filter(|(position, vulnerability)| {
+            let waits_for_details = is_placeholder(vulnerability)
+                || (*position < details_per_query && is_deferred(vulnerability));
             waits_for_details && cache.advisory(&vulnerability.id, now).is_none()
         })
         .count()
@@ -325,7 +360,6 @@ fn query_missing_vulnerabilities(
     budget: &Budget,
 ) -> FreshOsv {
     let details_per_query = budget.details_per_query();
-    let loads_deferred = details_per_query > DEFAULT_DETAILS_PER_QUERY;
     let mut fresh = FreshOsv::default();
     // Borrowed pairs: duplicates are found without copying the names.
     let mut seen: HashSet<(&str, &str)> = HashSet::new();
@@ -337,7 +371,7 @@ fn query_missing_vulnerabilities(
             continue;
         };
         let unresolved = match cache.vulnerabilities(eco, &dependency.name, version, now) {
-            Some(list) => match unresolved_count(list, cache, now, loads_deferred) {
+            Some(list) => match unresolved_count(list, cache, now, details_per_query) {
                 0 => continue,
                 count => Some(count),
             },
@@ -378,7 +412,7 @@ fn query_missing_vulnerabilities(
                 queries.iter().zip(unresolved_before).zip(results)
             {
                 let unresolved_after =
-                    unresolved_count(&vulnerabilities, cache, now, loads_deferred);
+                    unresolved_count(&vulnerabilities, cache, now, details_per_query);
                 // A pair never queried starts with every advisory unresolved.
                 let made_no_progress = unresolved_after > 0
                     && unresolved_after >= before.unwrap_or(vulnerabilities.len());
@@ -389,35 +423,13 @@ fn query_missing_vulnerabilities(
                     .insert(query.version.clone(), vulnerabilities.clone());
                 cache.put_vulnerabilities(eco, &query.name, &query.version, vulnerabilities, now);
                 if made_no_progress {
-                    fresh
-                        .failed
-                        .entry(query.name.clone())
-                        .or_default()
-                        .insert(query.version.clone(), DETAILS_NOT_LOADED.to_owned());
-                    cache.put_failure(
-                        FailureKind::Osv,
-                        eco,
-                        &osv_failure_key(&query.name, &query.version),
-                        DETAILS_NOT_LOADED.to_owned(),
-                        now,
-                    );
+                    record_osv_failure(&mut fresh, cache, eco, query, DETAILS_NOT_LOADED, now);
                 }
             }
         }
         Err(reason) => {
             for query in &queries {
-                fresh
-                    .failed
-                    .entry(query.name.clone())
-                    .or_default()
-                    .insert(query.version.clone(), reason.clone());
-                cache.put_failure(
-                    FailureKind::Osv,
-                    eco,
-                    &osv_failure_key(&query.name, &query.version),
-                    reason.clone(),
-                    now,
-                );
+                record_osv_failure(&mut fresh, cache, eco, query, &reason, now);
             }
         }
     }
@@ -480,7 +492,7 @@ fn build_entry(
         .unwrap_or_default()
         .iter()
         .filter_map(|cached| {
-            let current = if is_placeholder(cached) {
+            let current = if is_placeholder(cached) || is_deferred(cached) {
                 cache.advisory(&cached.id, now).unwrap_or(cached)
             } else {
                 cached
@@ -1962,5 +1974,75 @@ mod tests {
             Status::Unknown(DETAILS_NOT_LOADED.to_owned())
         );
         assert_eq!(status_of("1.0.200"), Status::NotChecked);
+    }
+
+    #[test]
+    fn a_deferred_advisory_is_replaced_once_its_details_are_cached() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = http_with_many_advisories(15);
+        run(&mut cache, &http, &Settings::default(), NOW, OLD_CRATE);
+        // Another package loads the advisory that sat at position 12.
+        cache.put_advisory(
+            Vulnerability {
+                id: "GHSA-0012".to_owned(),
+                severity: AdvisorySeverity::Low,
+                summary: "Loaded later".to_owned(),
+                url: None,
+            },
+            NOW,
+        );
+        let analysis = run(&mut cache, &http, &Settings::default(), NOW + 1, OLD_CRATE);
+        let old = entry(&analysis, "old");
+        assert_eq!(old.vulnerabilities.len(), 15);
+        assert_eq!(
+            old.vulnerabilities
+                .iter()
+                .filter(|v| crate::osv::is_deferred(v))
+                .count(),
+            4
+        );
+        assert!(
+            old.vulnerabilities
+                .iter()
+                .any(|v| v.summary == "Loaded later")
+        );
+
+        // A loaded advisory below the minimum severity is hidden, like any other.
+        let settings = Settings {
+            minimum_severity: AdvisorySeverity::Critical,
+            ..Settings::default()
+        };
+        let filtered = run(&mut cache, &http, &settings, NOW + 2, OLD_CRATE);
+        assert!(
+            !entry(&filtered, "old")
+                .vulnerabilities
+                .iter()
+                .any(|v| v.summary == "Loaded later")
+        );
+    }
+
+    #[test]
+    fn a_limit_between_the_default_and_the_list_length_leaves_no_false_failure() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = http_with_many_advisories(30);
+        let analyze_with_limit = |cache: &mut Cache, now: u64| {
+            analyze(
+                Ecosystem::Cargo,
+                parsers::cargo::parse(OLD_CRATE),
+                cache,
+                &http,
+                &Settings::default(),
+                now,
+                &mut Budget::new(usize::MAX, None).with_detail_limit(15),
+            )
+        };
+        let first = analyze_with_limit(&mut cache, NOW);
+        assert_eq!(http.count(DETAIL_PREFIX), 15);
+        assert_eq!(entry(&first, "old").status, Status::NotChecked);
+        // The 15 advisories past the limit are not waiting for this run, so a second run asks for nothing.
+        let second = analyze_with_limit(&mut cache, NOW + 1);
+        assert_eq!(entry(&second, "old").status, Status::NotChecked);
+        assert_eq!(http.count(BATCH_URL), 1);
+        assert_eq!(http.count(DETAIL_PREFIX), 15);
     }
 }

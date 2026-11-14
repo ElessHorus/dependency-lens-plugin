@@ -251,10 +251,12 @@ pub fn query_batch_limited(
                 .iter()
                 .enumerate()
                 .map(|(position, id)| {
-                    if position >= details_per_query {
+                    let advisory = resolve_advisory(id, &fetched, cache, now);
+                    // Past the window, an advisory stays deferred unless its details are known already.
+                    if position >= details_per_query && is_placeholder(&advisory) {
                         deferred(id)
                     } else {
-                        resolve_advisory(id, &fetched, cache, now)
+                        advisory
                     }
                 })
                 .collect()
@@ -1356,5 +1358,32 @@ mod tests {
             query_batch(&http, &mut cache, &[query("nokogiri", "1.10.0")], NOW, None).unwrap();
         assert!(results[0].iter().all(|advisory| !is_deferred(advisory)));
         assert_eq!(http.count(DETAIL_URL_PREFIX), 15);
+    }
+
+    #[test]
+    fn an_advisory_beyond_the_window_is_resolved_when_its_details_are_cached() {
+        let ids = advisory_ids(15);
+        let http = http_with_advisories(&ids);
+        let mut cache = Cache::new(TTL_SECS);
+        // Another package already loaded the advisory at position 12.
+        let cached = Vulnerability {
+            id: ids[12].clone(),
+            severity: AdvisorySeverity::Low,
+            summary: "Cached by another package".to_owned(),
+            url: None,
+        };
+        cache.put_advisory(cached.clone(), NOW);
+        let results = query_batch_limited(
+            &http,
+            &mut cache,
+            &[query("nokogiri", "1.10.0")],
+            NOW,
+            None,
+            DEFAULT_DETAILS_PER_QUERY,
+        )
+        .unwrap();
+        assert_eq!(results[0][12], cached);
+        assert!(results[0][10..12].iter().all(is_deferred));
+        assert!(results[0][13..].iter().all(is_deferred));
     }
 }

@@ -119,27 +119,29 @@ impl DependencyLens {
     /// Analyzes the manifest at `path` and publishes its decorations and problems, chunk by chunk.
     ///
     /// Every call makes at least its first chunk, so each manifest of a batch makes progress.
-    fn refresh(&mut self, path: &str, ctx: &Invocation, limits: RunLimits) {
+    ///
+    /// Returns the number of advisories of the manifest whose details are still not loaded.
+    fn refresh(&mut self, path: &str, ctx: &Invocation, limits: RunLimits) -> usize {
         let Some(eco) = Ecosystem::detect(path) else {
-            return;
+            return 0;
         };
         // The deepest open project holding the path wins; the window's project is only a fallback.
         let Some(project) = host::project_of(path).or_else(|| ctx.project()) else {
             self.forget_shown(path);
-            return;
+            return 0;
         };
         let text = match project.read_file(path) {
             Ok(text) => text,
             Err(error) => {
                 self.forget_shown(path);
                 host::log(LogLevel::Warn, &format!("cannot read {path}: {error}"));
-                return;
+                return 0;
             }
         };
         let deps = eco.parse(&text);
         self.published_paths.insert(path.to_owned());
         let task = host::begin_task(TASK_TITLE, true);
-        self.publish_chunks(eco, path, &text, &deps, &task, limits);
+        self.publish_chunks(eco, path, &text, &deps, &task, limits)
     }
 
     /// Stops tracking a manifest that cannot be read, and clears what the editor still shows for it.
@@ -153,6 +155,7 @@ impl DependencyLens {
     ///
     /// Reports progress and checks cancellation after every chunk. The host renews the call's
     /// time budget on each of these, so a long manifest is not cut while it reports.
+    /// Returns the number of advisories whose details are still not loaded after the last chunk.
     fn publish_chunks(
         &mut self,
         eco: Ecosystem,
@@ -161,7 +164,7 @@ impl DependencyLens {
         deps: &[Dependency],
         task: &Task,
         limits: RunLimits,
-    ) {
+    ) -> usize {
         let chunk = self.chunk_size();
         // One clock reading serves the whole run. With a cache lifetime shorter than a chunk, a
         // fresh reading per chunk would expire the answers of the chunk before and repeat its work.
@@ -184,6 +187,7 @@ impl DependencyLens {
             );
             publish_analysis(path, text, &analysis);
             let pending = analysis.pending;
+            let unloaded = analysis.unloaded_advisory_count();
             // Pending entries are the only ones without a status, so the done count is a subtraction, not a scan.
             let total = analysis.entries.len();
             let done = total.saturating_sub(pending);
@@ -200,7 +204,7 @@ impl DependencyLens {
                 Instant::now(),
                 limits.deadline,
             ) {
-                return;
+                return unloaded;
             }
             previous_pending = Some(pending);
         }
@@ -361,8 +365,19 @@ impl Plugin for DependencyLens {
                     details_per_query: usize::MAX,
                     ..RunLimits::standard(deadline_after(self.time_box))
                 };
-                self.refresh(&path, ctx, limits);
-                Ok(Some("Dependency Lens: vulnerabilities loaded".to_owned()))
+                if !self.settings.vulnerabilities {
+                    return Ok(Some(
+                        "Dependency Lens: vulnerabilities are turned off".to_owned(),
+                    ));
+                }
+                let unloaded = self.refresh(&path, ctx, limits);
+                Ok(Some(if unloaded == 0 {
+                    "Dependency Lens: vulnerabilities loaded".to_owned()
+                } else {
+                    format!(
+                        "Dependency Lens: {unloaded} advisories are still not loaded. Run the command again."
+                    )
+                }))
             }
             _ => Err(Error::NotFound(format!("command {id}"))),
         }

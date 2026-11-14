@@ -382,6 +382,54 @@ fn only_ten_advisories_load_until_the_user_asks_for_the_rest() {
 }
 
 #[test]
+fn the_load_command_says_how_many_advisories_are_left_and_can_run_again() {
+    let detail_requests = Rc::new(Cell::new(0));
+    let host = host_with_many_serde_advisories(130, detail_requests.clone());
+    let mut plugin = DependencyLens::default();
+    open_manifest(&host, &mut plugin);
+    host.open_editor(MANIFEST_PATH, "toml", MANIFEST, &[]);
+    assert_eq!(detail_requests.get(), 10);
+
+    // One run loads at most 100 details, so 20 of the 120 deferred advisories are left.
+    let first = plugin
+        .run_command("load-vulnerabilities", &host.invocation(), None)
+        .unwrap();
+    assert_eq!(
+        first,
+        Some(
+            "Dependency Lens: 20 advisories are still not loaded. Run the command again."
+                .to_owned()
+        )
+    );
+    assert_eq!(detail_requests.get(), 110);
+
+    let second = plugin
+        .run_command("load-vulnerabilities", &host.invocation(), None)
+        .unwrap();
+    assert_eq!(
+        second,
+        Some("Dependency Lens: vulnerabilities loaded".to_owned())
+    );
+    assert_eq!(detail_requests.get(), 130);
+}
+
+#[test]
+fn the_load_command_says_when_vulnerabilities_are_turned_off() {
+    let host = host_with_many_serde_advisories(15, Rc::new(Cell::new(0)));
+    host.set_setting("vulnerabilities", "false");
+    let mut plugin = DependencyLens::default();
+    plugin.activate(&host.context(PLUGIN_ID)).unwrap();
+    host.open_editor(MANIFEST_PATH, "toml", MANIFEST, &[]);
+    let answer = plugin
+        .run_command("load-vulnerabilities", &host.invocation(), None)
+        .unwrap();
+    assert_eq!(
+        answer,
+        Some("Dependency Lens: vulnerabilities are turned off".to_owned())
+    );
+}
+
+#[test]
 fn unknown_command_is_not_found() {
     let host = host_counting_fetches(Rc::new(Cell::new(0)));
     let mut plugin = DependencyLens::default();
