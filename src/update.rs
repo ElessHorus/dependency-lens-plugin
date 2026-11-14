@@ -3,7 +3,9 @@
 use crate::model::{Dependency, Ecosystem};
 use crate::osv::declared_version_for_osv;
 use crate::registries::dotted::{DottedVersion, is_dev_branch, segment};
+use crate::registries::gem_version::GemVersion;
 use crate::registries::pep440::Pep440;
+use std::borrow::Cow;
 
 /// Operator characters that may start a Poetry-style requirement such as `^2.28`.
 const OPERATOR_BYTES: &[u8] = b"^~=<>!";
@@ -28,8 +30,8 @@ trait UpdateVersion: Ord + Sized {
     fn parse_version(text: &str) -> Option<Self>;
     /// Returns `true` for a prerelease version.
     fn is_prerelease_version(&self) -> bool;
-    /// Returns the release segments, such as `[2, 31, 0]`.
-    fn release_segments(&self) -> &[u64];
+    /// Returns the release segments, such as `[2, 31, 0]`. Borrowed when the version stores them.
+    fn release_segments(&self) -> Cow<'_, [u64]>;
 }
 
 impl UpdateVersion for Pep440 {
@@ -41,8 +43,8 @@ impl UpdateVersion for Pep440 {
         self.is_prerelease()
     }
 
-    fn release_segments(&self) -> &[u64] {
-        self.release()
+    fn release_segments(&self) -> Cow<'_, [u64]> {
+        Cow::Borrowed(self.release())
     }
 }
 
@@ -55,8 +57,22 @@ impl UpdateVersion for DottedVersion {
         self.is_prerelease()
     }
 
-    fn release_segments(&self) -> &[u64] {
-        self.release()
+    fn release_segments(&self) -> Cow<'_, [u64]> {
+        Cow::Borrowed(self.release())
+    }
+}
+
+impl UpdateVersion for GemVersion {
+    fn parse_version(text: &str) -> Option<Self> {
+        GemVersion::parse(text)
+    }
+
+    fn is_prerelease_version(&self) -> bool {
+        self.is_prerelease()
+    }
+
+    fn release_segments(&self) -> Cow<'_, [u64]> {
+        Cow::Owned(self.release())
     }
 }
 
@@ -67,6 +83,7 @@ pub fn update_kind(eco: Ecosystem, current: &str, latest: &str) -> Option<Update
         Ecosystem::Packagist | Ecosystem::Pub | Ecosystem::NuGet => {
             update_kind_of::<DottedVersion>(current, latest)
         }
+        Ecosystem::RubyGems => update_kind_of::<GemVersion>(current, latest),
         _ => None,
     }
 }
@@ -78,6 +95,7 @@ pub fn is_outdated(eco: Ecosystem, declared: &str, latest: &str) -> bool {
         Ecosystem::Packagist | Ecosystem::Pub | Ecosystem::NuGet => {
             is_outdated_of::<DottedVersion>(declared, latest)
         }
+        Ecosystem::RubyGems => is_outdated_of::<GemVersion>(declared, latest),
         _ => false,
     }
 }
@@ -87,7 +105,10 @@ pub fn render_update(eco: Ecosystem, dep: &Dependency, latest: &str) -> Option<S
     match eco {
         Ecosystem::PyPI => pep440_render_update(dep, latest),
         Ecosystem::Packagist | Ecosystem::Pub => dotted_render_update(dep, latest),
-        Ecosystem::NuGet => nuget_render_update(dep, latest),
+        Ecosystem::NuGet => full_latest_render_update::<DottedVersion>(dep, latest),
+        // A second constraint stays in the line after the rewrite, so such a gem is left alone.
+        Ecosystem::RubyGems if dep.has_additional_version_constraints => None,
+        Ecosystem::RubyGems => full_latest_render_update::<GemVersion>(dep, latest),
         _ => None,
     }
 }
@@ -104,9 +125,9 @@ fn update_kind_of<V: UpdateVersion>(current: &str, latest: &str) -> Option<Updat
     }
     // A missing segment reads as 0, so `2` and `2.0` compare equal.
     let (current_release, latest_release) = (current.release_segments(), latest.release_segments());
-    if segment(current_release, 0) != segment(latest_release, 0) {
+    if segment(&current_release, 0) != segment(&latest_release, 0) {
         Some(UpdateKind::Major)
-    } else if segment(current_release, 1) != segment(latest_release, 1) {
+    } else if segment(&current_release, 1) != segment(&latest_release, 1) {
         Some(UpdateKind::Minor)
     } else {
         Some(UpdateKind::Patch)
@@ -147,19 +168,19 @@ fn pep440_render_update(dep: &Dependency, latest: &str) -> Option<String> {
     Some(format!("{operator}{latest}"))
 }
 
-/// Replaces a NuGet version with the full `latest`. NuGet pins are exact, so the
+/// Replaces a version with the full `latest`, for ecosystems whose pins are exact. The
 /// declared precision and operators do not apply. Floating, range and property
 /// versions name no single version to replace, so they are left alone.
-fn nuget_render_update(dep: &Dependency, latest: &str) -> Option<String> {
+fn full_latest_render_update<V: UpdateVersion>(dep: &Dependency, latest: &str) -> Option<String> {
     if dep.version.contains(char::is_whitespace)
         || dep.version.contains(['*', '$', '(', '[', ',', '|'])
         || latest.contains(char::is_whitespace)
     {
         return None;
     }
-    let declared = DottedVersion::parse(&dep.version)?;
-    let latest_version = DottedVersion::parse(latest)?;
-    if latest_version.is_prerelease() || latest_version == declared {
+    let declared = V::parse_version(&dep.version)?;
+    let latest_version = V::parse_version(latest)?;
+    if latest_version.is_prerelease_version() || latest_version == declared {
         return None;
     }
     Some(latest.to_owned())
@@ -452,6 +473,61 @@ mod tests {
         assert_eq!(render("[1.0,2.0)", "3.0.0"), None);
         assert_eq!(render("$(SerilogVersion)", "3.1.2"), None);
         assert_eq!(render("13.0.3", "14.0.0-beta1"), None);
+    }
+
+    /// Parses a `Gemfile` line and returns its first gem.
+    fn gem_dependency(line: &str) -> Dependency {
+        parsers::ruby::parse(line)
+            .into_iter()
+            .next()
+            .expect("one gem")
+    }
+
+    #[test]
+    fn rubygems_is_outdated_compares_the_declared_lower_bound() {
+        assert!(is_outdated(Ecosystem::RubyGems, "7.0.4", "8.1.4.1"));
+        assert!(!is_outdated(Ecosystem::RubyGems, "8.1.4.1", "8.1.4.1"));
+        assert!(!is_outdated(Ecosystem::RubyGems, "7.0.4", "8.0.0.rc1"));
+        assert!(!is_outdated(Ecosystem::RubyGems, "abc", "8.0"));
+    }
+
+    #[test]
+    fn rubygems_update_kind_names_the_first_changed_segment() {
+        assert_eq!(
+            update_kind(Ecosystem::RubyGems, "7.0.4", "8.1.4.1"),
+            Some(UpdateKind::Major)
+        );
+        assert_eq!(
+            update_kind(Ecosystem::RubyGems, "7.0.4", "7.1.2"),
+            Some(UpdateKind::Minor)
+        );
+        assert_eq!(
+            update_kind(Ecosystem::RubyGems, "7.0.4", "7.0.8"),
+            Some(UpdateKind::Patch)
+        );
+        assert_eq!(
+            update_kind(Ecosystem::RubyGems, "7.0.4", "8.0.0.rc1"),
+            Some(UpdateKind::Prerelease)
+        );
+        assert_eq!(update_kind(Ecosystem::RubyGems, "7.0.4", "7.0.4"), None);
+    }
+
+    #[test]
+    fn rubygems_render_writes_the_full_latest_version() {
+        let render = |line: &str, latest: &str| {
+            render_update(Ecosystem::RubyGems, &gem_dependency(line), latest)
+        };
+        assert_eq!(
+            render("gem 'rails', '~> 7.0.4'", "8.1.4.1").as_deref(),
+            Some("8.1.4.1")
+        );
+        assert_eq!(
+            render("gem 'rack','2.2.4'", "2.2.5").as_deref(),
+            Some("2.2.5")
+        );
+        assert_eq!(render("gem \"pg\", \">= 0.18\", \"< 2.0\"", "2.1.0"), None);
+        assert_eq!(render("gem 'rails', '~> 7.0.4'", "7.0.4"), None);
+        assert_eq!(render("gem 'rails', '~> 7.0.4'", "8.0.0.rc1"), None);
     }
 
     #[test]

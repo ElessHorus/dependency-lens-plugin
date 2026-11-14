@@ -976,6 +976,94 @@ mod tests {
         assert_eq!(http.count(NUGET_PREFIX), 0);
     }
 
+    /// Parses a `Gemfile` text and runs `analyze` for RubyGems.
+    fn analyze_gemfile(
+        cache: &mut Cache,
+        http: &dyn Http,
+        text: &str,
+        budget: &mut Budget,
+    ) -> Analysis {
+        analyze(
+            Ecosystem::RubyGems,
+            parsers::ruby::parse(text),
+            cache,
+            http,
+            &Settings::default(),
+            NOW,
+            budget,
+        )
+    }
+
+    #[test]
+    fn rubygems_gems_are_checked_from_the_registry_including_development_gems() {
+        const GEMFILE: &str = "gem 'rails', '~> 7.0.4'\ngem 'rack', '2.2.4'\ngroup :development do\n  gem 'rspec-rails', '~> 6.0'\nend\n";
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(3))
+            .route(
+                "GET",
+                "https://rubygems.org/api/v1/versions/rails.json",
+                200,
+                r#"[{"number":"8.1.4.1","prerelease":false},{"number":"7.0.4","prerelease":false}]"#,
+            )
+            .route(
+                "GET",
+                "https://rubygems.org/api/v1/versions/rack.json",
+                404,
+                "",
+            )
+            .route(
+                "GET",
+                "https://rubygems.org/api/v1/versions/rspec-rails.json",
+                200,
+                r#"[{"number":"6.0.4","prerelease":false},{"number":"6.0.3","prerelease":false}]"#,
+            );
+        let analysis = analyze_gemfile(
+            &mut cache,
+            &http,
+            GEMFILE,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(analysis.pending, 0);
+        assert_eq!(
+            entry(&analysis, "rails").status,
+            Status::Outdated {
+                latest: "8.1.4.1".to_owned()
+            }
+        );
+        assert_eq!(
+            entry(&analysis, "rack").status,
+            Status::Unknown("registry: HTTP 404".to_owned())
+        );
+        assert_eq!(
+            entry(&analysis, "rspec-rails").status,
+            Status::Outdated {
+                latest: "6.0.4".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn rubygems_pinned_at_the_latest_release_is_up_to_date() {
+        const GEMFILE: &str = "gem 'rails', '8.1.4.1'\n";
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route(
+                "GET",
+                "https://rubygems.org/api/v1/versions/rails.json",
+                200,
+                r#"[{"number":"8.1.4.1","prerelease":false}]"#,
+            );
+        let analysis = analyze_gemfile(
+            &mut cache,
+            &http,
+            GEMFILE,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(entry(&analysis, "rails").status, Status::UpToDate);
+    }
+
     const PYPI_PREFIX: &str = "https://pypi.org/pypi/";
     const REQUESTS_URL: &str = "https://pypi.org/pypi/requests/json";
     const FLASK_URL: &str = "https://pypi.org/pypi/flask/json";

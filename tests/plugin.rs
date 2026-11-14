@@ -721,3 +721,57 @@ fn csproj_quick_fix_replaces_the_version_and_is_served_from_the_cache() {
     assert_eq!(edits[0].text, "13.0.4");
     assert_eq!(fetches.get(), fetches_after_refresh);
 }
+
+const GEMFILE_PATH: &str = "/p/Gemfile";
+const GEMFILE: &str = "gem 'rails', '~> 7.0.4'\n";
+/// The version of `rails` sits on line 0; its version text is columns 17..22.
+const RAILS_VERSION_RANGE: Range = Range::new(Position::new(0, 17), Position::new(0, 22));
+const RUBYGEMS_RAILS_BODY: &str =
+    r#"[{"number":"8.1.4.1","prerelease":false},{"number":"7.0.4","prerelease":false}]"#;
+
+#[test]
+fn gemfile_requirement_shows_the_registry_version_and_offers_a_major_update() {
+    let fetches = Rc::new(Cell::new(0));
+    let host = host_with_registry(
+        fetches.clone(),
+        "net:rubygems.org",
+        "https://rubygems.org/api/v1/versions/",
+        RUBYGEMS_RAILS_BODY,
+    );
+    host.add_file("Gemfile", GEMFILE);
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(GEMFILE_PATH.to_owned())],
+        &host.invocation(),
+    );
+
+    let decorations = decorations_of(&host, GEMFILE_PATH);
+    let rails = decorations
+        .iter()
+        .find(|decoration| decoration.range == RAILS_VERSION_RANGE)
+        .expect("decoration on rails");
+    assert_eq!(rails.after, Some("→ 8.1.4.1".to_string()));
+    assert_eq!(rails.style, "info");
+    assert!(diagnostics_of(&host, GEMFILE_PATH).is_empty());
+
+    let fetches_after_refresh = fetches.get();
+    let document = Document {
+        path: GEMFILE_PATH.to_owned(),
+        language: "ruby".to_owned(),
+        version: 1,
+        text: GEMFILE.to_owned(),
+    };
+    let actions = Providers::code_actions(
+        &mut plugin,
+        &document,
+        Range::new(Position::new(0, 3), Position::new(0, 3)),
+    );
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].title, "Update rails to 8.1.4.1 (major)");
+    assert!(!actions[0].preferred);
+    let (edit_path, edits) = &actions[0].edits[0];
+    assert_eq!(edit_path, GEMFILE_PATH);
+    assert_eq!(edits[0].range, RAILS_VERSION_RANGE);
+    assert_eq!(edits[0].text, "8.1.4.1");
+    assert_eq!(fetches.get(), fetches_after_refresh);
+}

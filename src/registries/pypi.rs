@@ -1,6 +1,7 @@
 //! PyPI registry client: request building and response parsing.
 
 use super::pep440::Pep440;
+use super::rank_with;
 use crate::model::VersionInfo;
 use openidea_plugin::HttpRequest;
 use serde::Deserialize;
@@ -61,27 +62,20 @@ pub fn parse(body: &str) -> Result<VersionInfo, String> {
     let response: RegistryResponse =
         serde_json::from_str(body).map_err(|_| INVALID_RESPONSE.to_string())?;
     let RegistryResponse { info, releases } = response;
-    // Parse only the keys that can be listed. Each key is parsed once and kept beside its version.
-    let mut ranked: Vec<(Pep440, String)> = releases
+    // HashMap order is arbitrary. Sorting the keys by text first makes the stable ranking
+    // break ties, such as `1.0` and `1.0.0`, the same way on every run.
+    let mut texts: Vec<String> = releases
         .into_iter()
         .filter(|(_, files)| is_listable(files))
-        .filter_map(|(text, _)| Pep440::parse(&text).map(|version| (version, text)))
+        .map(|(text, _)| text)
         .collect();
-    // Newest first. The text breaks ties, such as `1.0` and `1.0.0`, so the order does not depend on HashMap order.
-    ranked.sort_by(|(left_version, left_text), (right_version, right_text)| {
-        right_version
-            .cmp(left_version)
-            .then_with(|| left_text.cmp(right_text))
-    });
-    let latest = ranked
-        .iter()
-        .find(|(version, _)| !version.is_prerelease())
-        .map(|(_, text)| text.clone())
+    texts.sort_unstable();
+    let mut version_info = rank_with(texts, Pep440::parse, Pep440::is_prerelease);
+    // The metadata version stands in for `latest` when every release is a prerelease.
+    version_info.latest = version_info
+        .latest
         .or_else(|| info.version.filter(|version_text| !version_text.is_empty()));
-    Ok(VersionInfo {
-        latest,
-        versions: ranked.into_iter().map(|(_, text)| text).collect(),
-    })
+    Ok(version_info)
 }
 
 /// Returns `true` when a release has files and at least one file is not yanked.

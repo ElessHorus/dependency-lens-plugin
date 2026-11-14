@@ -1,15 +1,42 @@
 //! Registry clients: one module per ecosystem, reached through `Ecosystem` hooks.
 
 pub mod dotted;
+pub mod gem_version;
 pub mod nuget;
 pub mod packagist;
 pub mod pep440;
 pub mod pub_dev;
 pub mod pypi;
+pub mod rubygems;
 
 use crate::model::{Ecosystem, VersionInfo};
 use openidea_plugin::HttpRequest;
 use std::borrow::Cow;
+
+/// Ranks version texts newest first, with `parse` and `is_prerelease` supplied by the ecosystem.
+///
+/// Each text is parsed once and kept beside its parsed version, so the sort compares
+/// stored values. Texts that do not parse are dropped. The sort is stable, so equal
+/// versions keep the input order. `latest` is the first non-prerelease in that order.
+pub fn rank_with<V: Ord>(
+    texts: impl IntoIterator<Item = String>,
+    parse: impl Fn(&str) -> Option<V>,
+    is_prerelease: impl Fn(&V) -> bool,
+) -> VersionInfo {
+    let mut ranked: Vec<(V, String)> = texts
+        .into_iter()
+        .filter_map(|text| parse(&text).map(|version| (version, text)))
+        .collect();
+    ranked.sort_by(|(left_version, _), (right_version, _)| right_version.cmp(left_version));
+    let latest = ranked
+        .iter()
+        .find(|(version, _)| !is_prerelease(version))
+        .map(|(_, text)| text.clone());
+    VersionInfo {
+        latest,
+        versions: ranked.into_iter().map(|(_, text)| text).collect(),
+    }
+}
 
 impl Ecosystem {
     /// Returns the registry spelling of `name`. Borrows when nothing changes.
@@ -38,6 +65,7 @@ impl Ecosystem {
             Ecosystem::Packagist => Some(packagist::request(package)),
             Ecosystem::Pub => Some(pub_dev::request(package)),
             Ecosystem::NuGet => Some(nuget::request(package)),
+            Ecosystem::RubyGems => Some(rubygems::request(package)),
             _ => None,
         }
     }
@@ -49,6 +77,7 @@ impl Ecosystem {
             Ecosystem::Packagist => packagist::parse(body),
             Ecosystem::Pub => pub_dev::parse(body),
             Ecosystem::NuGet => nuget::parse(body),
+            Ecosystem::RubyGems => rubygems::parse(body),
             _ => Err("no registry for this ecosystem".to_string()),
         }
     }
@@ -158,6 +187,71 @@ mod tests {
             Ecosystem::NuGet
                 .registry_request("Newtonsoft.Json")
                 .is_some()
+        );
+    }
+
+    /// Ranks plain `u32` versions, where a version is a prerelease when it is odd.
+    fn rank_numbers(texts: &[&str]) -> VersionInfo {
+        rank_with(
+            texts.iter().map(|text| (*text).to_owned()),
+            |text| text.parse::<u32>().ok(),
+            |version| version % 2 == 1,
+        )
+    }
+
+    #[test]
+    fn rank_with_drops_texts_that_do_not_parse() {
+        let info = rank_numbers(&["4", "x", "2", ""]);
+        assert_eq!(info.versions, ["4", "2"]);
+    }
+
+    #[test]
+    fn rank_with_sorts_newest_first_and_picks_the_first_non_prerelease() {
+        // 9 is an odd prerelease, so it is listed but skipped as `latest`.
+        let info = rank_numbers(&["2", "9", "3", "8"]);
+        assert_eq!(info.versions, ["9", "8", "3", "2"]);
+        assert_eq!(info.latest.as_deref(), Some("8"));
+    }
+
+    #[test]
+    fn rank_with_has_no_latest_when_only_prereleases_exist() {
+        let info = rank_numbers(&["1", "3"]);
+        assert_eq!(info.latest, None);
+        assert_eq!(info.versions, ["3", "1"]);
+    }
+
+    #[test]
+    fn rank_with_of_nothing_is_empty() {
+        let info = rank_numbers(&[]);
+        assert_eq!(info, VersionInfo::default());
+    }
+
+    #[test]
+    fn rank_with_keeps_the_input_order_of_equal_versions() {
+        let info = rank_with(
+            ["b", "a", "c"].map(str::to_owned),
+            |text| Some(text.len()),
+            |_| false,
+        );
+        assert_eq!(info.versions, ["b", "a", "c"]);
+    }
+
+    #[test]
+    fn rubygems_has_a_registry_and_keeps_gem_names() {
+        let fixture = include_str!("../../tests/fixtures/ruby/registry.json");
+        assert_eq!(
+            Ecosystem::RubyGems.parse_registry(fixture),
+            rubygems::parse(fixture)
+        );
+        assert!(matches!(
+            Ecosystem::RubyGems.normalize_package("Rails"),
+            Cow::Borrowed("Rails")
+        ));
+        assert_eq!(
+            Ecosystem::RubyGems
+                .registry_request("rails")
+                .map(|request| request.url),
+            Some("https://rubygems.org/api/v1/versions/rails.json".to_owned())
         );
     }
 

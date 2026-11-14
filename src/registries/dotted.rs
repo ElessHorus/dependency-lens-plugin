@@ -4,6 +4,7 @@
 //! alphanumeric identifiers. They compare lexically, so `alpha1 < beta1 < rc1`.
 //! Composer's `-p1` and `-patch` stability is treated as a prerelease.
 
+use super::rank_with;
 use crate::model::VersionInfo;
 use std::cmp::Ordering;
 
@@ -79,20 +80,7 @@ pub fn is_dev_branch(version: &str) -> bool {
 /// Texts that do not parse are dropped. Each text is parsed once and kept beside
 /// its parsed version, so the sort compares stored values without parsing again.
 pub fn rank_versions(texts: impl IntoIterator<Item = String>) -> VersionInfo {
-    let mut ranked: Vec<(DottedVersion, String)> = texts
-        .into_iter()
-        .filter_map(|text| DottedVersion::parse(&text).map(|version| (version, text)))
-        .collect();
-    // Newest first. The sort is stable, so equal versions keep the input order.
-    ranked.sort_by(|(left_version, _), (right_version, _)| right_version.cmp(left_version));
-    let latest = ranked
-        .iter()
-        .find(|(version, _)| !version.is_prerelease())
-        .map(|(_, text)| text.clone());
-    VersionInfo {
-        latest,
-        versions: ranked.into_iter().map(|(_, text)| text).collect(),
-    }
+    rank_with(texts, DottedVersion::parse, DottedVersion::is_prerelease)
 }
 
 impl Ord for DottedVersion {
