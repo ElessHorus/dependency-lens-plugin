@@ -75,6 +75,16 @@ Setting `ecosystems.<id>.enabled` to `false` turns an ecosystem off. Its manifes
 
 The plugin sends only package names, the OSV ecosystem names and the declared versions. Packages of disabled ecosystems and packages in `ignore` are not sent. The plugin sends no secrets and no account data, and it has no telemetry.
 
+### Private and local packages
+
+The plugin does not send a package that the manifest takes from a source other than the public registry. It reads these signs:
+
+- An entry with a local or private source is skipped: `path`, `git`, `hosted` (not pub.dev), `registry` and `source` (not the public index) options, `[tool.uv.sources]`, a Go `replace`, a Maven `system` scope, and Gemfile `path`, `git` and `source` blocks, `git_source` keys and `**options`.
+- A manifest-wide private source hides the whole file, because any of its packages can come from that source: a pip `--index-url`, `--extra-index-url` or `--find-links` that is not the public PyPI index, a Composer repository other than Packagist, and a Gemfile `source` other than `https://rubygems.org`.
+- A public source does not hide anything: `source 'https://rubygems.org'`, `hosted: https://pub.dev`, `source = "pypi"`, and the public Packagist or PyPI URLs.
+
+The plugin reads only the text of the manifest. A private source that a tool sets outside the manifest, such as a pip configuration file or an environment variable, is not seen.
+
 ## Settings
 
 | Key | Type | Default | Meaning |
