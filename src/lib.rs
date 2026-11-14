@@ -50,6 +50,15 @@ impl Default for DependencyLens {
 }
 
 impl DependencyLens {
+    /// Loads the settings from the host. The cache is replaced only when its lifetime changed.
+    fn reload_settings(&mut self) {
+        let settings = Settings::from_host();
+        if settings.cache_ttl_secs != self.settings.cache_ttl_secs {
+            self.cache = Cache::new(settings.cache_ttl_secs);
+        }
+        self.settings = settings;
+    }
+
     /// Analyzes the manifest at `path` and publishes its decorations and problems.
     ///
     /// Publishes once, after the analysis. A cancelled task publishes nothing.
@@ -128,9 +137,11 @@ pub(crate) fn is_manifest(path: &str) -> bool {
 
 impl Plugin for DependencyLens {
     fn activate(&mut self, _ctx: &Context) -> Result<(), Error> {
+        self.reload_settings();
         host::subscribe(EventKind::FileOpened)?;
         host::subscribe(EventKind::FileSaved)?;
-        host::subscribe(EventKind::FilesChanged)
+        host::subscribe(EventKind::FilesChanged)?;
+        host::subscribe(EventKind::SettingsChanged)
     }
 
     fn run_command(
@@ -159,8 +170,10 @@ impl Plugin for DependencyLens {
         // Borrowed paths: the batch is read once and no path is copied.
         let mut changed_paths: Vec<&str> = Vec::new();
         let mut removed_paths: Vec<&str> = Vec::new();
+        let mut settings_changed = false;
         for event in events {
             match event {
+                Event::Other { kind, .. } if kind == "settings-changed" => settings_changed = true,
                 Event::FileOpened(path) | Event::FileSaved(path) => changed_paths.push(path),
                 Event::FilesChanged(changes) => {
                     changed_paths.extend(
@@ -174,6 +187,10 @@ impl Plugin for DependencyLens {
                 }
                 _ => {}
             }
+        }
+        // Reloaded before any refresh below, so this batch's manifests use the new settings.
+        if settings_changed {
+            self.reload_settings();
         }
         for path in removed_paths.into_iter().filter(|path| is_manifest(path)) {
             publish_results(path, &[], &[]);

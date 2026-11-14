@@ -6,6 +6,7 @@ use crate::model::{Dependency, Ecosystem, VersionInfo, Vulnerability};
 use crate::osv::{OsvQuery, declared_version_for_osv, query_batch};
 use crate::settings::Settings;
 use crate::update::is_outdated;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -102,10 +103,15 @@ pub fn analyze(
             pending: 0,
         };
     }
-    let ignored: HashSet<&str> = settings.ignore.iter().map(String::as_str).collect();
+    // The ignore list is normalised once per call, so each dependency name is the only per-item work.
+    let ignored: HashSet<Cow<'_, str>> = settings
+        .ignore
+        .iter()
+        .map(|entry| eco.normalize_package(entry))
+        .collect();
     let kept: Vec<Dependency> = deps
         .into_iter()
-        .filter(|dependency| !ignored.contains(dependency.name.as_str()))
+        .filter(|dependency| !ignored.contains(&eco.normalize_package(&dependency.name)))
         .collect();
     // Each declared version is parsed once; the query and the entry both reuse it.
     let checked_versions: Vec<Option<String>> = kept
@@ -507,6 +513,57 @@ mod tests {
         assert_eq!(
             entry(&after_window, "serde").status,
             Status::Unknown("OSV: HTTP 500".to_string())
+        );
+    }
+
+    /// Runs `analyze` for `eco` on `text` with `ignore` and no advisory checks, and returns the kept names.
+    fn kept_names(eco: Ecosystem, text: &str, ignore: &[&str]) -> Vec<String> {
+        let settings = Settings {
+            vulnerabilities: false,
+            ignore: ignore.iter().map(|name| (*name).to_owned()).collect(),
+            ..Settings::default()
+        };
+        let mut cache = Cache::new(TTL_SECS);
+        let analysis = analyze(
+            eco,
+            eco.parse(text),
+            &mut cache,
+            &FakeHttp::new(),
+            &settings,
+            NOW,
+            &mut Budget::new(usize::MAX, None),
+        );
+        analysis
+            .entries
+            .into_iter()
+            .map(|entry| entry.dependency.name)
+            .collect()
+    }
+
+    #[test]
+    fn ignore_entry_matches_a_pypi_name_after_normalisation() {
+        let text = "flask-login==0.6.0\nrequests==2.28.0\n";
+        assert_eq!(
+            kept_names(Ecosystem::PyPI, text, &["Flask_Login"]),
+            ["requests"]
+        );
+    }
+
+    #[test]
+    fn ignore_entry_matches_a_packagist_name_case_insensitively() {
+        let text = r#"{"require":{"monolog/monolog":"^3.0","psr/log":"^3.0"}}"#;
+        assert_eq!(
+            kept_names(Ecosystem::Packagist, text, &["Monolog/Monolog"]),
+            ["psr/log"]
+        );
+    }
+
+    #[test]
+    fn ignore_entry_that_differs_after_normalisation_keeps_the_dependency() {
+        let text = "flask-login==0.6.0\n";
+        assert_eq!(
+            kept_names(Ecosystem::PyPI, text, &["flask-logins"]),
+            ["flask-login"]
         );
     }
 

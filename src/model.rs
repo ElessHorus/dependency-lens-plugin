@@ -43,6 +43,34 @@ pub enum Ecosystem {
 }
 
 impl Ecosystem {
+    /// Every supported ecosystem, in the order of the settings schema.
+    pub const ALL: [Ecosystem; 9] = [
+        Ecosystem::Cargo,
+        Ecosystem::Npm,
+        Ecosystem::PyPI,
+        Ecosystem::Go,
+        Ecosystem::Packagist,
+        Ecosystem::Pub,
+        Ecosystem::NuGet,
+        Ecosystem::RubyGems,
+        Ecosystem::Maven,
+    ];
+
+    /// Returns the id that names this ecosystem in the `ecosystems.<id>.enabled` setting.
+    pub fn settings_id(self) -> &'static str {
+        match self {
+            Ecosystem::Cargo => "cargo",
+            Ecosystem::Npm => "npm",
+            Ecosystem::PyPI => "pypi",
+            Ecosystem::Go => "go",
+            Ecosystem::Packagist => "packagist",
+            Ecosystem::Pub => "pub",
+            Ecosystem::NuGet => "nuget",
+            Ecosystem::RubyGems => "rubygems",
+            Ecosystem::Maven => "maven",
+        }
+    }
+
     /// Detects the ecosystem of a manifest from its path.
     ///
     /// Accepts `/` or `\` separators and matches on the file name only.
@@ -345,6 +373,41 @@ mod tests {
         let dependencies = Ecosystem::Maven.parse(manifest);
         assert_eq!(dependencies.len(), 7);
         assert_eq!(dependencies, parsers::maven::parse(manifest));
+    }
+
+    #[test]
+    fn all_lists_nine_distinct_ecosystems() {
+        let distinct: std::collections::BTreeSet<Ecosystem> = Ecosystem::ALL.into_iter().collect();
+        assert_eq!(Ecosystem::ALL.len(), 9);
+        assert_eq!(distinct.len(), 9);
+    }
+
+    #[test]
+    fn settings_ids_are_the_schema_ids() {
+        let ids: Vec<&str> = Ecosystem::ALL.iter().map(|eco| eco.settings_id()).collect();
+        assert_eq!(
+            ids,
+            [
+                "cargo",
+                "npm",
+                "pypi",
+                "go",
+                "packagist",
+                "pub",
+                "nuget",
+                "rubygems",
+                "maven"
+            ]
+        );
+    }
+
+    #[test]
+    fn every_settings_id_has_an_enabled_key_in_the_schema() {
+        let schema = include_str!("../settings.schema.json");
+        for eco in Ecosystem::ALL {
+            let key = format!("\"ecosystems.{}.enabled\"", eco.settings_id());
+            assert!(schema.contains(&key), "schema lacks {key}");
+        }
     }
 
     #[test]

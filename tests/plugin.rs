@@ -259,7 +259,7 @@ fn unknown_command_is_not_found() {
 }
 
 #[test]
-fn activation_subscribes_to_the_three_events() {
+fn activation_subscribes_to_the_four_events() {
     let host = host_counting_fetches(Rc::new(Cell::new(0)));
     let mut plugin = DependencyLens::default();
     plugin.activate(&Context::default()).unwrap();
@@ -269,8 +269,97 @@ fn activation_subscribes_to_the_three_events() {
             EventKind::FileOpened,
             EventKind::FileSaved,
             EventKind::FilesChanged,
+            EventKind::SettingsChanged,
         ])
     );
+}
+
+const PLUGIN_ID: &str = "local.dependency-lens";
+/// Batch path that OSV answers for each uncached `(name, version)` set.
+const OSV_BATCH_PATH: &str = "/v1/querybatch";
+
+/// Counts the OSV batch requests the plugin sent.
+fn osv_batch_requests(host: &MockHost) -> usize {
+    host.requests()
+        .iter()
+        .filter(|request| request.url.ends_with(OSV_BATCH_PATH))
+        .count()
+}
+
+#[test]
+fn disabled_pypi_setting_skips_requirements_and_keeps_cargo() {
+    let fetches = Rc::new(Cell::new(0));
+    let host = host_with_pypi(fetches.clone());
+    host.set_setting("ecosystems.pypi.enabled", "false");
+    let mut plugin = DependencyLens::default();
+    plugin.activate(&host.context(PLUGIN_ID)).unwrap();
+
+    host.add_file("requirements.txt", REQUIREMENTS);
+    plugin.handle_events(
+        &[Event::FileOpened(REQUIREMENTS_PATH.to_owned())],
+        &host.invocation(),
+    );
+    assert_eq!(fetches.get(), 0);
+    assert!(decorations_of(&host, REQUIREMENTS_PATH).is_empty());
+
+    open_manifest(&host, &mut plugin);
+    assert_eq!(decorations_of(&host, MANIFEST_PATH).len(), 1);
+}
+
+#[test]
+fn disabled_vulnerabilities_setting_sends_no_osv_request() {
+    let fetches = Rc::new(Cell::new(0));
+    let host = host_counting_fetches(fetches.clone());
+    host.set_setting("vulnerabilities", "false");
+    let mut plugin = DependencyLens::default();
+    plugin.activate(&host.context(PLUGIN_ID)).unwrap();
+
+    open_manifest(&host, &mut plugin);
+    assert_eq!(fetches.get(), 0);
+    assert!(decorations_of(&host, MANIFEST_PATH).is_empty());
+}
+
+#[test]
+fn settings_changed_event_disables_an_ecosystem_for_later_opens() {
+    let fetches = Rc::new(Cell::new(0));
+    let host = host_counting_fetches(fetches.clone());
+    let mut plugin = DependencyLens::default();
+    plugin.activate(&host.context(PLUGIN_ID)).unwrap();
+
+    host.set_setting("ecosystems.cargo.enabled", "false");
+    plugin.handle_events(
+        &[Event::Other {
+            kind: "settings-changed".to_owned(),
+            data: r#"["ecosystems.cargo.enabled"]"#.to_owned(),
+        }],
+        &host.invocation(),
+    );
+    assert_eq!(fetches.get(), 0);
+
+    open_manifest(&host, &mut plugin);
+    assert_eq!(fetches.get(), 0);
+}
+
+#[test]
+fn settings_changed_event_with_zero_ttl_replaces_the_cache() {
+    let host = host_counting_fetches(Rc::new(Cell::new(0)));
+    let mut plugin = DependencyLens::default();
+    plugin.activate(&host.context(PLUGIN_ID)).unwrap();
+
+    host.set_setting("cacheTtlSeconds", "0");
+    plugin.handle_events(
+        &[Event::Other {
+            kind: "settings-changed".to_owned(),
+            data: r#"["cacheTtlSeconds"]"#.to_owned(),
+        }],
+        &host.invocation(),
+    );
+    open_manifest(&host, &mut plugin);
+    plugin.handle_events(
+        &[Event::FileOpened(MANIFEST_PATH.to_owned())],
+        &host.invocation(),
+    );
+    assert_eq!(osv_batch_requests(&host), 2);
 }
 
 #[test]
