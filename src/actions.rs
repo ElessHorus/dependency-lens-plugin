@@ -480,6 +480,7 @@ mod tests {
                     ecosystem: eco.osv_name().to_owned(),
                     name: package.to_owned(),
                     ranges: vec![range],
+                    versions: Vec::new(),
                 }],
                 FIX_NOW,
             );
