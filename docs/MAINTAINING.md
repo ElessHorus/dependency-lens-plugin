@@ -13,6 +13,15 @@ Run these checks in the real IDE, after building and linking the plugin (see the
 5. Open a manifest with an old package that has many advisories, such as a `Gemfile` with `nokogiri 1.10.0`. Check that the first open is fast, that the hover lists 10 advisories and a line such as `N more not loaded`, and that the command "Dependency Lens: Load all vulnerabilities" loads the others.
 5. Turn one ecosystem off in the settings. Check that no request is sent for its manifests.
 
+## Updating the pinned actions
+
+The workflows pin each action to a commit SHA, with the version in a comment. A moved tag then cannot change what runs next to the signing key. A pinned action does not update itself, so renew the pins now and then, and after a security notice.
+
+1. Find the newest release of each action: `actions/checkout`, `Swatinem/rust-cache` and `dtolnay/rust-toolchain`. For the first two, take the newest tag of the major version in use, such as `v4.x.y`.
+2. Read its commit SHA: `gh api repos/<owner>/<repo>/commits/<tag> --jq .sha`.
+3. `dtolnay/rust-toolchain` reads its toolchain from the name after the `@`. Take the SHA of its `stable` branch (`gh api repos/dtolnay/rust-toolchain/branches/stable --jq .commit.sha`), because that branch sets `stable` as the default. A SHA from the `master` branch needs `with: toolchain: stable`.
+4. Replace the SHA and the version comment in `.github/workflows/ci.yml` and `release.yml`, then run the CI workflow (`gh workflow run ci.yml --ref <branch>`) before you merge.
+
 ## Before the first release
 
 1. Run `actionlint` on both files in `.github/workflows/`.
