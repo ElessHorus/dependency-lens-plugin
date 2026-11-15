@@ -46,7 +46,7 @@ The hover shows the package name and the declared version. It adds the latest ve
 
 The plugin loads the details of the first 10 advisories of each package version. This keeps the first open of an old package fast, because each detail is one request. The decoration and the problem still show the exact number of advisories. The hover lists the 10 loaded advisories and adds one line, for example `15 more not loaded`. Advisories that are not loaded have an unknown severity, so the `minimumSeverity` setting does not hide them, and they do not set the problem severity.
 
-To load the others, run "Dependency Lens: Load all vulnerabilities" in the open manifest. One run loads up to 100 details. Run it again when more are left. The loaded details stay in the cache for `cacheTtlSeconds`. After that, the manifest shows 10 advisories again.
+To load the others, use one of two ways. In the hover or the quick fix menu of the dependency, pick `Load <n> more vulnerabilities of <name>`: it loads the advisories of that dependency only, and shows them at once. Or run "Dependency Lens: Load all vulnerabilities" in the open manifest, which loads them for every dependency. One run loads up to 100 details. Run it again when more are left. The loaded details stay in the cache for `cacheTtlSeconds`. After that, the manifest shows 10 advisories again.
 
 ### Problems view
 

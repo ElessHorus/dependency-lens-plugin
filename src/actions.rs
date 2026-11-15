@@ -12,11 +12,17 @@ use crate::update::{UpdateKind, is_outdated, render_update, update_kind};
 use openidea_plugin::providers::CodeAction;
 use openidea_plugin::{Range, TextEdit};
 
+/// The start of the `data` of an action that loads the deferred advisories of one dependency.
+/// The rest of the text is the package name.
+pub const LOAD_ACTION_PREFIX: &str = "load-vulnerabilities:";
+
 /// Quick fixes for the requirements whose version lies on a selected line.
 ///
 /// A dependency with known vulnerabilities gets a fix to the smallest version that fixes them, in
 /// every ecosystem. An outdated dependency of an ecosystem with a registry also gets an update to the
-/// latest release, after the fix. Reads the cache only: an editor provider must never reach the network.
+/// latest release, after the fix. A dependency whose advisories wait for their details also gets an
+/// action that loads them, which runs when the user picks it. Listing the actions reads the cache
+/// only: an editor provider must never reach the network.
 pub fn code_actions(
     cache: &Cache,
     settings: &Settings,
@@ -57,9 +63,45 @@ pub fn code_actions(
             {
                 update.preferred = false;
             }
-            fix.into_iter().chain(update)
+            let load = settings
+                .vulnerabilities
+                .then(|| load_action_for(cache, eco, dep, now))
+                .flatten();
+            fix.into_iter().chain(update).chain(load)
         })
         .collect()
+}
+
+/// The action that loads the deferred advisories of `dep`, `None` when none waits for its details.
+///
+/// The action has no edit. Its `data` names the package, and picking it resolves the action,
+/// which loads the details and refreshes the manifest.
+fn load_action_for(
+    cache: &Cache,
+    eco: Ecosystem,
+    dep: &Dependency,
+    now: u64,
+) -> Option<CodeAction> {
+    let current = declared_version_for_osv(&dep.version)?;
+    let waiting = cache
+        .vulnerabilities(eco, &dep.name, &current, now)?
+        .iter()
+        .filter(|vulnerability| {
+            is_deferred(vulnerability) && cache.advisory(&vulnerability.id, now).is_none()
+        })
+        .count();
+    let noun = if waiting == 1 {
+        "vulnerability"
+    } else {
+        "vulnerabilities"
+    };
+    (waiting > 0).then(|| CodeAction {
+        title: format!("Load {waiting} more {noun} of {}", dep.name),
+        kind: Some("quickfix".to_string()),
+        preferred: false,
+        edits: Vec::new(),
+        data: Some(format!("{LOAD_ACTION_PREFIX}{}", dep.name)),
+    })
 }
 
 /// The quick fix that moves `dep` to the smallest version that fixes its cached advisories.
@@ -775,5 +817,94 @@ mod tests {
         );
         let preferred: Vec<bool> = actions.iter().map(|action| action.preferred).collect();
         assert_eq!(preferred, [true, false]);
+    }
+
+    // the action that loads the deferred advisories
+
+    /// A cache that lists `deferred` advisories of one dependency that wait for their details.
+    fn deferred_cache(eco: Ecosystem, package: &str, version: &str, deferred: usize) -> Cache {
+        let mut cache = Cache::new(TTL_SECS);
+        let listed = (0..deferred)
+            .map(|number| Vulnerability {
+                id: format!("GHSA-{number:04}"),
+                severity: AdvisorySeverity::Medium,
+                summary: crate::osv::DEFERRED_SUMMARY.to_owned(),
+                url: None,
+            })
+            .collect();
+        cache.put_vulnerabilities(eco, package, version, listed, FIX_NOW);
+        cache
+    }
+
+    const SMALLVEC: &str = "[dependencies]\nsmallvec = \"1.6.0\"\n";
+
+    #[test]
+    fn deferred_advisories_get_an_action_that_loads_them() {
+        let settings = Settings::default();
+        let cache = deferred_cache(Ecosystem::Cargo, "smallvec", "1.6.0", 33);
+        let actions = actions_at(&cache, &settings, "/p/Cargo.toml", SMALLVEC, 1);
+        assert_eq!(actions.len(), 1);
+        let load = &actions[0];
+        assert_eq!(load.title, "Load 33 more vulnerabilities of smallvec");
+        assert_eq!(load.kind.as_deref(), Some("quickfix"));
+        assert!(!load.preferred);
+        // The action has no edit: picking it runs the load, which resolves it.
+        assert!(load.edits.is_empty());
+        assert_eq!(load.data.as_deref(), Some("load-vulnerabilities:smallvec"));
+
+        let one = deferred_cache(Ecosystem::Cargo, "smallvec", "1.6.0", 1);
+        let titles: Vec<String> = actions_at(&one, &settings, "/p/Cargo.toml", SMALLVEC, 1)
+            .into_iter()
+            .map(|action| action.title)
+            .collect();
+        assert_eq!(titles, ["Load 1 more vulnerability of smallvec"]);
+    }
+
+    #[test]
+    fn no_load_action_without_deferred_advisories_or_when_their_details_are_cached() {
+        let settings = Settings::default();
+        // Nothing is deferred.
+        let none = deferred_cache(Ecosystem::Cargo, "smallvec", "1.6.0", 0);
+        assert!(actions_at(&none, &settings, "/p/Cargo.toml", SMALLVEC, 1).is_empty());
+        // Another package already loaded the details of two of the three, so only one waits.
+        let mut cache = deferred_cache(Ecosystem::Cargo, "smallvec", "1.6.0", 3);
+        for number in 0..2 {
+            cache.put_advisory(
+                Vulnerability {
+                    id: format!("GHSA-{number:04}"),
+                    severity: AdvisorySeverity::Low,
+                    summary: "Loaded".to_owned(),
+                    url: None,
+                },
+                FIX_NOW,
+            );
+        }
+        let titles: Vec<String> = actions_at(&cache, &settings, "/p/Cargo.toml", SMALLVEC, 1)
+            .into_iter()
+            .map(|action| action.title)
+            .collect();
+        assert_eq!(titles, ["Load 1 more vulnerability of smallvec"]);
+        // Vulnerabilities off, an ignored package and a cold cache offer nothing.
+        let cache = deferred_cache(Ecosystem::Cargo, "smallvec", "1.6.0", 3);
+        let off = Settings {
+            vulnerabilities: false,
+            ..Settings::default()
+        };
+        assert!(actions_at(&cache, &off, "/p/Cargo.toml", SMALLVEC, 1).is_empty());
+        let ignoring = Settings {
+            ignore: vec!["smallvec".to_owned()],
+            ..Settings::default()
+        };
+        assert!(actions_at(&cache, &ignoring, "/p/Cargo.toml", SMALLVEC, 1).is_empty());
+        assert!(
+            actions_at(
+                &Cache::new(TTL_SECS),
+                &settings,
+                "/p/Cargo.toml",
+                SMALLVEC,
+                1
+            )
+            .is_empty()
+        );
     }
 }
