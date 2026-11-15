@@ -4,7 +4,7 @@ This page is for the maintainer. It lists the checks to run in the IDE, the step
 
 ## Checks in OpenIDEA
 
-Run these checks in the real IDE, after building and linking the plugin (see the Building section of the README).
+Run these checks in the real IDE, after building and linking the plugin (see the Building section of the README). The IDE loads `dist/plugin.wasm`, not `target/`. Run `openidea-plugin build` after every code change, then choose Reload in Settings › Plugins. A stale `dist/plugin.wasm` runs old code, and a plain `cargo build` does not update it.
 
 1. Open `fixtures/rust-app/Cargo.toml`, `ts-app/package.json`, `go-app/go.mod`, `python-app/requirements.txt` (or `pyproject.toml`) and `java-app/pom.xml` of the OpenIDEA checkout. Also open a `composer.json`, a `pubspec.yaml`, a `.csproj` file and a `Gemfile`. Check the decorations, the hover, the Problems view and the quick fix.
 2. Measure the time from opening a manifest to its final decoration. Measure it cold and warm, on a manifest with 50 or more dependencies.

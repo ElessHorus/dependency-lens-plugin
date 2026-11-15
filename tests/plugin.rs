@@ -429,6 +429,78 @@ fn the_load_command_says_when_vulnerabilities_are_turned_off() {
     );
 }
 
+/// A host for a Gemfile whose only gem has `advisory_count` advisories, counting detail requests.
+fn host_with_gem_advisories(advisory_count: usize, detail_requests: Rc<Cell<u32>>) -> MockHost {
+    let host = MockHost::install().with_capabilities(&[
+        "events",
+        "project.read",
+        "editor.read",
+        "net:api.osv.dev",
+        "net:rubygems.org",
+    ]);
+    host.set_project_root(Some("/p"));
+    host.on_fetch(move |request| {
+        let body = if request.url.ends_with(OSV_BATCH_SUFFIX) {
+            let query_body: Value =
+                serde_json::from_slice(request.body.as_deref().unwrap_or_default())
+                    .unwrap_or(Value::Null);
+            let results: Vec<Value> = query_body["queries"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|_| {
+                    let vulns: Vec<Value> = (0..advisory_count)
+                        .map(|number| json!({ "id": format!("GHSA-{number:04}") }))
+                        .collect();
+                    json!({ "vulns": vulns })
+                })
+                .collect();
+            json!({ "results": results }).to_string()
+        } else if let Some(id) = request.url.strip_prefix(OSV_DETAIL_PREFIX) {
+            detail_requests.set(detail_requests.get() + 1);
+            json!({ "id": id, "summary": "Test advisory", "database_specific": { "severity": "HIGH" } })
+                .to_string()
+        } else if request.url.starts_with("https://rubygems.org/api/v1/versions/") {
+            r#"[{"number":"1.16.0","prerelease":false},{"number":"1.10.0","prerelease":false}]"#
+                .to_owned()
+        } else {
+            return Err(Error::Failed(format!("unexpected request {}", request.url)));
+        };
+        Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: body.into_bytes(),
+        })
+    });
+    host
+}
+
+#[test]
+fn a_gemfile_with_many_advisories_loads_only_ten_details_on_open() {
+    let detail_requests = Rc::new(Cell::new(0));
+    let host = host_with_gem_advisories(43, detail_requests.clone());
+    host.add_file(
+        "Gemfile",
+        "source 'https://rubygems.org'\ngem 'nokogiri', '1.10.0'\n",
+    );
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(GEMFILE_PATH.to_owned())],
+        &host.invocation(),
+    );
+    let decorations = decorations_of(&host, GEMFILE_PATH);
+    assert_eq!(decorations.len(), 1);
+    let hover = decorations[0].hover.clone().unwrap();
+    // Count the advisory lines of the hover, as the user reads them.
+    let advisory_lines = hover
+        .lines()
+        .filter(|line| line.starts_with("- [GHSA-"))
+        .count();
+    assert_eq!(detail_requests.get(), 10, "detail requests, hover: {hover}");
+    assert_eq!(advisory_lines, 10, "hover: {hover}");
+    assert!(hover.contains("33 more not loaded"), "{hover}");
+}
+
 #[test]
 fn unknown_command_is_not_found() {
     let host = host_counting_fetches(Rc::new(Cell::new(0)));
