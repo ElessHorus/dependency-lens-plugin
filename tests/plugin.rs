@@ -556,7 +556,8 @@ fn a_request_cancelled_by_the_host_shows_nothing_and_does_not_block_the_next_ope
     let decorations = decorations_of(&host, MANIFEST_PATH);
     assert_eq!(decorations.len(), 1);
     assert_eq!(decorations[0].after.as_deref(), Some("⚠ 1 vulnerability"));
-    assert_eq!(osv_batch_requests(&host), 2);
+    // The cancelled batch, then the two slices of the newer call (1 dependency, then the other).
+    assert_eq!(osv_batch_requests(&host), 3);
 }
 
 #[test]
@@ -830,12 +831,14 @@ fn raising_the_minimum_severity_republishes_from_the_cache_without_a_request() {
     plugin.activate(&host.context(PLUGIN_ID)).unwrap();
     open_manifest(&host, &mut plugin);
     assert_eq!(diagnostics_of(&host, MANIFEST_PATH).len(), 1);
-    assert_eq!(osv_batch_requests(&host), 1);
+    let batches_after_open = osv_batch_requests(&host);
+    assert!(batches_after_open >= 1);
 
     host.set_setting("minimumSeverity", "\"critical\"");
     send_settings_changed(&host, &mut plugin, "minimumSeverity");
     assert!(diagnostics_of(&host, MANIFEST_PATH).is_empty());
-    assert_eq!(osv_batch_requests(&host), 1);
+    // The change reads the cache: no request follows.
+    assert_eq!(osv_batch_requests(&host), batches_after_open);
 }
 
 #[test]
@@ -844,6 +847,7 @@ fn a_removed_manifest_is_not_republished_after_a_settings_change() {
     let mut plugin = DependencyLens::default();
     plugin.activate(&host.context(PLUGIN_ID)).unwrap();
     open_manifest(&host, &mut plugin);
+    let batches_after_open = osv_batch_requests(&host);
     plugin.handle_events(
         &[Event::FilesChanged(FilesChanged {
             created: Vec::new(),
@@ -854,7 +858,7 @@ fn a_removed_manifest_is_not_republished_after_a_settings_change() {
     );
     send_settings_changed(&host, &mut plugin, "minimumSeverity");
     assert!(decorations_of(&host, MANIFEST_PATH).is_empty());
-    assert_eq!(osv_batch_requests(&host), 1);
+    assert_eq!(osv_batch_requests(&host), batches_after_open);
 }
 
 #[test]
@@ -1377,8 +1381,9 @@ fn default_limits_resolve_every_package_in_one_refresh() {
             .iter()
             .all(|decoration| decoration.after.as_deref() == Some(LATEST_TEXT))
     );
-    assert_eq!(fetches.get(), 1 + 300);
-    assert_eq!(osv_batch_requests(&host), 1);
+    // One batch per slice: 1 dependency at first, then each slice doubles (1, 1, 2, 4, ... 128, 44).
+    assert_eq!(fetches.get(), 10 + 300);
+    assert_eq!(osv_batch_requests(&host), 10);
 
     let tasks = host.tasks();
     let last_report = tasks.last().and_then(|task| task.reports.last());
@@ -1399,14 +1404,16 @@ fn zero_time_box_gives_each_save_one_chunk_until_all_resolve() {
         &host.invocation(),
     );
 
-    assert_eq!(fetches.get(), 1 + 20);
+    // The first chunk is a slice of 1 dependency: one batch, and the registry of that one.
+    assert_eq!(osv_batch_requests(&host), 1);
+    assert_eq!(registry_requests(&host), 1);
     assert_eq!(
         count_decorations_with(&host, REQUIREMENTS_PATH, LATEST_TEXT),
-        20
+        1
     );
     assert_eq!(
         count_decorations_with(&host, REQUIREMENTS_PATH, PENDING_TEXT),
-        280
+        299
     );
     assert!(
         decorations_of(&host, REQUIREMENTS_PATH)
@@ -1415,23 +1422,19 @@ fn zero_time_box_gives_each_save_one_chunk_until_all_resolve() {
             .all(|decoration| decoration.style == "muted")
     );
 
-    for save_number in 1..=14 {
+    // Each save makes one more chunk. The slices double, then the registry takes 20 a chunk.
+    let mut saves = 0;
+    while count_decorations_with(&host, REQUIREMENTS_PATH, LATEST_TEXT) < 300 {
+        saves += 1;
+        assert!(saves <= 20, "still pending after {saves} saves");
         plugin.handle_events(
             &[Event::FileSaved(REQUIREMENTS_PATH.to_owned())],
             &host.invocation(),
         );
-        assert_eq!(
-            fetches.get(),
-            1 + 20 * (save_number + 1),
-            "after save {save_number}"
-        );
     }
     assert_eq!(registry_requests(&host), 300);
-    assert_eq!(osv_batch_requests(&host), 1);
-    assert_eq!(
-        count_decorations_with(&host, REQUIREMENTS_PATH, LATEST_TEXT),
-        300
-    );
+    assert_eq!(largest_repeat_of_a_lookup(&host), 1);
+    assert_eq!(osv_batch_requests(&host), 10);
 }
 
 #[test]
@@ -1452,22 +1455,28 @@ fn batch_of_manifests_gives_each_its_first_chunk_then_each_save_finishes_it() {
         &host.invocation(),
     );
 
+    // Each manifest makes progress: its first slice of 1 dependency.
     assert_eq!(osv_batch_requests(&host), 3);
-    assert_eq!(registry_requests(&host), 60);
+    assert_eq!(registry_requests(&host), 3);
     for path in paths {
-        assert_eq!(count_decorations_with(&host, path, LATEST_TEXT), 20);
-        assert_eq!(count_decorations_with(&host, path, PENDING_TEXT), 20);
+        assert_eq!(count_decorations_with(&host, path, LATEST_TEXT), 1);
+        assert_eq!(count_decorations_with(&host, path, PENDING_TEXT), 39);
     }
 
-    plugin.handle_events(
-        &paths.map(|path| Event::FileSaved(path.to_owned())),
-        &host.invocation(),
-    );
-    assert_eq!(registry_requests(&host), 120);
-    assert_eq!(osv_batch_requests(&host), 3);
-    for path in paths {
-        assert_eq!(count_decorations_with(&host, path, LATEST_TEXT), 40);
+    let mut saves = 0;
+    while paths
+        .iter()
+        .any(|path| count_decorations_with(&host, path, LATEST_TEXT) < 40)
+    {
+        saves += 1;
+        assert!(saves <= 20, "still pending after {saves} saves");
+        plugin.handle_events(
+            &paths.map(|path| Event::FileSaved(path.to_owned())),
+            &host.invocation(),
+        );
     }
+    assert_eq!(registry_requests(&host), 120);
+    assert_eq!(largest_repeat_of_a_lookup(&host), 1);
 }
 
 #[test]
@@ -1505,10 +1514,14 @@ fn progress_reports_grow_during_one_refresh() {
     let tasks = host.tasks();
     assert_eq!(tasks.len(), 1);
     let done_counts: Vec<u32> = tasks[0].reports.iter().map(|(done, _, _)| *done).collect();
-    assert_eq!(
-        done_counts,
-        (1..=15).map(|chunk| chunk * 20).collect::<Vec<u32>>()
-    );
+    // The OSV slices double (1, 2, 4, 8, 16, 32). Once OSV has answered for all of them, the
+    // registry lookups go 20 at a time.
+    let expected: Vec<u32> = [1, 2, 4, 8, 16, 32]
+        .into_iter()
+        .chain((52..300).step_by(20))
+        .chain([300])
+        .collect();
+    assert_eq!(done_counts, expected);
     assert!(
         tasks[0]
             .reports
@@ -1555,7 +1568,7 @@ fn time_box_too_large_for_the_clock_still_resolves_every_package() {
         count_decorations_with(&host, REQUIREMENTS_PATH, LATEST_TEXT),
         300
     );
-    assert_eq!(fetches.get(), 1 + 300);
+    assert_eq!(fetches.get(), 10 + 300);
 }
 
 #[test]
