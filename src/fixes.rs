@@ -6,7 +6,7 @@
 //! advisory of its current version.
 
 use crate::model::{Affected, Ecosystem, RangeEvent};
-use crate::registries::dotted::{DottedVersion, segment};
+use crate::registries::dotted::{DottedVersion, PubVersion, segment};
 use crate::registries::gem_version::GemVersion;
 use crate::registries::pep440::Pep440;
 use crate::update::{UpdateVersion, split_operator};
@@ -63,6 +63,9 @@ pub fn fixed_version(
         Ecosystem::RubyGems => {
             fixed_version_of::<GemVersion>(eco, package, current, affected).map(|(_, text)| text)
         }
+        Ecosystem::Pub => {
+            fixed_version_of::<PubVersion>(eco, package, current, affected).map(|(_, text)| text)
+        }
         _ => {
             fixed_version_of::<DottedVersion>(eco, package, current, affected).map(|(_, text)| text)
         }
@@ -97,8 +100,11 @@ fn fix_of_range<V: UpdateVersion>(events: &[RangeEvent], current: &V) -> Option<
         match event {
             RangeEvent::Introduced(text) => introduced = V::parse_version(text),
             RangeEvent::Fixed(text) => {
-                let fixed = V::parse_version(text)?;
-                if introduced.as_ref().is_some_and(|start| start <= current) && *current < fixed {
+                // A fixed version that is not a version, such as a commit, skips only its interval.
+                if let Some(fixed) = V::parse_version(text)
+                    && introduced.as_ref().is_some_and(|start| start <= current)
+                    && *current < fixed
+                {
                     return Some((fixed, text.clone()));
                 }
                 introduced = None;
@@ -124,6 +130,7 @@ pub fn plan_fix(
     match eco {
         Ecosystem::PyPI => plan_fix_of::<Pep440>(eco, package, current, advisories, allows),
         Ecosystem::RubyGems => plan_fix_of::<GemVersion>(eco, package, current, advisories, allows),
+        Ecosystem::Pub => plan_fix_of::<PubVersion>(eco, package, current, advisories, allows),
         _ => plan_fix_of::<DottedVersion>(eco, package, current, advisories, allows),
     }
 }
@@ -153,12 +160,15 @@ fn plan_fix_of<V: UpdateVersion>(
     })
 }
 
-/// Reads the constraints of a requirement `line`, where the pin starts at byte `pin_start`.
+/// Reads the constraints of the requirement of `eco` that holds the pin at byte `pin_start` of `line`.
 ///
 /// A constraint is an operator followed by a version that starts with a digit. This reads
-/// `flask>=0.12.2,<1` and `gem 'rails', '>= 7.0', '< 8'`, and leaves out a marker such as `python_version < "3.8"`.
-pub fn line_constraints(line: &str, pin_start: usize) -> LineConstraints {
-    let bytes = line.as_bytes();
+/// `flask>=0.12.2,<1` and `gem 'rails', '>= 7.0', '< 8'`, and leaves out a marker such as
+/// `python_version < "3.8"`, a comment, and the other requirements of the same line.
+pub fn line_constraints(eco: Ecosystem, line: &str, pin_start: usize) -> LineConstraints {
+    let (segment, segment_start) = requirement_segment(eco, line, pin_start);
+    let pin_in_segment = pin_start.saturating_sub(segment_start);
+    let bytes = segment.as_bytes();
     let mut found = LineConstraints {
         pin_operator: None,
         others: Vec::new(),
@@ -166,9 +176,10 @@ pub fn line_constraints(line: &str, pin_start: usize) -> LineConstraints {
     let mut index = 0;
     while index < bytes.len() {
         let follows_operator = index > 0 && b"=<>!~".contains(&bytes[index - 1]);
-        let operator = SCANNED_OPERATORS
-            .iter()
-            .find(|candidate| !follows_operator && line[index..].starts_with(**candidate));
+        // Bytes are compared, because `index` may sit inside a multi-byte character.
+        let operator = SCANNED_OPERATORS.iter().find(|candidate| {
+            !follows_operator && bytes[index..].starts_with(candidate.as_bytes())
+        });
         let Some(operator) = operator else {
             index += 1;
             continue;
@@ -185,12 +196,13 @@ pub fn line_constraints(line: &str, pin_start: usize) -> LineConstraints {
             .count();
         let starts_with_digit = bytes.get(version_start).is_some_and(u8::is_ascii_digit);
         if starts_with_digit {
-            if version_start == pin_start {
+            if version_start == pin_in_segment {
                 found.pin_operator = Some((*operator).to_owned());
             } else {
                 found.others.push(Constraint {
                     operator: (*operator).to_owned(),
-                    version: line[version_start..version_start + version_len].to_owned(),
+                    // The version bytes are ASCII, so the slice is on character boundaries.
+                    version: segment[version_start..version_start + version_len].to_owned(),
                 });
             }
         }
@@ -199,12 +211,32 @@ pub fn line_constraints(line: &str, pin_start: usize) -> LineConstraints {
     found
 }
 
+/// The part of `line` that holds the requirement of the pin, and its start.
+///
+/// A PyPI requirement sits in one string (`"flask>=0.12.2,<1"`) or fills a requirements line,
+/// and a trailing comment is not part of it. A gem lists its constraints in several strings, so
+/// its segment is the line up to a trailing comment.
+fn requirement_segment(eco: Ecosystem, line: &str, pin_start: usize) -> (&str, usize) {
+    let code = line.find(" #").map_or(line, |comment| &line[..comment]);
+    if eco == Ecosystem::RubyGems {
+        return (code, 0);
+    }
+    let before = code.get(..pin_start).unwrap_or(code);
+    let start = before.rfind(['"', '\'']).map_or(0, |quote| quote + 1);
+    let after = code.get(pin_start..).unwrap_or_default();
+    let end = after
+        .find(['"', '\''])
+        .map_or(code.len(), |quote| pin_start + quote);
+    (&code[start..end], start)
+}
+
 /// Returns `true` when `target` satisfies every constraint. A constraint that is not a version
 /// cannot be checked, so it refuses the target.
 pub fn satisfies_all(eco: Ecosystem, target: &str, constraints: &[Constraint]) -> bool {
     match eco {
         Ecosystem::PyPI => satisfies_all_of::<Pep440>(target, constraints),
         Ecosystem::RubyGems => satisfies_all_of::<GemVersion>(target, constraints),
+        Ecosystem::Pub => satisfies_all_of::<PubVersion>(target, constraints),
         _ => satisfies_all_of::<DottedVersion>(target, constraints),
     }
 }
@@ -228,7 +260,8 @@ fn satisfies_all_of<V: UpdateVersion>(target: &str, constraints: &[Constraint]) 
             "~=" | "~>" => {
                 let (bound_segments, target_segments) =
                     (bound.release_segments(), target.release_segments());
-                let kept = bound_segments.len().saturating_sub(1);
+                // `~> 2.2` keeps the major version, and so does `~> 2`: at least one segment is kept.
+                let kept = bound_segments.len().saturating_sub(1).max(1);
                 target >= bound
                     && (0..kept).all(|index| {
                         segment(&target_segments, index) == segment(&bound_segments, index)
@@ -247,6 +280,7 @@ pub fn render_fix(eco: Ecosystem, declared: &str, target: &str) -> Option<String
     match eco {
         Ecosystem::PyPI => render_fix_of::<Pep440>(declared, target),
         Ecosystem::RubyGems => render_fix_of::<GemVersion>(declared, target),
+        Ecosystem::Pub => render_fix_of::<PubVersion>(declared, target),
         _ => render_fix_of::<DottedVersion>(declared, target),
     }
 }
@@ -480,7 +514,7 @@ mod tests {
     fn constraints_are_read_from_the_line_except_the_pin() {
         let line = "  \"flask>=0.12.2,<1\",";
         let pin_start = line.find("0.12.2").unwrap();
-        let found = line_constraints(line, pin_start);
+        let found = line_constraints(Ecosystem::PyPI, line, pin_start);
         assert_eq!(found.pin_operator.as_deref(), Some(">="));
         assert_eq!(
             found.others,
@@ -491,12 +525,12 @@ mod tests {
         );
         // A marker with a quoted version is not a constraint.
         let marked = "\"requests==2.0; python_version < \\\"3.8\\\"\"";
-        let found = line_constraints(marked, marked.find("2.0").unwrap());
+        let found = line_constraints(Ecosystem::PyPI, marked, marked.find("2.0").unwrap());
         assert_eq!(found.pin_operator.as_deref(), Some("=="));
         assert!(found.others.is_empty());
         // Ruby lists each constraint in its own string.
         let gem = "gem 'rails', '>= 7.0.4', '< 8'";
-        let found = line_constraints(gem, gem.find("7.0.4").unwrap());
+        let found = line_constraints(Ecosystem::RubyGems, gem, gem.find("7.0.4").unwrap());
         assert_eq!(found.pin_operator.as_deref(), Some(">="));
         assert_eq!(found.others.len(), 1);
         assert_eq!(found.others[0].version, "8");
@@ -634,6 +668,69 @@ mod tests {
         assert_eq!(
             fixed_version(Ecosystem::Maven, package, "2.0", &log4j).as_deref(),
             Some("2.3.1")
+        );
+    }
+
+    #[test]
+    fn the_line_scan_survives_non_ascii_text_and_stays_inside_the_requirement() {
+        // A non-ASCII character after the pin must not split the scan inside a character.
+        let line = "  \"flask>=0.12.2,<1\",  # prüfen >=3.5";
+        let found = line_constraints(Ecosystem::PyPI, line, line.find("0.12.2").unwrap());
+        assert_eq!(found.others.len(), 1);
+        assert_eq!(found.others[0].version, "1");
+        // Another requirement on the same line is not a constraint of this one.
+        let two = "dependencies = [\"flask>=0.12.2,<1\", \"requests==2.19.0\"]";
+        let found = line_constraints(Ecosystem::PyPI, two, two.find("0.12.2").unwrap());
+        assert_eq!(found.others.len(), 1);
+        assert_eq!(found.others[0].operator, "<");
+        // A requirements line has no quotes, and its comment is left out.
+        let plain = "flask>=0.12.2,<1  # needs >=3.5";
+        let found = line_constraints(Ecosystem::PyPI, plain, plain.find("0.12.2").unwrap());
+        assert_eq!(found.others.len(), 1);
+    }
+
+    #[test]
+    fn an_unparsable_fixed_version_skips_only_its_interval() {
+        let events = affected(
+            "Maven",
+            "g:a",
+            &[&[
+                ("introduced", "0"),
+                ("fixed", "not-a-version"),
+                ("introduced", "2.0"),
+                ("fixed", "2.4.1"),
+            ]],
+        );
+        assert_eq!(
+            fixed_version(Ecosystem::Maven, "g:a", "2.1", &events).as_deref(),
+            Some("2.4.1")
+        );
+    }
+
+    #[test]
+    fn a_single_segment_pessimistic_bound_keeps_its_major_version() {
+        let bound = [Constraint {
+            operator: "~>".to_owned(),
+            version: "2".to_owned(),
+        }];
+        assert!(!satisfies_all(Ecosystem::RubyGems, "3.0.1", &bound));
+        assert!(satisfies_all(Ecosystem::RubyGems, "2.5", &bound));
+    }
+
+    #[test]
+    fn pub_versions_count_their_build_number() {
+        let pub_package = affected(
+            "Pub",
+            "demo",
+            &[&[("introduced", "0"), ("fixed", "0.4.0+2")]],
+        );
+        assert_eq!(
+            fixed_version(Ecosystem::Pub, "demo", "0.4.0+1", &pub_package).as_deref(),
+            Some("0.4.0+2")
+        );
+        assert_eq!(
+            fixed_version(Ecosystem::Pub, "demo", "0.4.0+2", &pub_package),
+            None
         );
     }
 }

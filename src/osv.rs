@@ -357,34 +357,44 @@ fn fetch_detail(http: &dyn Http, id: &str) -> Option<(Vulnerability, Vec<Affecte
     (detail.id == id).then(|| {
         (
             advisory_from_detail(id, &detail),
-            affected_from_detail(&detail),
+            affected_from_detail(&detail).collect(),
         )
     })
 }
 
-/// Reads the affected ranges of an advisory. A package without a name or an ecosystem, and a range of
-/// another kind than `SEMVER` or `ECOSYSTEM`, are left out.
-fn affected_from_detail(detail: &AdvisoryDetail) -> Vec<Affected> {
+/// Reads the affected ranges of an advisory.
+///
+/// An entry that is malformed, that has no package name, or whose ecosystem the plugin does not read, is
+/// left out, and so is a range of another kind than `SEMVER` or `ECOSYSTEM`. Some advisories list
+/// thousands of packages, and only the ones of the nine ecosystems can be a dependency here.
+fn affected_from_detail(detail: &AdvisoryDetail) -> impl Iterator<Item = Affected> + '_ {
     detail
         .affected
         .iter()
         .flatten()
+        .filter_map(|value| AffectedDetail::deserialize(value).ok())
         .filter_map(|entry| {
-            let package = entry.package.as_ref()?;
+            let package = entry.package?;
+            let (name, ecosystem) = (package.name?, package.ecosystem?);
+            if !Ecosystem::ALL
+                .iter()
+                .any(|known| known.osv_name().eq_ignore_ascii_case(&ecosystem))
+            {
+                return None;
+            }
             let ranges = entry
                 .ranges
-                .iter()
+                .into_iter()
                 .flatten()
-                .filter(|range| matches!(range.kind.as_str(), "SEMVER" | "ECOSYSTEM"))
+                .filter(|range| matches!(range.kind.as_deref(), Some("SEMVER" | "ECOSYSTEM")))
                 .map(|range| range.events.iter().filter_map(range_event_of).collect())
                 .collect();
             Some(Affected {
-                ecosystem: package.ecosystem.clone(),
-                name: package.name.clone(),
+                ecosystem,
+                name,
                 ranges,
             })
         })
-        .collect()
 }
 
 /// Reads one range event: the one key that an OSV event object holds.
@@ -558,7 +568,8 @@ struct AdvisoryDetail {
     details: Option<String>,
     severity: Option<Vec<SeverityEntry>>,
     database_specific: Option<DatabaseSpecific>,
-    affected: Option<Vec<AffectedDetail>>,
+    /// Read entry by entry, so a malformed entry never hides the advisory itself.
+    affected: Option<Vec<serde_json::Value>>,
 }
 
 /// One `affected[]` entry of an advisory record.
@@ -571,15 +582,15 @@ struct AffectedDetail {
 /// The `package` of an `affected[]` entry.
 #[derive(Debug, Deserialize)]
 struct PackageDetail {
-    name: String,
-    ecosystem: String,
+    name: Option<String>,
+    ecosystem: Option<String>,
 }
 
 /// One `ranges[]` entry: its kind and its events.
 #[derive(Debug, Deserialize)]
 struct RangeDetail {
     #[serde(rename = "type")]
-    kind: String,
+    kind: Option<String>,
     #[serde(default)]
     events: Vec<RangeEventDetail>,
 }
@@ -1545,5 +1556,30 @@ mod tests {
         let mut cache = Cache::new(TTL_SECS);
         query_batch(&http, &mut cache, &[query("serde", "1.0.0")], NOW, None).unwrap();
         assert_eq!(cache.affected("GHSA-0001", NOW), Some(&[][..]));
+    }
+
+    #[test]
+    fn a_malformed_affected_entry_does_not_hide_the_advisory() {
+        let body = r#"{
+            "id": "GHSA-0002",
+            "summary": "Still shown",
+            "affected": [
+                {"package": {"ecosystem": "npm"}, "ranges": [{"events": [{"introduced": "0"}]}]},
+                {"package": {"name": "ok", "ecosystem": "npm"}, "ranges": [{"type": "SEMVER", "events": [{"introduced": "0"}, {"fixed": "1.2.3"}]}]},
+                {"package": {"name": "other", "ecosystem": "Alpine:v3.5"}, "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": "9"}]}]}
+            ]
+        }"#;
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(&[&["GHSA-0002"]]))
+            .route("GET", &detail_url("GHSA-0002"), 200, body);
+        let mut cache = Cache::new(TTL_SECS);
+        let results = query_batch(&http, &mut cache, &[query("ok", "1.0.0")], NOW, None).unwrap();
+        assert_eq!(results[0][0].summary, "Still shown");
+        // Only the well-formed entry of a known ecosystem is kept.
+        let affected = cache
+            .affected("GHSA-0002", NOW)
+            .expect("affected is cached");
+        assert_eq!(affected.len(), 1);
+        assert_eq!(affected[0].name, "ok");
     }
 }

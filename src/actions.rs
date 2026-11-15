@@ -47,10 +47,16 @@ pub fn code_actions(
                 .vulnerabilities
                 .then(|| fix_action_for(cache, settings, eco, dep, doc_path, doc_text, now))
                 .flatten();
-            let update = eco
+            let mut update = eco
                 .offers_updates()
                 .then(|| action_for(cache, eco, dep, doc_path, doc_text, now))
                 .flatten();
+            // Two preferred actions on one version would leave the choice to the editor.
+            if fix.is_some()
+                && let Some(update) = update.as_mut()
+            {
+                update.preferred = false;
+            }
             fix.into_iter().chain(update)
         })
         .collect()
@@ -70,6 +76,10 @@ fn fix_action_for(
     doc_text: &str,
     now: u64,
 ) -> Option<CodeAction> {
+    // A Maven version that is a property has its text elsewhere, so there is nothing to replace here.
+    if eco == Ecosystem::Maven && dep.has_additional_version_constraints {
+        return None;
+    }
     let current = declared_version_for_osv(&dep.version)?;
     let listed = cache.vulnerabilities(eco, &dep.name, &current, now)?;
     let affected: Vec<&[Affected]> = listed
@@ -84,16 +94,16 @@ fn fix_action_for(
                 .then(|| cache.affected(&known.id, now).unwrap_or_default())
         })
         .collect();
-    // A Maven version that is a property has its text elsewhere, so there is nothing to replace here.
-    if eco == Ecosystem::Maven && dep.has_additional_version_constraints {
-        return None;
-    }
     // For PyPI and RubyGems, the version text excludes its operator, so the operator and the other
     // constraints sit in the line. The other ecosystems write them inside the version text, and an
     // XML tag such as `<version>` would read as an operator.
     let constraints = if matches!(eco, Ecosystem::PyPI | Ecosystem::RubyGems) {
         let line = doc_text.lines().nth(dep.version_span.line as usize)?;
-        Some(line_constraints(line, dep.version_span.line_start as usize))
+        Some(line_constraints(
+            eco,
+            line,
+            dep.version_span.line_start as usize,
+        ))
     } else {
         None
     };
@@ -737,5 +747,33 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn only_the_fix_is_preferred_when_a_line_has_both_actions() {
+        let mut cache = fix_cache(
+            Ecosystem::PyPI,
+            "requests",
+            "2.19.0",
+            &[("GHSA-1", HIGH, &events("2.20.0"))],
+        );
+        cache.put_version_info(
+            Ecosystem::PyPI,
+            "requests",
+            VersionInfo {
+                latest: Some("2.31.0".to_owned()),
+                versions: Vec::new(),
+            },
+            FIX_NOW,
+        );
+        let actions = actions_at(
+            &cache,
+            &Settings::default(),
+            "/p/requirements.txt",
+            "requests==2.19.0\n",
+            0,
+        );
+        let preferred: Vec<bool> = actions.iter().map(|action| action.preferred).collect();
+        assert_eq!(preferred, [true, false]);
     }
 }
