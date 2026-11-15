@@ -389,10 +389,17 @@ fn affected_from_detail(detail: &AdvisoryDetail) -> impl Iterator<Item = Affecte
                 .filter(|range| matches!(range.kind.as_deref(), Some("SEMVER" | "ECOSYSTEM")))
                 .map(|range| range.events.iter().filter_map(range_event_of).collect())
                 .collect();
+            let versions = entry
+                .versions
+                .into_iter()
+                .flatten()
+                .filter_map(|version| version.as_str().map(str::to_owned))
+                .collect();
             Some(Affected {
                 ecosystem,
                 name,
                 ranges,
+                versions,
             })
         })
 }
@@ -577,6 +584,8 @@ struct AdvisoryDetail {
 struct AffectedDetail {
     package: Option<PackageDetail>,
     ranges: Option<Vec<RangeDetail>>,
+    /// Kept as raw values: an item that is not a string is skipped, and the entry stays.
+    versions: Option<Vec<serde_json::Value>>,
 }
 
 /// The `package` of an `affected[]` entry.
@@ -1483,7 +1492,8 @@ mod tests {
                 "ranges": [
                     {"type": "SEMVER", "events": [{"introduced": "0"}, {"fixed": "0.3.3"}]},
                     {"type": "GIT", "repo": "https://example.com/x.git", "events": [{"introduced": "0"}, {"fixed": "abc123"}]}
-                ]
+                ],
+                "versions": ["0.1.0", "0.3.0"]
             },
             {
                 "package": {"name": "other", "ecosystem": "npm"},
@@ -1493,7 +1503,7 @@ mod tests {
     }"#;
 
     #[test]
-    fn the_affected_ranges_of_a_fetched_advisory_are_cached_without_git_ranges() {
+    fn the_affected_ranges_and_versions_of_a_fetched_advisory_are_cached_without_git_ranges() {
         let http = FakeHttp::new()
             .route(
                 "POST",
@@ -1530,6 +1540,7 @@ mod tests {
                         RangeEvent::Introduced("0".to_owned()),
                         RangeEvent::Fixed("0.3.3".to_owned()),
                     ]],
+                    versions: vec!["0.1.0".to_owned(), "0.3.0".to_owned()],
                 },
                 Affected {
                     ecosystem: "npm".to_owned(),
@@ -1538,6 +1549,7 @@ mod tests {
                         RangeEvent::Introduced("1.0".to_owned()),
                         RangeEvent::LastAffected("1.4".to_owned()),
                     ]],
+                    versions: Vec::new(),
                 },
             ]
         );

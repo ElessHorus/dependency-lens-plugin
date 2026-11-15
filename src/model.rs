@@ -236,6 +236,9 @@ pub struct Affected {
     pub name: String,
     /// Each range is its events in order.
     pub ranges: Vec<Vec<RangeEvent>>,
+    /// The versions that the advisory lists as affected, besides its ranges. OSV counts a version
+    /// as affected when it lies in a range or sits in this list.
+    pub versions: Vec<String>,
 }
 
 /// A known vulnerability that affects a package version.

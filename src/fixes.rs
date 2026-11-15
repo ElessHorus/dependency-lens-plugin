@@ -82,20 +82,26 @@ fn fixed_version_of<V: UpdateVersion>(
     ranges_of(eco, package, affected).find_map(|events| fix_of_range(events, &current))
 }
 
+/// Returns the entries of `affected` that name `package` in `eco`.
+fn entries_of<'a>(
+    eco: Ecosystem,
+    package: &str,
+    affected: &'a [Affected],
+) -> impl Iterator<Item = &'a Affected> {
+    let wanted_package = eco.normalize_package(package);
+    affected.iter().filter(move |entry| {
+        entry.ecosystem.eq_ignore_ascii_case(eco.osv_name())
+            && eco.normalize_package(&entry.name) == wanted_package
+    })
+}
+
 /// Returns the event lists of the ranges of the entries of `affected` that name `package` in `eco`.
 fn ranges_of<'a>(
     eco: Ecosystem,
     package: &str,
     affected: &'a [Affected],
 ) -> impl Iterator<Item = &'a [RangeEvent]> {
-    let wanted_package = eco.normalize_package(package);
-    affected
-        .iter()
-        .filter(move |entry| {
-            entry.ecosystem.eq_ignore_ascii_case(eco.osv_name())
-                && eco.normalize_package(&entry.name) == wanted_package
-        })
-        .flat_map(|entry| entry.ranges.iter().map(Vec::as_slice))
+    entries_of(eco, package, affected).flat_map(|entry| entry.ranges.iter().map(Vec::as_slice))
 }
 
 /// Returns the fix of the interval of `events` that holds `current`.
@@ -201,15 +207,40 @@ fn range_holds<V: UpdateVersion>(events: &[ParsedEvent<'_, V>], version: &V) -> 
     is_affected
 }
 
-/// The ranges of one advisory for the package, with their events parsed.
-struct AdvisoryRanges<'a, V> {
+/// What one advisory says about the package, with its versions parsed.
+struct AdvisoryScope<'a, V> {
     ranges: Vec<Vec<ParsedEvent<'a, V>>>,
+    /// The versions that the advisory lists as affected, besides its ranges.
+    versions: Vec<V>,
 }
 
-impl<'a, V: UpdateVersion> AdvisoryRanges<'a, V> {
-    /// Returns `true` when the advisory affects `version` through any of its ranges.
+impl<'a, V: UpdateVersion> AdvisoryScope<'a, V> {
+    /// Reads the ranges and the listed versions of the entries of `affected` for the package.
+    ///
+    /// A listed version that does not parse is skipped.
+    fn of(eco: Ecosystem, package: &str, affected: &'a [Affected]) -> Self {
+        let mut scope = Self {
+            ranges: Vec::new(),
+            versions: Vec::new(),
+        };
+        for entry in entries_of(eco, package, affected) {
+            scope
+                .ranges
+                .extend(entry.ranges.iter().map(|events| parse_range(events)));
+            scope.versions.extend(
+                entry
+                    .versions
+                    .iter()
+                    .filter_map(|text| V::parse_version(text)),
+            );
+        }
+        scope
+    }
+
+    /// Returns `true` when the advisory affects `version`: it lies in a range or the list holds it.
     fn affects(&self, version: &V) -> bool {
         self.ranges.iter().any(|range| range_holds(range, version))
+            || self.versions.contains(version)
     }
 
     /// Returns the `fixed` event that ends the intervals holding `current`, as OSV writes it.
@@ -249,15 +280,13 @@ fn plan_fix_of<V: UpdateVersion>(
 ) -> Option<FixPlan> {
     let current = V::parse_version(current)?;
     // Parse each advisory once. Only an advisory that affects the current version can be fixed.
-    let open_advisories: Vec<AdvisoryRanges<'_, V>> = advisories
+    let open_advisories: Vec<AdvisoryScope<'_, V>> = advisories
         .iter()
-        .map(|affected| AdvisoryRanges {
-            ranges: ranges_of(eco, package, affected).map(parse_range).collect(),
-        })
+        .map(|affected| AdvisoryScope::of(eco, package, affected))
         .filter(|advisory| advisory.affects(&current))
         .collect();
     // The fix of each open advisory for the current version, when it has one.
-    let fixes: Vec<(&AdvisoryRanges<'_, V>, &ParsedEvent<'_, V>)> = open_advisories
+    let fixes: Vec<(&AdvisoryScope<'_, V>, &ParsedEvent<'_, V>)> = open_advisories
         .iter()
         .filter_map(|advisory| Some((advisory, advisory.fix_for(&current)?)))
         .collect();
@@ -269,7 +298,7 @@ fn plan_fix_of<V: UpdateVersion>(
     let least_target = &least_fix.version;
     // The target must fix every advisory that this least target is meant to fix. A later interval of
     // such an advisory may hold the least target, so the target then moves to a higher fix.
-    let must_fix: Vec<&AdvisoryRanges<'_, V>> = fixes
+    let must_fix: Vec<&AdvisoryScope<'_, V>> = fixes
         .iter()
         .filter(|(_, fix)| fix.version <= *least_target)
         .map(|(advisory, _)| *advisory)
@@ -485,6 +514,7 @@ mod tests {
             ecosystem: ecosystem.to_owned(),
             name: name.to_owned(),
             ranges: ranges.iter().map(|events| range(events)).collect(),
+            versions: Vec::new(),
         }]
     }
 
@@ -848,6 +878,66 @@ mod tests {
         .expect("a fix");
         assert_eq!(plan.target, "0.10.0");
         assert_eq!((plan.fixed_count, plan.total_count), (3, 3));
+    }
+
+    fn affected_with_versions(ranges: &[&[(&str, &str)]], versions: &[&str]) -> Vec<Affected> {
+        vec![Affected {
+            versions: versions
+                .iter()
+                .map(|version| (*version).to_owned())
+                .collect(),
+            ..affected("crates.io", "review_demo", ranges).remove(0)
+        }]
+    }
+
+    #[test]
+    fn a_version_listed_in_the_versions_field_is_affected_even_outside_the_ranges() {
+        // OSV: a version is affected when it lies in a range or sits in `versions`.
+        // A is affected on [0, 1.1.0) and [1.5.0, 1.8.0). B is affected on [0, 1.1.0) and lists
+        // 1.1.0, so 1.1.0 does not fix B and the target moves on to 1.8.0.
+        let advisory_a = two_interval_advisory(("fixed", "1.8.0"));
+        let advisory_b =
+            affected_with_versions(&[&[("introduced", "0"), ("fixed", "1.1.0")]], &["1.1.0"]);
+        let plan = plan_of(&[&advisory_a, &advisory_b], |_| true).expect("a fix");
+        assert_eq!(plan.target, "1.8.0");
+        assert_eq!((plan.fixed_count, plan.total_count), (2, 2));
+        // Control: without the listed version, 1.1.0 fixes B and A is fixed by 1.8.0 only after
+        // its second interval, so the plain ranges give the nearest target.
+        let plain_b = affected(
+            "crates.io",
+            "review_demo",
+            &[&[("introduced", "0"), ("fixed", "1.1.0")]],
+        );
+        let plan = plan_of(&[&advisory_a, &plain_b], |_| true).expect("a fix");
+        assert_eq!(plan.target, "1.1.0");
+    }
+
+    #[test]
+    fn an_advisory_that_lists_only_versions_is_open_and_fixed_by_any_other_version() {
+        // C names no range: it affects 1.0.0 only because the list holds it.
+        let advisory_a = affected(
+            "crates.io",
+            "review_demo",
+            &[&[("introduced", "0"), ("fixed", "1.1.0")]],
+        );
+        let advisory_c = affected_with_versions(&[], &["1.0.0", "1.0.1"]);
+        let plan = plan_of(&[&advisory_a, &advisory_c], |_| true).expect("a fix");
+        assert_eq!(plan.target, "1.1.0");
+        assert_eq!((plan.fixed_count, plan.total_count), (2, 2));
+        // The list alone gives no fix, so the plan is empty when nothing else names one.
+        assert!(plan_of(&[&advisory_c], |_| true).is_none());
+    }
+
+    #[test]
+    fn a_listed_version_that_is_not_a_version_is_skipped() {
+        let advisory_a = affected(
+            "crates.io",
+            "review_demo",
+            &[&[("introduced", "0"), ("fixed", "1.1.0")]],
+        );
+        let advisory_c = affected_with_versions(&[], &["not a version", "1.0.0"]);
+        let plan = plan_of(&[&advisory_a, &advisory_c], |_| true).expect("a fix");
+        assert_eq!((plan.fixed_count, plan.total_count), (2, 2));
     }
 
     #[test]
