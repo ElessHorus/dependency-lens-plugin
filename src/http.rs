@@ -1,10 +1,21 @@
 //! HTTP transport seam: the host implementation and a test double.
 
-use openidea_plugin::{HttpRequest, HttpResponse, host};
+use openidea_plugin::{Error, HttpRequest, HttpResponse, host};
 use std::borrow::Cow;
 
 /// Timeout of a request that sets none. The host default (30 s) would let two hung requests fill a chunk.
 const DEFAULT_TIMEOUT_MS: u32 = 10_000;
+
+/// The transport error text of a request that the host cancelled, because a newer call supersedes the current one.
+pub const CANCELLED_MESSAGE: &str = "cancelled";
+
+/// Returns `true` when `message` reports a cancelled request, with or without a `registry:` or `OSV:` prefix.
+pub fn is_cancelled_message(message: &str) -> bool {
+    message == CANCELLED_MESSAGE
+        || message
+            .strip_suffix(CANCELLED_MESSAGE)
+            .is_some_and(|prefix| prefix.ends_with(": "))
+}
 
 /// Returns `true` for a 2xx HTTP status.
 pub fn is_success(status: u16) -> bool {
@@ -22,7 +33,10 @@ pub struct HostHttp;
 
 impl Http for HostHttp {
     fn send(&self, request: &HttpRequest) -> Result<HttpResponse, String> {
-        host::fetch(&with_default_timeout(request)).map_err(|error| error.to_string())
+        host::fetch(&with_default_timeout(request)).map_err(|error| match error {
+            Error::Cancelled => CANCELLED_MESSAGE.to_owned(),
+            other => other.to_string(),
+        })
     }
 }
 

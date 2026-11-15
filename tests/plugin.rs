@@ -502,6 +502,40 @@ fn a_gemfile_with_many_advisories_loads_only_ten_details_on_open() {
 }
 
 #[test]
+fn a_request_cancelled_by_the_host_shows_nothing_and_does_not_block_the_next_open() {
+    // The host cancels a running call when a newer batch of the same kind arrives. The first
+    // OSV request fails with `Cancelled`, and the manifest must not show `?` for the next minute.
+    let host = MockHost::install().with_capabilities(&[
+        "events",
+        "project.read",
+        "editor.read",
+        "net:api.osv.dev",
+    ]);
+    host.set_project_root(Some("/p"));
+    let is_first_batch = Rc::new(Cell::new(true));
+    host.on_fetch(move |request| {
+        if request.url.ends_with(OSV_BATCH_SUFFIX) && is_first_batch.replace(false) {
+            return Err(Error::Cancelled);
+        }
+        answer_osv(request)
+    });
+    let mut plugin = DependencyLens::default();
+    open_manifest(&host, &mut plugin);
+    assert!(decorations_of(&host, MANIFEST_PATH).is_empty());
+    assert!(diagnostics_of(&host, MANIFEST_PATH).is_empty());
+
+    // The newer call, an instant later, asks OSV again and shows the advisory.
+    plugin.handle_events(
+        &[Event::FileOpened(MANIFEST_PATH.to_owned())],
+        &host.invocation(),
+    );
+    let decorations = decorations_of(&host, MANIFEST_PATH);
+    assert_eq!(decorations.len(), 1);
+    assert_eq!(decorations[0].after.as_deref(), Some("⚠ 1 vulnerability"));
+    assert_eq!(osv_batch_requests(&host), 2);
+}
+
+#[test]
 fn unknown_command_is_not_found() {
     let host = host_counting_fetches(Rc::new(Cell::new(0)));
     let mut plugin = DependencyLens::default();

@@ -114,6 +114,7 @@ Add the package name to `ignore`, for example `["serde", "left-pad"]`. The name 
 - Answers are cached in memory for `cacheTtlSeconds` (one hour by default). The cache is lost when the IDE unloads the plugin. A failed lookup is retried after 60 seconds.
 - The IDE unloads an idle plugin after about five minutes, and the in-memory cache is then empty. The "→ x" decorations stay on screen, but the update quick fix is unavailable until the next save or "Dependency Lens: Refresh".
 - "Dependency Lens: Refresh" reads the file again, but it answers from the cache while the entries are younger than `cacheTtlSeconds`.
+- The IDE cancels a running analysis when a newer open or save of the same kind arrives. The cancelled request is not a failure: the plugin shows nothing new for it, and the newer call asks again. If the newer call is for another file, the first manifest keeps what it showed until its next open or save.
 - The update quick fix writes the exact latest version. A compatible-release requirement such as `~=2.28` (Python) or `~> 7.0` (Ruby) becomes narrower after the fix (`~=2.31.0`).
 - Unlisted and deprecated package states are not shown. For NuGet, the latest release can be a version that its author unlisted, because the version index does not tell them apart.
 - The Maven parser reads the `project/properties` block only, for `${name}` version placeholders.

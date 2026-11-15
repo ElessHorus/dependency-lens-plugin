@@ -1,7 +1,7 @@
 //! Analysis pipeline: turns parsed dependencies into entries with status and advisories.
 
 use crate::cache::{Cache, FailureKind};
-use crate::http::{Http, is_success};
+use crate::http::{Http, is_cancelled_message, is_success};
 use crate::model::{Dependency, Ecosystem, VersionInfo, Vulnerability};
 use crate::osv::{
     DEFAULT_DETAILS_PER_QUERY, OsvQuery, declared_version_for_osv, is_deferred, is_placeholder,
@@ -71,6 +71,8 @@ pub struct Budget {
     deadline: Option<Instant>,
     /// Advisories per package version whose details load. The others are deferred.
     details_per_query: usize,
+    /// The host cancelled a request of this run, because a newer call supersedes it.
+    is_cancelled: bool,
 }
 
 impl Budget {
@@ -80,7 +82,19 @@ impl Budget {
             lookups_left: max_lookups,
             deadline,
             details_per_query: DEFAULT_DETAILS_PER_QUERY,
+            is_cancelled: false,
         }
+    }
+
+    /// Records that the host cancelled a request. No lookup starts afterwards.
+    pub(crate) fn cancel(&mut self) {
+        self.is_cancelled = true;
+        self.lookups_left = 0;
+    }
+
+    /// Whether the host cancelled a request of this run. Its results are then incomplete.
+    pub fn is_cancelled(&self) -> bool {
+        self.is_cancelled
     }
 
     /// Sets how many advisories per package version load their details. `usize::MAX` loads all.
@@ -217,6 +231,16 @@ fn resolve_registry(
             };
             if budget.take() {
                 let lookup = lookup_registry(eco, request, &name, http, cache, now);
+                if lookup
+                    .as_ref()
+                    .is_err_and(|reason| is_cancelled_message(reason))
+                {
+                    // The host superseded this call. The entry stays pending, and no lookup follows.
+                    budget.cancel();
+                    pending_count += 1;
+                    entry.status = Status::Pending;
+                    continue;
+                }
                 let status = status_from_lookup(eco, declared, lookup_view(&lookup));
                 fresh.insert(name.into_owned(), lookup);
                 status
@@ -270,7 +294,10 @@ fn lookup_registry(
             Ok(latest)
         }
         Err(reason) => {
-            cache.put_failure(FailureKind::Registry, eco, name, reason.clone(), now);
+            // A cancelled request is not a registry failure: the newer call asks the registry again.
+            if !is_cancelled_message(&reason) {
+                cache.put_failure(FailureKind::Registry, eco, name, reason.clone(), now);
+            }
             Err(reason)
         }
     }
@@ -357,7 +384,7 @@ fn query_missing_vulnerabilities(
     cache: &mut Cache,
     http: &dyn Http,
     now: u64,
-    budget: &Budget,
+    budget: &mut Budget,
 ) -> FreshOsv {
     let details_per_query = budget.details_per_query();
     let mut fresh = FreshOsv::default();
@@ -427,6 +454,8 @@ fn query_missing_vulnerabilities(
                 }
             }
         }
+        // A cancelled request is not an OSV failure: the newer call queries OSV again.
+        Err(reason) if is_cancelled_message(&reason) => budget.cancel(),
         Err(reason) => {
             for query in &queries {
                 record_osv_failure(&mut fresh, cache, eco, query, &reason, now);
@@ -2044,5 +2073,101 @@ mod tests {
         assert_eq!(entry(&second, "old").status, Status::NotChecked);
         assert_eq!(http.count(BATCH_URL), 1);
         assert_eq!(http.count(DETAIL_PREFIX), 15);
+    }
+
+    #[test]
+    fn a_cancelled_osv_request_is_not_cached_as_a_failure() {
+        // The host cancels the call when a newer batch of the same kind arrives. The newer call
+        // must still query OSV, so the cancellation leaves no failure behind.
+        let mut cache = Cache::new(TTL_SECS);
+        let cancelled_http = FakeHttp::new().transport_error("POST", BATCH_URL, "cancelled");
+        let mut budget = Budget::new(usize::MAX, None);
+        let analysis = analyze(
+            Ecosystem::Cargo,
+            parsers::cargo::parse(MANIFEST),
+            &mut cache,
+            &cancelled_http,
+            &Settings::default(),
+            NOW,
+            &mut budget,
+        );
+        assert!(budget.is_cancelled());
+        assert!(
+            analysis
+                .entries
+                .iter()
+                .all(|entry| entry.status == Status::NotChecked)
+        );
+        assert!(
+            cache
+                .failure(
+                    FailureKind::Osv,
+                    Ecosystem::Cargo,
+                    &osv_failure_key("serde", "1.0.0"),
+                    NOW
+                )
+                .is_none()
+        );
+
+        // The next call, a moment later, asks OSV again and shows the advisory.
+        let next = run(
+            &mut cache,
+            &serde_high_http(),
+            &Settings::default(),
+            NOW + 1,
+            MANIFEST,
+        );
+        assert_eq!(entry(&next, "serde").vulnerabilities.len(), 1);
+        assert_eq!(entry(&next, "serde").status, Status::NotChecked);
+    }
+
+    #[test]
+    fn a_cancelled_registry_lookup_stays_pending_and_is_not_cached() {
+        const GEMFILE: &str = "gem 'rails', '7.0.4'\n";
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .transport_error(
+                "GET",
+                "https://rubygems.org/api/v1/versions/rails.json",
+                "cancelled",
+            );
+        let mut budget = Budget::new(usize::MAX, None);
+        let analysis = analyze_gemfile(&mut cache, &http, GEMFILE, &mut budget);
+        assert!(budget.is_cancelled());
+        assert_eq!(entry(&analysis, "rails").status, Status::Pending);
+        assert_eq!(analysis.pending, 1);
+        assert!(
+            cache
+                .failure(FailureKind::Registry, Ecosystem::RubyGems, "rails", NOW)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_ordinary_transport_error_is_still_cached_as_a_failure() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new().transport_error("POST", BATCH_URL, "timeout");
+        let mut budget = Budget::new(usize::MAX, None);
+        analyze(
+            Ecosystem::Cargo,
+            parsers::cargo::parse(MANIFEST),
+            &mut cache,
+            &http,
+            &Settings::default(),
+            NOW,
+            &mut budget,
+        );
+        assert!(!budget.is_cancelled());
+        assert!(
+            cache
+                .failure(
+                    FailureKind::Osv,
+                    Ecosystem::Cargo,
+                    &osv_failure_key("serde", "1.0.0"),
+                    NOW
+                )
+                .is_some()
+        );
     }
 }

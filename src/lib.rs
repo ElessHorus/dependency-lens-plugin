@@ -120,22 +120,23 @@ impl DependencyLens {
     ///
     /// Every call makes at least its first chunk, so each manifest of a batch makes progress.
     ///
-    /// Returns the number of advisories of the manifest whose details are still not loaded.
-    fn refresh(&mut self, path: &str, ctx: &Invocation, limits: RunLimits) -> usize {
+    /// Returns the number of advisories of the manifest whose details are still not loaded,
+    /// or `None` when the host cancelled the run because a newer call supersedes it.
+    fn refresh(&mut self, path: &str, ctx: &Invocation, limits: RunLimits) -> Option<usize> {
         let Some(eco) = Ecosystem::detect(path) else {
-            return 0;
+            return Some(0);
         };
         // The deepest open project holding the path wins; the window's project is only a fallback.
         let Some(project) = host::project_of(path).or_else(|| ctx.project()) else {
             self.forget_shown(path);
-            return 0;
+            return Some(0);
         };
         let text = match project.read_file(path) {
             Ok(text) => text,
             Err(error) => {
                 self.forget_shown(path);
                 host::log(LogLevel::Warn, &format!("cannot read {path}: {error}"));
-                return 0;
+                return Some(0);
             }
         };
         let deps = eco.parse(&text);
@@ -155,7 +156,8 @@ impl DependencyLens {
     ///
     /// Reports progress and checks cancellation after every chunk. The host renews the call's
     /// time budget on each of these, so a long manifest is not cut while it reports.
-    /// Returns the number of advisories whose details are still not loaded after the last chunk.
+    /// Returns the number of advisories whose details are still not loaded after the last chunk,
+    /// or `None` when the host cancelled a request of the first chunk.
     fn publish_chunks(
         &mut self,
         eco: Ecosystem,
@@ -164,7 +166,7 @@ impl DependencyLens {
         deps: &[Dependency],
         task: &Task,
         limits: RunLimits,
-    ) -> usize {
+    ) -> Option<usize> {
         let chunk = self.chunk_size();
         // One clock reading serves the whole run. With a cache lifetime shorter than a chunk, a
         // fresh reading per chunk would expire the answers of the chunk before and repeat its work.
@@ -185,6 +187,12 @@ impl DependencyLens {
                 run_started_at,
                 &mut budget,
             );
+            if budget.is_cancelled() {
+                // A newer call supersedes this one and refreshes the manifest. Publishing the
+                // unfinished analysis would replace good results with `…` or `?`. After the first
+                // chunk, what the editor shows is already a published result, so it stays as it is.
+                return previous_pending.is_some().then_some(0);
+            }
             publish_analysis(path, text, &analysis);
             let pending = analysis.pending;
             let unloaded = analysis.unloaded_advisory_count();
@@ -204,7 +212,7 @@ impl DependencyLens {
                 Instant::now(),
                 limits.deadline,
             ) {
-                return unloaded;
+                return Some(unloaded);
             }
             previous_pending = Some(pending);
         }
@@ -370,14 +378,15 @@ impl Plugin for DependencyLens {
                         "Dependency Lens: vulnerabilities are turned off".to_owned(),
                     ));
                 }
-                let unloaded = self.refresh(&path, ctx, limits);
-                Ok(Some(if unloaded == 0 {
-                    "Dependency Lens: vulnerabilities loaded".to_owned()
-                } else {
-                    format!(
+                let message = match self.refresh(&path, ctx, limits) {
+                    None => "Dependency Lens: a newer request cancelled this one. Run the command again."
+                        .to_owned(),
+                    Some(0) => "Dependency Lens: vulnerabilities loaded".to_owned(),
+                    Some(unloaded) => format!(
                         "Dependency Lens: {unloaded} advisories are still not loaded. Run the command again."
-                    )
-                }))
+                    ),
+                };
+                Ok(Some(message))
             }
             _ => Err(Error::NotFound(format!("command {id}"))),
         }
