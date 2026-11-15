@@ -673,6 +673,40 @@ fn picking_the_load_action_loads_the_other_advisories_and_refreshes_the_manifest
 }
 
 #[test]
+fn picking_the_load_action_does_nothing_when_vulnerabilities_are_turned_off() {
+    let detail_requests = Rc::new(Cell::new(0));
+    let host = host_with_gem_advisories(43, detail_requests.clone());
+    host.add_file(
+        "Gemfile",
+        "source 'https://rubygems.org'\ngem 'nokogiri', '1.10.0'\n",
+    );
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(GEMFILE_PATH.to_owned())],
+        &host.invocation(),
+    );
+    let document = Document {
+        path: GEMFILE_PATH.to_owned(),
+        language: "ruby".to_owned(),
+        version: 1,
+        text: "source 'https://rubygems.org'\ngem 'nokogiri', '1.10.0'\n".to_owned(),
+    };
+    let cursor = Range::new(Position::new(1, 20), Position::new(1, 20));
+    let load = Providers::code_actions(&mut plugin, &document, cursor)
+        .into_iter()
+        .find(|action| action.title.starts_with("Load "))
+        .expect("a load action");
+    let requests_before = host.requests().len();
+
+    // The setting changes between listing the action and picking it.
+    host.set_setting("vulnerabilities", "false");
+    plugin.activate(&host.context(PLUGIN_ID)).unwrap();
+    Providers::resolve_code_action(&mut plugin, &document, load).unwrap();
+    assert_eq!(host.requests().len(), requests_before);
+    assert_eq!(detail_requests.get(), 10);
+}
+
+#[test]
 fn unknown_command_is_not_found() {
     let host = host_counting_fetches(Rc::new(Cell::new(0)));
     let mut plugin = DependencyLens::default();

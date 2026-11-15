@@ -11,6 +11,7 @@ use crate::text::to_range;
 use crate::update::{UpdateKind, is_outdated, render_update, update_kind};
 use openidea_plugin::providers::CodeAction;
 use openidea_plugin::{Range, TextEdit};
+use std::collections::HashSet;
 
 /// The start of the `data` of an action that loads the deferred advisories of one dependency.
 /// The rest of the text is the package name.
@@ -44,7 +45,8 @@ pub fn code_actions(
     let ignored = settings.ignored_packages(eco);
     // One parse; the line test is a range check, so lines outside the selection build no action.
     let selected_lines = selection.start.line..=selection.end.line;
-    eco.parse(doc_text)
+    let mut actions: Vec<CodeAction> = eco
+        .parse(doc_text)
         .iter()
         .filter(|dep| selected_lines.contains(&dep.version_span.line))
         .filter(|dep| !ignored.contains(&eco.normalize_package(&dep.name)))
@@ -69,7 +71,16 @@ pub fn code_actions(
                 .flatten();
             fix.into_iter().chain(update).chain(load)
         })
-        .collect()
+        .collect();
+    // Two lines of one package give the same load action, so it is listed once.
+    let mut seen_data: HashSet<String> = HashSet::new();
+    actions.retain(|action| {
+        action
+            .data
+            .as_ref()
+            .is_none_or(|data| seen_data.insert(data.clone()))
+    });
+    actions
 }
 
 /// The action that loads the deferred advisories of `dep`, `None` when none waits for its details.
@@ -906,5 +917,23 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn two_lines_of_the_same_package_give_one_load_action() {
+        let cache = deferred_cache(Ecosystem::Cargo, "smallvec", "1.6.0", 3);
+        let text =
+            "[dependencies]\nsmallvec = \"1.6.0\"\n\n[dev-dependencies]\nsmallvec = \"1.6.0\"\n";
+        let selection = Range::new(Position::new(1, 0), Position::new(4, 0));
+        let actions = code_actions(
+            &cache,
+            &Settings::default(),
+            "/p/Cargo.toml",
+            Some("/p"),
+            text,
+            selection,
+            FIX_NOW,
+        );
+        assert_eq!(actions.len(), 1);
     }
 }

@@ -36,6 +36,9 @@ const SKIPPED_DIRECTORIES: [&str; 4] = ["node_modules", "target", "vendor", ".gi
 const TIME_BOX: Duration = Duration::from_secs(300);
 /// Hard limit of one chunk. Its lookups that start after this limit stay pending.
 const CHUNK_LIMIT: Duration = Duration::from_secs(40);
+/// How long the action that loads the deferred advisories may fetch details. The refresh that
+/// follows must fit in the 60 s that an open task allows, so this stays well below it.
+const LOAD_ACTION_LIMIT: Duration = Duration::from_secs(30);
 /// Registry lookups per chunk. Each chunk publishes its results before the next one starts.
 const REGISTRY_CHUNK: usize = 20;
 /// Offset of the fallback deadline used when a time box is too large for the clock.
@@ -463,6 +466,10 @@ impl DependencyLens {
         let Some(eco) = Ecosystem::detect(&doc.path) else {
             return;
         };
+        // The setting may have changed since the action was listed.
+        if !self.settings.vulnerabilities {
+            return;
+        }
         let deps: Vec<Dependency> = eco
             .parse(&doc.text)
             .into_iter()
@@ -473,8 +480,8 @@ impl DependencyLens {
         }
         // The call has a budget of 5 s. An open task lifts it to 60 s, so up to 100 details fit,
         // and the chunk limit stops the fetches before the budget ends.
-        let _task = host::begin_task(TASK_TITLE, true);
-        let deadline = Instant::now() + CHUNK_LIMIT;
+        let task = host::begin_task(TASK_TITLE, true);
+        let deadline = Instant::now() + LOAD_ACTION_LIMIT;
         let mut budget = Budget::new(0, Some(deadline)).with_detail_limit(usize::MAX);
         analyze(
             eco,
@@ -485,6 +492,8 @@ impl DependencyLens {
             now_secs(),
             &mut budget,
         );
+        // The refresh opens its own task, so this one ends first.
+        drop(task);
         // A superseded run leaves the manifest as it is. The newer call refreshes it.
         if !budget.is_cancelled() {
             self.refresh(&doc.path, None, RunLimits::standard(deadline));
