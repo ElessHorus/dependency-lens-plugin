@@ -2,7 +2,7 @@
 
 use crate::cache::Cache;
 use crate::http::{Http, is_success};
-use crate::model::{AdvisorySeverity, Ecosystem, Vulnerability};
+use crate::model::{AdvisorySeverity, Affected, Ecosystem, RangeEvent, Vulnerability};
 use crate::registries::dotted::is_dev_branch;
 use openidea_plugin::{HttpRequest, HttpResponse};
 use serde::{Deserialize, Serialize};
@@ -336,16 +336,17 @@ fn fetch_missing_details<'a>(
         if deadline.is_some_and(|limit| Instant::now() >= limit) {
             break;
         }
-        if let Some(advisory) = fetch_detail(http, id) {
+        if let Some((advisory, affected)) = fetch_detail(http, id) {
             cache.put_advisory(advisory.clone(), now);
+            cache.put_affected(id, affected, now);
             fetched.insert(id, advisory);
         }
     }
     fetched
 }
 
-/// Fetches and parses one advisory. Returns `None` on any failure.
-fn fetch_detail(http: &dyn Http, id: &str) -> Option<Vulnerability> {
+/// Fetches and parses one advisory with its affected ranges. Returns `None` on any failure.
+fn fetch_detail(http: &dyn Http, id: &str) -> Option<(Vulnerability, Vec<Affected>)> {
     let url = format!("{DETAIL_URL_PREFIX}{id}");
     let response = http.send(&HttpRequest::get(&url)).ok()?;
     if !is_success(response.status) {
@@ -353,7 +354,47 @@ fn fetch_detail(http: &dyn Http, id: &str) -> Option<Vulnerability> {
     }
     let detail: AdvisoryDetail = serde_json::from_slice(&response.body).ok()?;
     // A record for another id would be cached under the wrong key, so it is rejected.
-    (detail.id == id).then(|| advisory_from_detail(id, &detail))
+    (detail.id == id).then(|| {
+        (
+            advisory_from_detail(id, &detail),
+            affected_from_detail(&detail),
+        )
+    })
+}
+
+/// Reads the affected ranges of an advisory. A package without a name or an ecosystem, and a range of
+/// another kind than `SEMVER` or `ECOSYSTEM`, are left out.
+fn affected_from_detail(detail: &AdvisoryDetail) -> Vec<Affected> {
+    detail
+        .affected
+        .iter()
+        .flatten()
+        .filter_map(|entry| {
+            let package = entry.package.as_ref()?;
+            let ranges = entry
+                .ranges
+                .iter()
+                .flatten()
+                .filter(|range| matches!(range.kind.as_str(), "SEMVER" | "ECOSYSTEM"))
+                .map(|range| range.events.iter().filter_map(range_event_of).collect())
+                .collect();
+            Some(Affected {
+                ecosystem: package.ecosystem.clone(),
+                name: package.name.clone(),
+                ranges,
+            })
+        })
+        .collect()
+}
+
+/// Reads one range event: the one key that an OSV event object holds.
+fn range_event_of(event: &RangeEventDetail) -> Option<RangeEvent> {
+    event
+        .introduced
+        .clone()
+        .map(RangeEvent::Introduced)
+        .or_else(|| event.fixed.clone().map(RangeEvent::Fixed))
+        .or_else(|| event.last_affected.clone().map(RangeEvent::LastAffected))
 }
 
 /// Returns the advisory for `id` from this run's fetches or from `cache`, else a placeholder.
@@ -517,6 +558,38 @@ struct AdvisoryDetail {
     details: Option<String>,
     severity: Option<Vec<SeverityEntry>>,
     database_specific: Option<DatabaseSpecific>,
+    affected: Option<Vec<AffectedDetail>>,
+}
+
+/// One `affected[]` entry of an advisory record.
+#[derive(Debug, Deserialize)]
+struct AffectedDetail {
+    package: Option<PackageDetail>,
+    ranges: Option<Vec<RangeDetail>>,
+}
+
+/// The `package` of an `affected[]` entry.
+#[derive(Debug, Deserialize)]
+struct PackageDetail {
+    name: String,
+    ecosystem: String,
+}
+
+/// One `ranges[]` entry: its kind and its events.
+#[derive(Debug, Deserialize)]
+struct RangeDetail {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    events: Vec<RangeEventDetail>,
+}
+
+/// One event of a range. Each object holds a single one of these keys.
+#[derive(Debug, Deserialize)]
+struct RangeEventDetail {
+    introduced: Option<String>,
+    fixed: Option<String>,
+    last_affected: Option<String>,
 }
 
 /// One `severity[]` entry: a CVSS vector or a plain numeric score.
@@ -1385,5 +1458,92 @@ mod tests {
         assert_eq!(results[0][12], cached);
         assert!(results[0][10..12].iter().all(is_deferred));
         assert!(results[0][13..].iter().all(is_deferred));
+    }
+
+    // affected ranges
+
+    /// A real-shaped advisory record: one Go package with an open range closed by a fix.
+    const DETAIL_WITH_RANGES: &str = r#"{
+        "id": "GHSA-5rcv-m4m3-hfh7",
+        "summary": "golang.org/x/text Infinite loop",
+        "affected": [
+            {
+                "package": {"name": "golang.org/x/text", "ecosystem": "Go"},
+                "ranges": [
+                    {"type": "SEMVER", "events": [{"introduced": "0"}, {"fixed": "0.3.3"}]},
+                    {"type": "GIT", "repo": "https://example.com/x.git", "events": [{"introduced": "0"}, {"fixed": "abc123"}]}
+                ]
+            },
+            {
+                "package": {"name": "other", "ecosystem": "npm"},
+                "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "1.0"}, {"last_affected": "1.4"}]}]
+            }
+        ]
+    }"#;
+
+    #[test]
+    fn the_affected_ranges_of_a_fetched_advisory_are_cached_without_git_ranges() {
+        let http = FakeHttp::new()
+            .route(
+                "POST",
+                BATCH_URL,
+                200,
+                &batch_body(&[&["GHSA-5rcv-m4m3-hfh7"]]),
+            )
+            .route(
+                "GET",
+                &detail_url("GHSA-5rcv-m4m3-hfh7"),
+                200,
+                DETAIL_WITH_RANGES,
+            );
+        let mut cache = Cache::new(TTL_SECS);
+        query_batch(
+            &http,
+            &mut cache,
+            &[query("golang.org/x/text", "0.3.0")],
+            NOW,
+            None,
+        )
+        .unwrap();
+
+        let affected = cache
+            .affected("GHSA-5rcv-m4m3-hfh7", NOW)
+            .expect("affected is cached");
+        assert_eq!(
+            affected,
+            [
+                Affected {
+                    ecosystem: "Go".to_owned(),
+                    name: "golang.org/x/text".to_owned(),
+                    ranges: vec![vec![
+                        RangeEvent::Introduced("0".to_owned()),
+                        RangeEvent::Fixed("0.3.3".to_owned()),
+                    ]],
+                },
+                Affected {
+                    ecosystem: "npm".to_owned(),
+                    name: "other".to_owned(),
+                    ranges: vec![vec![
+                        RangeEvent::Introduced("1.0".to_owned()),
+                        RangeEvent::LastAffected("1.4".to_owned()),
+                    ]],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_advisory_without_affected_ranges_caches_an_empty_list() {
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(&[&["GHSA-0001"]]))
+            .route(
+                "GET",
+                &detail_url("GHSA-0001"),
+                200,
+                &detail_body("GHSA-0001"),
+            );
+        let mut cache = Cache::new(TTL_SECS);
+        query_batch(&http, &mut cache, &[query("serde", "1.0.0")], NOW, None).unwrap();
+        assert_eq!(cache.affected("GHSA-0001", NOW), Some(&[][..]));
     }
 }

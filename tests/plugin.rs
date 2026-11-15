@@ -42,7 +42,14 @@ fn answer_osv(request: &HttpRequest) -> Result<HttpResponse, Error> {
         json!({
             "id": id,
             "summary": "Serde test advisory",
-            "database_specific": { "severity": "HIGH" }
+            "database_specific": { "severity": "HIGH" },
+            "affected": [{
+                "package": { "name": "serde", "ecosystem": "crates.io" },
+                "ranges": [{
+                    "type": "SEMVER",
+                    "events": [{ "introduced": "0" }, { "fixed": "1.0.5" }]
+                }]
+            }]
         })
         .to_string()
     } else {
@@ -550,6 +557,47 @@ fn a_request_cancelled_by_the_host_shows_nothing_and_does_not_block_the_next_ope
     assert_eq!(decorations.len(), 1);
     assert_eq!(decorations[0].after.as_deref(), Some("⚠ 1 vulnerability"));
     assert_eq!(osv_batch_requests(&host), 2);
+}
+
+#[test]
+fn a_vulnerable_crate_gets_a_fix_to_the_version_that_osv_names() {
+    // Cargo has no registry, so this fix is the only update the plugin can offer it.
+    let host = host_counting_fetches(Rc::new(Cell::new(0)));
+    let mut plugin = DependencyLens::default();
+    open_manifest(&host, &mut plugin);
+    let requests_after_open = host.requests().len();
+
+    let document = Document {
+        path: MANIFEST_PATH.to_owned(),
+        language: "toml".to_owned(),
+        version: 1,
+        text: MANIFEST.to_owned(),
+    };
+    let actions = Providers::code_actions(
+        &mut plugin,
+        &document,
+        Range::new(Position::new(5, 10), Position::new(5, 10)),
+    );
+    assert_eq!(actions.len(), 1);
+    assert_eq!(
+        actions[0].title,
+        "Fix 1 vulnerability: update serde to 1.0.5"
+    );
+    assert!(actions[0].preferred);
+    let (edit_path, edits) = &actions[0].edits[0];
+    assert_eq!(edit_path, MANIFEST_PATH);
+    assert_eq!(edits[0].range, SERDE_VERSION_RANGE);
+    assert_eq!(edits[0].text, "1.0.5");
+    // The action reads the cache, so it sends no request.
+    assert_eq!(host.requests().len(), requests_after_open);
+
+    // tokio has no advisory, so its line gets no action.
+    let none = Providers::code_actions(
+        &mut plugin,
+        &document,
+        Range::new(Position::new(6, 10), Position::new(6, 10)),
+    );
+    assert!(none.is_empty());
 }
 
 #[test]
