@@ -193,7 +193,7 @@ impl DependencyLens {
                 // chunk, what the editor shows is already a published result, so it stays as it is.
                 return previous_pending.is_some().then_some(0);
             }
-            publish_analysis(path, text, &analysis);
+            publish_analysis(path, text, &analysis, self.settings.outdated_problems);
             let pending = analysis.pending;
             let unloaded = analysis.unloaded_advisory_count();
             // Pending entries are the only ones without a status, so the done count is a subtraction, not a scan.
@@ -245,9 +245,9 @@ fn should_continue(
 }
 
 /// Publishes the decorations and problems of one analysis of the manifest `text` at `path`.
-fn publish_analysis(path: &str, text: &str, analysis: &Analysis) {
+fn publish_analysis(path: &str, text: &str, analysis: &Analysis, outdated_problems: bool) {
     let editor_decorations = publish::decorations(text, analysis);
-    let problems = publish::diagnostics(text, analysis);
+    let problems = publish::diagnostics(text, analysis, outdated_problems);
     publish_results(path, &editor_decorations, &problems);
 }
 

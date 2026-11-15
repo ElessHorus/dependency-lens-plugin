@@ -5,6 +5,12 @@
       "title": "Show known vulnerabilities",
       "default": true
     },
+    "outdatedProblems": {
+      "type": "boolean",
+      "title": "Show a problem for outdated dependencies",
+      "description": "Adds an informational problem on each outdated version, so the update quick fix shows in the hover.",
+      "default": true
+    },
     "minimumSeverity": {
       "type": "string",
       "title": "Minimum advisory severity",

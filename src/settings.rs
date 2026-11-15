@@ -22,6 +22,9 @@ const SEVERITY_NAMES: [(&str, AdvisorySeverity); 4] = [
 pub struct Settings {
     /// Whether to query OSV.dev for advisories.
     pub vulnerabilities: bool,
+    /// Whether an outdated dependency gets an informational problem. The problem
+    /// carries the quick fix in the hover, because the editor lists fixes per problem.
+    pub outdated_problems: bool,
     /// Lowest advisory severity that is reported.
     pub minimum_severity: AdvisorySeverity,
     /// Package names that are skipped.
@@ -36,6 +39,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             vulnerabilities: true,
+            outdated_problems: true,
             minimum_severity: AdvisorySeverity::Low,
             ignore: Vec::new(),
             enabled: [
@@ -109,6 +113,9 @@ impl Settings {
             vulnerabilities: value_of("vulnerabilities")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(defaults.vulnerabilities),
+            outdated_problems: value_of("outdatedProblems")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(defaults.outdated_problems),
             minimum_severity: value_of("minimumSeverity")
                 .as_ref()
                 .and_then(Value::as_str)
@@ -154,6 +161,13 @@ mod tests {
         assert_eq!(settings.enabled.len(), 9);
         assert!(settings.is_enabled(Ecosystem::Maven));
         assert_eq!(settings.cache_ttl_secs, 3600);
+        assert!(settings.outdated_problems);
+    }
+
+    #[test]
+    fn outdated_problems_must_be_a_json_bool() {
+        assert!(settings_from(&[("outdatedProblems", "\"false\"")]).outdated_problems);
+        assert!(!settings_from(&[("outdatedProblems", "false")]).outdated_problems);
     }
 
     #[test]
@@ -246,6 +260,7 @@ mod tests {
     fn invalid_json_gives_the_default_for_every_key() {
         for key in [
             "vulnerabilities",
+            "outdatedProblems",
             "minimumSeverity",
             "ignore",
             "ecosystems.pypi.enabled",
