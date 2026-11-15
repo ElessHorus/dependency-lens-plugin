@@ -1,6 +1,6 @@
 //! In-memory TTL cache for registry versions, OSV results and advisories.
 
-use crate::model::{Ecosystem, VersionInfo, Vulnerability};
+use crate::model::{Affected, Ecosystem, VersionInfo, Vulnerability};
 use std::collections::HashMap;
 
 /// Lifetime of a cached failure, in seconds. Independent of the cache TTL.
@@ -31,6 +31,8 @@ pub struct Cache {
     vulnerabilities: HashMap<Ecosystem, VulnerabilityIndex>,
     failures: HashMap<(FailureKind, Ecosystem), HashMap<String, Entry<String>>>,
     advisories: HashMap<String, Entry<Vulnerability>>,
+    /// The affected ranges of each advisory, which the fix quick fix reads.
+    affected: HashMap<String, Entry<Vec<Affected>>>,
 }
 
 /// Returns the value of an entry that is still valid at `now`.
@@ -51,6 +53,7 @@ impl Cache {
             vulnerabilities: HashMap::new(),
             failures: HashMap::new(),
             advisories: HashMap::new(),
+            affected: HashMap::new(),
         }
     }
 
@@ -154,6 +157,25 @@ impl Cache {
     /// Returns a cached advisory by its identifier, if still valid.
     pub fn advisory(&self, id: &str, now: u64) -> Option<&Vulnerability> {
         fresh_value(self.advisories.get(id), now, self.ttl_secs)
+    }
+
+    /// Returns the cached affected ranges of an advisory, if still valid.
+    pub fn affected(&self, id: &str, now: u64) -> Option<&[Affected]> {
+        fresh_value(self.affected.get(id), now, self.ttl_secs).map(Vec::as_slice)
+    }
+
+    /// Stores the affected ranges of the advisory `id`, replacing any previous value.
+    pub fn put_affected(&mut self, id: &str, affected: Vec<Affected>, now: u64) {
+        if !self.stores_entries() {
+            return;
+        }
+        self.affected.insert(
+            id.to_owned(),
+            Entry {
+                value: affected,
+                stored_at: now,
+            },
+        );
     }
 
     /// Stores an advisory under its `id`, replacing any previous value.

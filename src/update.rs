@@ -25,7 +25,7 @@ pub enum UpdateKind {
 
 /// Version operations that the update rules need. PEP 440 and dotted versions implement it,
 /// so each ecosystem adds one match arm and no new rule code.
-trait UpdateVersion: Ord + Sized {
+pub(crate) trait UpdateVersion: Ord + Sized {
     /// Parses version text, or returns `None` when the text is not a version of this ecosystem.
     fn parse_version(text: &str) -> Option<Self>;
     /// Returns `true` for a prerelease version.
@@ -162,7 +162,7 @@ fn is_outdated_of<V: UpdateVersion>(declared: &str, latest: &str) -> bool {
 }
 
 /// Splits a requirement into its leading operator run and the version text after it.
-fn split_operator(requirement: &str) -> (&str, &str) {
+pub(crate) fn split_operator(requirement: &str) -> (&str, &str) {
     // The operator bytes are ASCII, so the split always falls on a character boundary.
     let operator_len = requirement
         .bytes()

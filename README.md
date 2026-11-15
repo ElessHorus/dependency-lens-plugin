@@ -4,7 +4,7 @@
 
 Dependency Lens is an OpenIDEA plugin. It shows, after the version of each declared dependency, the known OSV vulnerabilities of that version and, for some ecosystems, the newest registry release.
 
-OpenIDEA's built-in outdated-dependency inspection covers Cargo only. This plugin adds OSV vulnerabilities for all nine ecosystems. It also adds version hints and an update quick fix for Python, PHP, Dart, C# and Ruby. For npm, Go and Maven it shows vulnerabilities only.
+OpenIDEA's built-in outdated-dependency inspection covers Cargo only. This plugin adds OSV vulnerabilities for all nine ecosystems. It also adds version hints and an update quick fix for Python, PHP, Dart, C# and Ruby, and a quick fix that fixes a vulnerability for all nine ecosystems. For Cargo, npm, Go and Maven it shows no version hint and no update to the latest release.
 
 ## Supported files
 
@@ -64,6 +64,18 @@ A dependency with a newer stable release also gets an `Info` problem on its vers
 
 On a line with an outdated requirement, the quick fix title is `Update <name> to <version> (major|minor|patch|prerelease)`. Minor and patch updates are marked as preferred. The quick fix appears only after the registry lookup of that package has run, because the code action reads the cache and never calls the network.
 
+#### Fix a vulnerability
+
+On a line with known vulnerabilities, a second quick fix has the title `Fix <n> vulnerabilities: update <name> to <version>`. It works for all nine ecosystems, because it uses the fixed versions that OSV gives for each advisory, and not a registry. It is marked as preferred and comes before the update to the latest release.
+
+- The target is the smallest version that fixes every advisory with a known fix: the highest of their fixed versions. The title says `Fix 2 of 3 vulnerabilities` when an advisory has no known fix, or when its fix is out of reach (see below).
+- The quick fix counts the advisories that the hover lists: their details are loaded, and their severity reaches `minimumSeverity`. Run "Dependency Lens: Load all vulnerabilities" to count the others.
+- The operator stays: `^1.6.0` becomes `^1.6.1`, and a Go `v0.3.0` becomes `v0.3.3`. The new text is the full fixed version.
+- A requirement with several constraints, such as `flask>=0.12.2,<1`, takes the highest fixed version that satisfies all of them. When none does, there is no quick fix.
+- A requirement that names no single version gets no fix: a range (`>=1.0, <2`, `[2.0,3.0)`), a wildcard, `||`, a Maven property, and a strict `>`.
+- The fix names the version where OSV closes the advisory. That version can have an advisory of its own, and the next analysis shows it.
+- Like the other quick fix, it reads the cache, so it needs `cacheTtlSeconds` above `0`.
+
 ## Network access
 
 The plugin contacts these six hosts. Each host is listed in the capabilities of `plugin.toml`.
@@ -110,7 +122,7 @@ Add the package name to `ignore`, for example `["serde", "left-pad"]`. The name 
 
 ## Limitations
 
-- For npm, Go and Maven, the plugin shows vulnerabilities only. It shows no version hint and no quick fix.
+- For Cargo, npm, Go and Maven, the plugin shows no version hint and no update to the latest release. It still offers the fix for a vulnerability.
 - The plugin checks the version declared in the manifest, not a lockfile.
 - For a requirement with a range (`^1.2`, `>=2.0`, `||`), the plugin checks the lower bound of the first alternative. A newer release is then shown as outdated against that bound.
 - The first lookup of a large manifest takes seconds. The lookups run one after another. The status bar shows the progress, and you can cancel the task. Each chunk of 20 lookups shows its results before the next chunk starts. After a five-minute soft cap, the entries that still show `…` finish on the next open, save or "Dependency Lens: Refresh" of their manifest.

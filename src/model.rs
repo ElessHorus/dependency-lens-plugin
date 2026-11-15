@@ -214,6 +214,30 @@ pub enum AdvisorySeverity {
     Critical,
 }
 
+/// One boundary of a version range that an advisory affects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RangeEvent {
+    /// The first affected version. `0` means every version from the start.
+    Introduced(String),
+    /// The first version that is not affected, because the advisory is fixed in it.
+    Fixed(String),
+    /// The last affected version, when the advisory names no fixed version.
+    LastAffected(String),
+}
+
+/// The version ranges of one package that an advisory affects, as OSV lists them.
+///
+/// Only ranges of the `SEMVER` and `ECOSYSTEM` kinds are kept: a `GIT` range names commits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Affected {
+    /// The OSV ecosystem name, such as `Go` or `crates.io`.
+    pub ecosystem: String,
+    /// The package name in that ecosystem.
+    pub name: String,
+    /// Each range is its events in order.
+    pub ranges: Vec<Vec<RangeEvent>>,
+}
+
 /// A known vulnerability that affects a package version.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Vulnerability {
