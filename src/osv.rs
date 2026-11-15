@@ -372,7 +372,7 @@ fn affected_from_detail(detail: &AdvisoryDetail) -> impl Iterator<Item = Affecte
         .affected
         .iter()
         .flatten()
-        .filter_map(|value| AffectedDetail::deserialize(value).ok())
+        .filter_map(|raw| serde_json::from_str::<AffectedDetail>(raw.get()).ok())
         .filter_map(|entry| {
             let package = entry.package?;
             let (name, ecosystem) = (package.name?, package.ecosystem?);
@@ -393,7 +393,10 @@ fn affected_from_detail(detail: &AdvisoryDetail) -> impl Iterator<Item = Affecte
                 .versions
                 .into_iter()
                 .flatten()
-                .filter_map(|version| version.as_str().map(str::to_owned))
+                .filter_map(|version| match version {
+                    serde_json::Value::String(text) => Some(text),
+                    _ => None,
+                })
                 .collect();
             Some(Affected {
                 ecosystem,
@@ -575,8 +578,9 @@ struct AdvisoryDetail {
     details: Option<String>,
     severity: Option<Vec<SeverityEntry>>,
     database_specific: Option<DatabaseSpecific>,
-    /// Read entry by entry, so a malformed entry never hides the advisory itself.
-    affected: Option<Vec<serde_json::Value>>,
+    /// Read entry by entry, so a malformed entry never hides the advisory itself. Each entry stays
+    /// raw text until it is read, because an advisory can list thousands of packages and versions.
+    affected: Option<Vec<Box<serde_json::value::RawValue>>>,
 }
 
 /// One `affected[]` entry of an advisory record.
@@ -1593,5 +1597,27 @@ mod tests {
             .expect("affected is cached");
         assert_eq!(affected.len(), 1);
         assert_eq!(affected[0].name, "ok");
+    }
+
+    #[test]
+    fn a_listed_version_that_is_not_text_is_skipped_and_the_entry_stays() {
+        let body = r#"{
+            "id": "GHSA-0003",
+            "affected": [{
+                "package": {"name": "ok", "ecosystem": "npm"},
+                "ranges": [{"type": "SEMVER", "events": [{"introduced": "0"}, {"fixed": "1.2.3"}]}],
+                "versions": ["1.0.0", 5, null, ["x"], {"a": 1}, "1.1.0"]
+            }]
+        }"#;
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(&[&["GHSA-0003"]]))
+            .route("GET", &detail_url("GHSA-0003"), 200, body);
+        let mut cache = Cache::new(TTL_SECS);
+        query_batch(&http, &mut cache, &[query("ok", "1.0.0")], NOW, None).unwrap();
+        let affected = cache
+            .affected("GHSA-0003", NOW)
+            .expect("affected is cached");
+        assert_eq!(affected[0].versions, ["1.0.0", "1.1.0"]);
+        assert_eq!(affected[0].ranges.len(), 1);
     }
 }
