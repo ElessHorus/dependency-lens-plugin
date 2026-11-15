@@ -13,8 +13,9 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      # Third-party actions are pinned by major tag. The maintainer may pin them to commit SHAs.
-      - uses: actions/checkout@v4
+      # Actions are pinned to commit SHAs, so a moved tag cannot change what runs next to the signing key.
+      # The comment after each SHA names the version. See docs/MAINTAINING.md to update them.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
@@ -34,7 +35,7 @@ jobs:
             exit 1
           fi
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch, 2026-11-15
         with:
           targets: wasm32-wasip2
 

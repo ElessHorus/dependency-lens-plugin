@@ -19,17 +19,18 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      # Third-party actions are pinned by major tag. The maintainer may pin them to commit SHAs.
-      - uses: actions/checkout@v4
+      # Actions are pinned to commit SHAs, so a moved tag cannot change what runs. The comment after
+      # each SHA names the version. See docs/MAINTAINING.md to update them.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch, 2026-11-15
         with:
           targets: wasm32-wasip2
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       # The tag must match the SDK tag in Cargo.toml (`openidea-plugin` git dependency).
       # Keep both in sync when the SDK changes.
@@ -55,15 +56,15 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable branch, 2026-11-15
         with:
           targets: wasm32-wasip2
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Download the latest plugin tool
         env:
