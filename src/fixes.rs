@@ -79,15 +79,23 @@ fn fixed_version_of<V: UpdateVersion>(
     affected: &[Affected],
 ) -> Option<(V, String)> {
     let current = V::parse_version(current)?;
+    ranges_of(eco, package, affected).find_map(|events| fix_of_range(events, &current))
+}
+
+/// Returns the event lists of the ranges of the entries of `affected` that name `package` in `eco`.
+fn ranges_of<'a>(
+    eco: Ecosystem,
+    package: &str,
+    affected: &'a [Affected],
+) -> impl Iterator<Item = &'a [RangeEvent]> {
     let wanted_package = eco.normalize_package(package);
     affected
         .iter()
-        .filter(|entry| {
+        .filter(move |entry| {
             entry.ecosystem.eq_ignore_ascii_case(eco.osv_name())
                 && eco.normalize_package(&entry.name) == wanted_package
         })
-        .flat_map(|entry| &entry.ranges)
-        .find_map(|events| fix_of_range(events, &current))
+        .flat_map(|entry| entry.ranges.iter().map(Vec::as_slice))
 }
 
 /// Returns the fix of the interval of `events` that holds `current`.
@@ -135,6 +143,76 @@ pub fn plan_fix(
     }
 }
 
+/// The kind of an OSV range event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventKind {
+    Introduced,
+    Fixed,
+    LastAffected,
+}
+
+/// A range event whose version is parsed. `text` is the version as OSV writes it.
+struct ParsedEvent<'a, V> {
+    version: V,
+    kind: EventKind,
+    text: &'a str,
+}
+
+/// Parses the events of a range and sorts them by version, as the OSV evaluation algorithm does.
+///
+/// An event whose version does not parse, such as a commit, is skipped. An unreadable `fixed` or
+/// `last_affected` then leaves its interval open, so the range never claims a fix it cannot prove.
+fn parse_range<V: UpdateVersion>(events: &[RangeEvent]) -> Vec<ParsedEvent<'_, V>> {
+    let mut parsed: Vec<ParsedEvent<'_, V>> = events
+        .iter()
+        .filter_map(|event| {
+            let (kind, text) = match event {
+                RangeEvent::Introduced(text) => (EventKind::Introduced, text.as_str()),
+                RangeEvent::Fixed(text) => (EventKind::Fixed, text.as_str()),
+                RangeEvent::LastAffected(text) => (EventKind::LastAffected, text.as_str()),
+            };
+            Some(ParsedEvent {
+                version: V::parse_version(text)?,
+                kind,
+                text,
+            })
+        })
+        .collect();
+    // Stable, so events of the same version keep the order of the advisory.
+    parsed.sort_by(|left, right| left.version.cmp(&right.version));
+    parsed
+}
+
+/// Returns `true` when `version` lies in the range `events`.
+///
+/// This is the `IncludedInRanges` algorithm of the OSV schema: `introduced` opens the range at its
+/// version, `fixed` closes it at its version, and `last_affected` closes it after its version. The
+/// later events win, so a range with several intervals holds a version of any of them.
+fn range_holds<V: UpdateVersion>(events: &[ParsedEvent<'_, V>], version: &V) -> bool {
+    let mut is_affected = false;
+    for event in events {
+        match event.kind {
+            EventKind::Introduced if *version >= event.version => is_affected = true,
+            EventKind::Fixed if *version >= event.version => is_affected = false,
+            EventKind::LastAffected if *version > event.version => is_affected = false,
+            _ => {}
+        }
+    }
+    is_affected
+}
+
+/// The ranges of one advisory for the package, with their events parsed.
+struct AdvisoryRanges<'a, V> {
+    ranges: Vec<Vec<ParsedEvent<'a, V>>>,
+}
+
+impl<V: UpdateVersion> AdvisoryRanges<'_, V> {
+    /// Returns `true` when the advisory affects `version` through any of its ranges.
+    fn affects(&self, version: &V) -> bool {
+        self.ranges.iter().any(|range| range_holds(range, version))
+    }
+}
+
 fn plan_fix_of<V: UpdateVersion>(
     eco: Ecosystem,
     package: &str,
@@ -142,20 +220,41 @@ fn plan_fix_of<V: UpdateVersion>(
     advisories: &[&[Affected]],
     allows: impl Fn(&str) -> bool,
 ) -> Option<FixPlan> {
-    let fixes: Vec<(V, String)> = advisories
+    let current = V::parse_version(current)?;
+    // Parse each advisory once. Only an advisory that affects the current version can be fixed.
+    let open_advisories: Vec<AdvisoryRanges<'_, V>> = advisories
         .iter()
-        .filter_map(|affected| fixed_version_of::<V>(eco, package, current, affected))
+        .map(|affected| AdvisoryRanges {
+            ranges: ranges_of(eco, package, affected).map(parse_range).collect(),
+        })
+        .filter(|advisory| advisory.affects(&current))
         .collect();
-    let (target_version, target) = fixes
+    // A candidate target is a version where an interval of such an advisory ends. A later interval
+    // of the same advisory may still hold it, so each candidate is checked against every advisory.
+    let mut candidates: Vec<(&V, &str)> = open_advisories
         .iter()
-        .filter(|(_, text)| allows(text))
-        .max_by(|(left, _), (right, _)| left.cmp(right))?;
-    Some(FixPlan {
-        target: target.clone(),
-        fixed_count: fixes
+        .flat_map(|advisory| &advisory.ranges)
+        .flatten()
+        .filter(|event| event.kind == EventKind::Fixed && event.version > current)
+        .filter(|event| allows(event.text))
+        .map(|event| (&event.version, event.text))
+        .collect();
+    candidates.sort_by(|left, right| left.0.cmp(right.0));
+    // Sorted by version, so the first of the best candidates is the smallest version that fixes the most.
+    let mut best: Option<(usize, &str)> = None;
+    for (version, text) in candidates {
+        let fixed_count = open_advisories
             .iter()
-            .filter(|(version, _)| version <= target_version)
-            .count(),
+            .filter(|advisory| !advisory.affects(version))
+            .count();
+        if fixed_count > best.map_or(0, |(best_count, _)| best_count) {
+            best = Some((fixed_count, text));
+        }
+    }
+    let (fixed_count, target) = best?;
+    Some(FixPlan {
+        target: target.to_owned(),
+        fixed_count,
         total_count: advisories.len(),
     })
 }
@@ -508,6 +607,158 @@ mod tests {
         // When every fix leaves the bounds, there is none.
         let only_late: Vec<&[Affected]> = vec![&late];
         assert!(plan_fix(Ecosystem::PyPI, "flask", "0.12.2", &only_late, allows).is_none());
+    }
+
+    /// An advisory whose single range holds several intervals, as in the OSV "multiple range" example.
+    fn two_interval_advisory(second_end: (&'static str, &'static str)) -> Vec<Affected> {
+        affected(
+            "crates.io",
+            "review_demo",
+            &[&[
+                ("introduced", "0"),
+                ("fixed", "1.1.0"),
+                ("introduced", "1.5.0"),
+                second_end,
+            ]],
+        )
+    }
+
+    fn plan_of(advisories: &[&[Affected]], allows: impl Fn(&str) -> bool) -> Option<FixPlan> {
+        plan_fix(Ecosystem::Cargo, "review_demo", "1.0.0", advisories, allows)
+    }
+
+    #[test]
+    fn a_target_inside_a_later_interval_of_an_advisory_does_not_fix_it() {
+        // A is affected on [0, 1.1.0) and [1.5.0, 1.8.0). B is affected on [0, 1.6.0).
+        let advisory_a = two_interval_advisory(("fixed", "1.8.0"));
+        let advisory_b = affected(
+            "crates.io",
+            "review_demo",
+            &[&[("introduced", "0"), ("fixed", "1.6.0")]],
+        );
+        let plan = plan_of(&[&advisory_a, &advisory_b], |_| true).expect("a fix");
+        // 1.6.0 is still inside the second interval of A, so the target moves on to 1.8.0.
+        assert_eq!(plan.target, "1.8.0");
+        assert_eq!((plan.fixed_count, plan.total_count), (2, 2));
+        // Control: with only the first interval of A, 1.6.0 fixes both.
+        let first_only = affected(
+            "crates.io",
+            "review_demo",
+            &[&[("introduced", "0"), ("fixed", "1.1.0")]],
+        );
+        let plan = plan_of(&[&first_only, &advisory_b], |_| true).expect("a fix");
+        assert_eq!(plan.target, "1.6.0");
+        assert_eq!((plan.fixed_count, plan.total_count), (2, 2));
+    }
+
+    #[test]
+    fn the_fixed_count_follows_the_real_status_of_the_target() {
+        let advisory_a = two_interval_advisory(("fixed", "1.8.0"));
+        let advisory_b = affected(
+            "crates.io",
+            "review_demo",
+            &[&[("introduced", "0"), ("fixed", "1.6.0")]],
+        );
+        // The bounds refuse 1.8.0. 1.1.0 and 1.6.0 each fix one advisory, and the smaller one wins.
+        let plan = plan_of(&[&advisory_a, &advisory_b], |target| target != "1.8.0").expect("a fix");
+        assert_eq!(plan.target, "1.1.0");
+        assert_eq!((plan.fixed_count, plan.total_count), (1, 2));
+    }
+
+    #[test]
+    fn the_intervals_of_several_ranges_of_one_entry_all_count() {
+        let two_ranges = affected(
+            "crates.io",
+            "review_demo",
+            &[
+                &[("introduced", "0"), ("fixed", "1.1.0")],
+                &[("introduced", "1.5.0"), ("fixed", "1.8.0")],
+            ],
+        );
+        let advisory_b = affected(
+            "crates.io",
+            "review_demo",
+            &[&[("introduced", "0"), ("fixed", "1.6.0")]],
+        );
+        let plan = plan_of(&[&two_ranges, &advisory_b], |_| true).expect("a fix");
+        assert_eq!(plan.target, "1.8.0");
+        assert_eq!((plan.fixed_count, plan.total_count), (2, 2));
+    }
+
+    #[test]
+    fn events_are_read_in_version_order() {
+        // OSV recommends sorted events but does not require it: its algorithm sorts them first.
+        let shuffled = affected(
+            "crates.io",
+            "review_demo",
+            &[&[
+                ("introduced", "1.5.0"),
+                ("fixed", "1.8.0"),
+                ("introduced", "0"),
+                ("fixed", "1.1.0"),
+            ]],
+        );
+        let advisory_b = affected(
+            "crates.io",
+            "review_demo",
+            &[&[("introduced", "0"), ("fixed", "1.6.0")]],
+        );
+        let plan = plan_of(&[&shuffled, &advisory_b], |_| true).expect("a fix");
+        assert_eq!(plan.target, "1.8.0");
+        assert_eq!((plan.fixed_count, plan.total_count), (2, 2));
+    }
+
+    #[test]
+    fn the_last_affected_version_is_still_affected() {
+        let advisory_b = affected(
+            "crates.io",
+            "review_demo",
+            &[&[("introduced", "0"), ("fixed", "1.6.0")]],
+        );
+        // 1.6.0 is the last affected version of A: A still affects it, so 1.1.0 stays the target.
+        let inclusive = two_interval_advisory(("last_affected", "1.6.0"));
+        let plan = plan_of(&[&inclusive, &advisory_b], |_| true).expect("a fix");
+        assert_eq!(plan.target, "1.1.0");
+        assert_eq!((plan.fixed_count, plan.total_count), (1, 2));
+        // One step lower, 1.6.0 is above the last affected version, so it fixes both.
+        let exclusive = two_interval_advisory(("last_affected", "1.5.9"));
+        let plan = plan_of(&[&exclusive, &advisory_b], |_| true).expect("a fix");
+        assert_eq!(plan.target, "1.6.0");
+        assert_eq!((plan.fixed_count, plan.total_count), (2, 2));
+    }
+
+    #[test]
+    fn an_interval_with_an_unparsable_end_is_never_claimed_as_fixed() {
+        // The second interval ends at a commit: it cannot be compared, so it stays affected.
+        let commit_end = two_interval_advisory(("fixed", "abc123"));
+        let advisory_b = affected(
+            "crates.io",
+            "review_demo",
+            &[&[("introduced", "0"), ("fixed", "1.6.0")]],
+        );
+        let plan = plan_of(&[&commit_end, &advisory_b], |_| true).expect("a fix");
+        assert_eq!(plan.target, "1.1.0");
+        assert_eq!((plan.fixed_count, plan.total_count), (1, 2));
+    }
+
+    #[test]
+    fn a_backport_does_not_pull_the_target_to_another_major_line() {
+        // One advisory, a fix on each version line: the nearest fix of the current line wins the tie.
+        let backport = affected(
+            "npm",
+            "lodash",
+            &[&[
+                ("introduced", "0"),
+                ("fixed", "4.17.21"),
+                ("introduced", "5.0.0"),
+                ("fixed", "5.1.2"),
+            ]],
+        );
+        let advisories: Vec<&[Affected]> = vec![&backport];
+        let plan =
+            plan_fix(Ecosystem::Npm, "lodash", "4.17.15", &advisories, |_| true).expect("a fix");
+        assert_eq!(plan.target, "4.17.21");
+        assert_eq!((plan.fixed_count, plan.total_count), (1, 1));
     }
 
     #[test]

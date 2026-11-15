@@ -640,6 +640,44 @@ mod tests {
     }
 
     #[test]
+    fn the_fix_skips_a_version_that_a_later_interval_of_an_advisory_still_affects() {
+        // GHSA-A is affected on [0, 1.1.0) and [1.5.0, 1.8.0). GHSA-B is affected on [0, 1.6.0).
+        // 1.6.0 would fix GHSA-B only, so the action must move on to 1.8.0.
+        let cache = fix_cache(
+            Ecosystem::Cargo,
+            "review_demo",
+            "1.0.0",
+            &[
+                (
+                    "GHSA-A",
+                    HIGH,
+                    &[
+                        ("introduced", "0"),
+                        ("fixed", "1.1.0"),
+                        ("introduced", "1.5.0"),
+                        ("fixed", "1.8.0"),
+                    ],
+                ),
+                ("GHSA-B", HIGH, &events("1.6.0")),
+            ],
+        );
+        let actions = actions_at(
+            &cache,
+            &Settings::default(),
+            "/p/Cargo.toml",
+            "[dependencies]\nreview_demo = \"1.0.0\"\n",
+            1,
+        );
+        assert_eq!(
+            summary_of(&actions),
+            [(
+                "Fix 2 vulnerabilities: update review_demo to 1.8.0".to_owned(),
+                "1.8.0".to_owned()
+            )]
+        );
+    }
+
+    #[test]
     fn a_bounded_python_requirement_is_fixed_only_within_its_bounds() {
         let pyproject = "[project]\ndependencies = [\n  \"flask>=0.12.2,<1\",\n]\n";
         // The fix of 2.3.2 would break `<1`, so the action takes the fix of 0.12.3 and says it is partial.
