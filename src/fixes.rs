@@ -256,33 +256,31 @@ fn plan_fix_of<V: UpdateVersion>(
         })
         .filter(|advisory| advisory.affects(&current))
         .collect();
-    let fixes: Vec<&ParsedEvent<'_, V>> = open_advisories
+    // The fix of each open advisory for the current version, when it has one.
+    let fixes: Vec<(&AdvisoryRanges<'_, V>, &ParsedEvent<'_, V>)> = open_advisories
         .iter()
-        .filter_map(|advisory| advisory.fix_for(&current))
+        .filter_map(|advisory| Some((advisory, advisory.fix_for(&current)?)))
         .collect();
     // The least target is the highest allowed fix that OSV names for the current version.
-    let least_fix = fixes
+    let (_, least_fix) = fixes
         .iter()
-        .filter(|fix| allows(fix.text))
-        .max_by(|left, right| left.version.cmp(&right.version))?;
+        .filter(|(_, fix)| allows(fix.text))
+        .max_by(|(_, left), (_, right)| left.version.cmp(&right.version))?;
     let least_target = &least_fix.version;
     // The target must fix every advisory that this least target is meant to fix. A later interval of
     // such an advisory may hold the least target, so the target then moves to a higher fix.
-    let must_fix: Vec<&AdvisoryRanges<'_, V>> = open_advisories
+    let must_fix: Vec<&AdvisoryRanges<'_, V>> = fixes
         .iter()
-        .filter(|advisory| {
-            advisory
-                .fix_for(&current)
-                .is_some_and(|fix| fix.version <= *least_target)
-        })
+        .filter(|(_, fix)| fix.version <= *least_target)
+        .map(|(advisory, _)| *advisory)
         .collect();
-    // A candidate target is a version where an interval of an open advisory ends.
+    // A candidate target is a version where an interval of an open advisory ends. `allows` runs
+    // only on the candidates that the search reaches, because it can be costly.
     let mut candidates: Vec<(&V, &str)> = open_advisories
         .iter()
         .flat_map(|advisory| &advisory.ranges)
         .flatten()
         .filter(|event| event.kind == EventKind::Fixed && event.version > current)
-        .filter(|event| allows(event.text))
         .map(|event| (&event.version, event.text))
         .collect();
     candidates.sort_by(|left, right| left.0.cmp(right.0));
@@ -299,14 +297,16 @@ fn plan_fix_of<V: UpdateVersion>(
     };
     // The nearest candidate from the least target that fixes every advisory to fix. It does not
     // chase advisories that have no fix for the current version, so it never jumps further than needed.
-    if let Some((version, text)) = candidates.iter().find(|(version, _)| {
-        **version >= *least_target && must_fix.iter().all(|advisory| !advisory.affects(version))
+    if let Some((version, text)) = candidates.iter().find(|(version, text)| {
+        **version >= *least_target
+            && must_fix.iter().all(|advisory| !advisory.affects(version))
+            && allows(text)
     }) {
         return Some(plan_at(text, fixed_count_at(version)));
     }
     // No allowed candidate fixes them all. Take the one that fixes the most, the smallest on a tie.
     let mut best: Option<(usize, &str)> = None;
-    for (version, text) in candidates {
+    for (version, text) in candidates.into_iter().filter(|(_, text)| allows(text)) {
         let fixed_count = fixed_count_at(version);
         if fixed_count > best.map_or(0, |(best_count, _)| best_count) {
             best = Some((fixed_count, text));
