@@ -68,7 +68,7 @@ On a line with an outdated requirement, the quick fix title is `Update <name> to
 
 On a line with known vulnerabilities, a second quick fix has the title `Fix <n> vulnerabilities: update <name> to <version>`. It works for all nine ecosystems, because it uses the fixed versions that OSV gives for each advisory, and not a registry. It is marked as preferred and comes before the update to the latest release.
 
-- The target is the smallest version that fixes every advisory with a known fix: the highest of their fixed versions. The title says `Fix 2 of 3 vulnerabilities` when an advisory has no known fix, or when its fix is out of reach (see below).
+- The target is the smallest version that fixes every advisory with a known fix. An advisory can affect several intervals of versions (such as `[0, 1.1.0)` and `[1.5.0, 1.8.0)`): the target is never a version that the advisory still affects, so it can be higher than the highest first fix. The title says `Fix 2 of 3 vulnerabilities` when an advisory has no known fix, or when its fix is out of reach (see below).
 - The quick fix counts the advisories that the hover lists: their details are loaded, and their severity reaches `minimumSeverity`. Run "Dependency Lens: Load all vulnerabilities" to count the others.
 - The operator stays: `^1.6.0` becomes `^1.6.1`, and a Go `v0.3.0` becomes `v0.3.3`. The new text is the full fixed version.
 - A requirement with several constraints, such as `flask>=0.12.2,<1`, takes the highest fixed version that satisfies all of them. When none does, there is no quick fix.
