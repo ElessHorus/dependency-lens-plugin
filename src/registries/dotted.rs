@@ -44,7 +44,7 @@ impl DottedVersion {
         };
         let (release_text, pre_text) = match without_build.split_once('-') {
             Some((release_text, pre_text)) => (release_text, Some(pre_text)),
-            None => (without_build, None),
+            None => split_attached_stability(without_build),
         };
         Some(DottedVersion {
             release: parse_release(release_text)?,
@@ -190,6 +190,23 @@ fn parse_number(text: &str) -> Option<u64> {
     text.parse().ok()
 }
 
+/// Splits a Composer stability that follows the last number without a hyphen, as in `2.1.0RC1`.
+///
+/// Returns the text unchanged, with no prerelease, when the last segment is only digits.
+fn split_attached_stability(text: &str) -> (&str, Option<&str>) {
+    let last_segment_start = text.rfind('.').map_or(0, |dot| dot + 1);
+    let digits_len = text[last_segment_start..]
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    let split_at = last_segment_start + digits_len;
+    // No digit before the letters means this is not a stability suffix, so the parse fails later.
+    if digits_len == 0 || split_at == text.len() {
+        return (text, None);
+    }
+    (&text[..split_at], Some(&text[split_at..]))
+}
+
 /// Parses the text after `-`, such as `beta.11`, into its dot-separated identifiers.
 fn parse_prerelease(text: &str) -> Option<Vec<PreId>> {
     text.split('.').map(parse_pre_id).collect()
@@ -197,7 +214,12 @@ fn parse_prerelease(text: &str) -> Option<Vec<PreId>> {
 
 /// Parses one prerelease identifier. Letters are lowercased, so the comparison ignores case.
 fn parse_pre_id(text: &str) -> Option<PreId> {
-    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+    // Semver identifiers hold letters, digits and hyphens, so `beta-2` is one identifier.
+    if text.is_empty()
+        || !text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
         return None;
     }
     if text.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -344,5 +366,32 @@ mod tests {
         ] {
             assert!(DottedVersion::parse(text).is_none(), "{text}");
         }
+    }
+
+    #[test]
+    fn prerelease_identifiers_may_hold_hyphens() {
+        for text in ["1.1.0-beta-2", "2.0.0-rc1-final", "1.0.0-dev-1"] {
+            let parsed = version(text);
+            assert!(parsed.is_prerelease(), "{text}");
+            assert!(
+                parsed < version(&text[..5]),
+                "{text} sorts below its release"
+            );
+        }
+        assert!(version("1.1.0-beta-2") > version("1.1.0-beta-1"));
+    }
+
+    #[test]
+    fn composer_stability_without_a_hyphen_is_a_prerelease() {
+        for text in ["2.1.0RC1", "2.1.0beta2", "2.1.0alpha"] {
+            let parsed = version(text);
+            assert!(parsed.is_prerelease(), "{text}");
+            assert_eq!(parsed.release(), [2, 1, 0], "{text}");
+            assert!(parsed < version("2.1.0"), "{text}");
+        }
+        assert!(version("2.1.0alpha") < version("2.1.0beta2"));
+        assert!(version("2.1.0beta2") < version("2.1.0RC1"));
+        let info = rank_versions(texts(&["2.0.0", "2.1.0RC1", "2.1.0-beta-1"]));
+        assert_eq!(info.latest.as_deref(), Some("2.0.0"));
     }
 }

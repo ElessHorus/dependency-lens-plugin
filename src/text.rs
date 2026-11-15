@@ -10,7 +10,14 @@ use crate::model::Span;
 /// or when a span edge is not on a UTF-8 character boundary.
 pub fn to_range(text: &str, span: Span) -> Option<Range> {
     // `lines` already drops the `\r` of a `\r\n` terminator.
-    let line = text.lines().nth(span.line as usize)?;
+    to_range_in_line(text.lines().nth(span.line as usize)?, span)
+}
+
+/// Converts a byte span into an LSP range, given the text of its line.
+///
+/// A caller that converts many spans of one text collects `text.lines()` once and passes
+/// each line here. [`to_range`] would walk the text from its start for every span.
+pub fn to_range_in_line(line: &str, span: Span) -> Option<Range> {
     let start = span.line_start as usize;
     let end = span.line_end as usize;
     if start > end
@@ -106,5 +113,40 @@ mod tests {
         };
         let range = to_range(text, span).unwrap();
         assert_eq!(range, Range::new(Position::new(1, 4), Position::new(1, 7)));
+    }
+
+    #[test]
+    fn a_range_from_a_split_line_table_equals_the_range_from_the_text() {
+        let text = "é = 1\r\n[a]\nname = \"é1\"\n";
+        let lines: Vec<&str> = text.lines().collect();
+        for span in [
+            Span {
+                line: 0,
+                line_start: 5,
+                line_end: 6,
+            },
+            Span {
+                line: 2,
+                line_start: 8,
+                line_end: 11,
+            },
+            Span {
+                line: 3,
+                line_start: 0,
+                line_end: 1,
+            },
+            Span {
+                line: 1,
+                line_start: 9,
+                line_end: 10,
+            },
+        ] {
+            assert_eq!(
+                lines
+                    .get(span.line as usize)
+                    .and_then(|line| to_range_in_line(line, span)),
+                to_range(text, span)
+            );
+        }
     }
 }

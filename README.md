@@ -42,6 +42,12 @@ Example: `→ 2.31.0 · ⚠ 2 vulnerabilities`.
 
 The hover shows the package name and the declared version. It adds the latest version when one is newer, and the reason when a check failed. When advisories exist, it adds the checked version and one line per advisory. Each advisory line links to its OSV page when OSV gives a link.
 
+### Many advisories
+
+The plugin loads the details of the first 10 advisories of each package version. This keeps the first open of an old package fast, because each detail is one request. The decoration and the problem still show the exact number of advisories. The hover lists the 10 loaded advisories and adds one line, for example `15 more not loaded`. Advisories that are not loaded have an unknown severity, so the `minimumSeverity` setting does not hide them, and they do not set the problem severity.
+
+To load the others, run "Dependency Lens: Load all vulnerabilities" in the open manifest. One run loads up to 100 details. Run it again when more are left. The loaded details stay in the cache for `cacheTtlSeconds`. After that, the manifest shows 10 advisories again.
+
 ### Problems view
 
 Each dependency with advisories gets one problem, on its version text. The source is `Dependency Lens`. The code is the id of the most severe advisory. The message names the package, the version and the number of advisories.
@@ -93,7 +99,7 @@ The plugin reads only the text of the manifest. A private source that a tool set
 | `minimumSeverity` | `low`, `medium`, `high` or `critical` | `low` | Hide advisories below this severity. |
 | `ignore` | array of strings | `[]` | Package names that are skipped. |
 | `ecosystems.<id>.enabled` | boolean | `true` | Analyze the manifests of one ecosystem. The ids are `cargo`, `npm`, `pypi`, `go`, `packagist`, `pub`, `nuget`, `rubygems` and `maven`. |
-| `cacheTtlSeconds` | integer | `3600` | Lifetime of cached answers. `0` turns the cache off. Values above one week (`604800`) are read as one week. |
+| `cacheTtlSeconds` | integer | `3600` | Lifetime of cached answers. `0` turns the cache off, and the quick fix then never appears, because it reads the cache. Values above one week (`604800`) are read as one week. |
 
 ### Ignoring a package
 
@@ -108,6 +114,7 @@ Add the package name to `ignore`, for example `["serde", "left-pad"]`. The name 
 - Answers are cached in memory for `cacheTtlSeconds` (one hour by default). The cache is lost when the IDE unloads the plugin. A failed lookup is retried after 60 seconds.
 - The IDE unloads an idle plugin after about five minutes, and the in-memory cache is then empty. The "→ x" decorations stay on screen, but the update quick fix is unavailable until the next save or "Dependency Lens: Refresh".
 - "Dependency Lens: Refresh" reads the file again, but it answers from the cache while the entries are younger than `cacheTtlSeconds`.
+- The IDE cancels a running analysis when a newer open or save of the same kind arrives. The cancelled request is not a failure: the plugin shows nothing new for it, and the newer call asks again. If the newer call is for another file, the first manifest keeps what it showed until its next open or save.
 - The update quick fix writes the exact latest version. A compatible-release requirement such as `~=2.28` (Python) or `~> 7.0` (Ruby) becomes narrower after the fix (`~=2.31.0`).
 - Unlisted and deprecated package states are not shown. For NuGet, the latest release can be a version that its author unlisted, because the version index does not tell them apart.
 - The Maven parser reads the `project/properties` block only, for `${name}` version placeholders.

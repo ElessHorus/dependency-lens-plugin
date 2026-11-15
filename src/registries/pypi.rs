@@ -62,6 +62,11 @@ pub fn parse(body: &str) -> Result<VersionInfo, String> {
     let response: RegistryResponse =
         serde_json::from_str(body).map_err(|_| INVALID_RESPONSE.to_string())?;
     let RegistryResponse { info, releases } = response;
+    // The metadata version can name a release that is yanked, or has no file left.
+    let is_info_version_unlisted = info
+        .version
+        .as_deref()
+        .is_some_and(|text| releases.get(text).is_some_and(|files| !is_listable(files)));
     // HashMap order is arbitrary. Sorting the keys by text first makes the stable ranking
     // break ties, such as `1.0` and `1.0.0`, the same way on every run.
     let mut texts: Vec<String> = releases
@@ -71,10 +76,10 @@ pub fn parse(body: &str) -> Result<VersionInfo, String> {
         .collect();
     texts.sort_unstable();
     let mut version_info = rank_with(texts, Pep440::parse, Pep440::is_prerelease);
-    // The metadata version stands in for `latest` when every release is a prerelease.
-    version_info.latest = version_info
-        .latest
-        .or_else(|| info.version.filter(|version_text| !version_text.is_empty()));
+    // The metadata version stands in for `latest` when every release is a prerelease, unless it is unlisted.
+    if version_info.latest.is_none() && !is_info_version_unlisted {
+        version_info.latest = info.version.filter(|version_text| !version_text.is_empty());
+    }
     Ok(version_info)
 }
 
@@ -159,5 +164,23 @@ mod tests {
             Err("registry: invalid response".to_string())
         );
         assert_eq!(parse("{}"), Err("registry: invalid response".to_string()));
+    }
+
+    #[test]
+    fn a_project_with_only_yanked_releases_has_no_latest() {
+        let body = r#"{"info":{"version":"1.0"},"releases":{"1.0":[{"yanked":true}],"0.9":[{"yanked":true}]}}"#;
+        let info = parse(body).expect("body must parse");
+        assert_eq!(info.latest, None);
+        assert!(info.versions.is_empty());
+    }
+
+    #[test]
+    fn the_metadata_version_stands_in_only_when_it_is_listed() {
+        // Every listed release is a prerelease, and the metadata version is one of them.
+        let listed = r#"{"info":{"version":"2.0rc1"},"releases":{"2.0rc1":[{"yanked":false}],"2.0b1":[{"yanked":false}]}}"#;
+        assert_eq!(parse(listed).unwrap().latest.as_deref(), Some("2.0rc1"));
+        // The metadata version names a yanked release, so it must not become the latest.
+        let yanked = r#"{"info":{"version":"2.0rc2"},"releases":{"2.0rc2":[{"yanked":true}],"2.0b1":[{"yanked":false}]}}"#;
+        assert_eq!(parse(yanked).unwrap().latest, None);
     }
 }

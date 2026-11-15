@@ -52,9 +52,15 @@ pub fn parse(text: &str) -> Vec<Dependency> {
             OpenBlock::Replace if keyword == ")" => open_block = OpenBlock::None,
             OpenBlock::Replace => record_replacement(&mut replacements, parse_replacement(code, 0)),
             OpenBlock::None => {
+                // `require(` holds its parenthesis in the same field, so it is split off here.
+                let (keyword, has_attached_parenthesis) = match keyword.split_once('(') {
+                    Some((directive, "")) => (directive, true),
+                    _ => (keyword, false),
+                };
                 let keyword_end = keyword_start + keyword.len();
-                let opens_block =
-                    next_field(code, keyword_end).is_some_and(|(_, field)| field.starts_with('('));
+                let opens_block = has_attached_parenthesis
+                    || next_field(code, keyword_end)
+                        .is_some_and(|(_, field)| field.starts_with('('));
                 if keyword == "require" {
                     if opens_block {
                         open_block = OpenBlock::Require;
@@ -338,5 +344,15 @@ replace f.example.com/single v1.0.0 => /abs/single
             .map(|dependency| dependency.name)
             .collect();
         assert_eq!(names, ["d.example.com/exact-other", "e.example.com/kept"]);
+    }
+
+    #[test]
+    fn a_directive_with_its_parenthesis_attached_opens_a_block() {
+        let manifest = "require(\n\tgithub.com/a/b v1.0.0\n)\nreplace(\n\tgithub.com/x/y => ../y\n)\nrequire github.com/c/d v2.0.0\n";
+        let names: Vec<_> = parse(manifest)
+            .into_iter()
+            .map(|dependency| dependency.name)
+            .collect();
+        assert_eq!(names, ["github.com/a/b", "github.com/c/d"]);
     }
 }

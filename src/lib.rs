@@ -17,6 +17,7 @@ use crate::analysis::{Analysis, Budget, analyze};
 use crate::cache::Cache;
 use crate::http::HostHttp;
 use crate::model::{Dependency, Ecosystem};
+use crate::osv::DEFAULT_DETAILS_PER_QUERY;
 use crate::settings::Settings;
 use openidea_plugin::host::Task;
 use openidea_plugin::providers::{CodeAction, Document, Providers};
@@ -40,6 +41,25 @@ const REGISTRY_CHUNK: usize = 20;
 const FAR_FUTURE: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
 /// Title of the background task shown while a manifest is analyzed.
 const TASK_TITLE: &str = "Dependency Lens";
+
+/// The limits of one refresh of a manifest.
+#[derive(Clone, Copy)]
+struct RunLimits {
+    /// The instant after which the chunk loop stops.
+    deadline: Instant,
+    /// Advisories per package version whose details load. `usize::MAX` loads every one.
+    details_per_query: usize,
+}
+
+impl RunLimits {
+    /// The limits of an open, a save or a refresh: ten advisories per package version.
+    fn standard(deadline: Instant) -> Self {
+        Self {
+            deadline,
+            details_per_query: DEFAULT_DETAILS_PER_QUERY,
+        }
+    }
+}
 
 /// Dependency Lens plugin state: the analysis cache, the settings it runs with, the manifests it
 /// shows, and the chunk limits.
@@ -99,27 +119,30 @@ impl DependencyLens {
     /// Analyzes the manifest at `path` and publishes its decorations and problems, chunk by chunk.
     ///
     /// Every call makes at least its first chunk, so each manifest of a batch makes progress.
-    fn refresh(&mut self, path: &str, ctx: &Invocation, deadline: Instant) {
+    ///
+    /// Returns the number of advisories of the manifest whose details are still not loaded,
+    /// or `None` when the host cancelled the run because a newer call supersedes it.
+    fn refresh(&mut self, path: &str, ctx: &Invocation, limits: RunLimits) -> Option<usize> {
         let Some(eco) = Ecosystem::detect(path) else {
-            return;
+            return Some(0);
         };
         // The deepest open project holding the path wins; the window's project is only a fallback.
         let Some(project) = host::project_of(path).or_else(|| ctx.project()) else {
             self.forget_shown(path);
-            return;
+            return Some(0);
         };
         let text = match project.read_file(path) {
             Ok(text) => text,
             Err(error) => {
                 self.forget_shown(path);
                 host::log(LogLevel::Warn, &format!("cannot read {path}: {error}"));
-                return;
+                return Some(0);
             }
         };
         let deps = eco.parse(&text);
         self.published_paths.insert(path.to_owned());
         let task = host::begin_task(TASK_TITLE, true);
-        self.publish_chunks(eco, path, &text, &deps, &task, deadline);
+        self.publish_chunks(eco, path, &text, &deps, &task, limits)
     }
 
     /// Stops tracking a manifest that cannot be read, and clears what the editor still shows for it.
@@ -133,6 +156,8 @@ impl DependencyLens {
     ///
     /// Reports progress and checks cancellation after every chunk. The host renews the call's
     /// time budget on each of these, so a long manifest is not cut while it reports.
+    /// Returns the number of advisories whose details are still not loaded after the last chunk,
+    /// or `None` when the host cancelled a request of the first chunk.
     fn publish_chunks(
         &mut self,
         eco: Ecosystem,
@@ -140,8 +165,8 @@ impl DependencyLens {
         text: &str,
         deps: &[Dependency],
         task: &Task,
-        deadline: Instant,
-    ) {
+        limits: RunLimits,
+    ) -> Option<usize> {
         let chunk = self.chunk_size();
         // One clock reading serves the whole run. With a cache lifetime shorter than a chunk, a
         // fresh reading per chunk would expire the answers of the chunk before and repeat its work.
@@ -151,7 +176,8 @@ impl DependencyLens {
             // The dependency vector is cloned per chunk; the parse is not repeated.
             // Each chunk gets its own deadline. The first registry lookup of a chunk runs unless the deadline has passed,
             // and the OSV phase stops fetching advisory details once the deadline has passed.
-            let mut budget = Budget::new(chunk, Some(Instant::now() + CHUNK_LIMIT));
+            let mut budget = Budget::new(chunk, Some(Instant::now() + CHUNK_LIMIT))
+                .with_detail_limit(limits.details_per_query);
             let analysis = analyze(
                 eco,
                 deps.to_vec(),
@@ -161,8 +187,15 @@ impl DependencyLens {
                 run_started_at,
                 &mut budget,
             );
+            if budget.is_cancelled() {
+                // A newer call supersedes this one and refreshes the manifest. Publishing the
+                // unfinished analysis would replace good results with `…` or `?`. After the first
+                // chunk, what the editor shows is already a published result, so it stays as it is.
+                return previous_pending.is_some().then_some(0);
+            }
             publish_analysis(path, text, &analysis);
             let pending = analysis.pending;
+            let unloaded = analysis.unloaded_advisory_count();
             // Pending entries are the only ones without a status, so the done count is a subtraction, not a scan.
             let total = analysis.entries.len();
             let done = total.saturating_sub(pending);
@@ -177,9 +210,9 @@ impl DependencyLens {
                 previous_pending,
                 cancelled,
                 Instant::now(),
-                deadline,
+                limits.deadline,
             ) {
-                return;
+                return Some(unloaded);
             }
             previous_pending = Some(pending);
         }
@@ -320,8 +353,40 @@ impl Plugin for DependencyLens {
                     return Ok(Some("Dependency Lens: not a supported manifest".to_owned()));
                 }
                 // A command is one batch of its own: it gets a fresh time box.
-                self.refresh(&path, ctx, deadline_after(self.time_box));
+                self.refresh(
+                    &path,
+                    ctx,
+                    RunLimits::standard(deadline_after(self.time_box)),
+                );
                 Ok(Some("Dependency Lens: refreshed".to_owned()))
+            }
+            "load-vulnerabilities" => {
+                let editor = ctx
+                    .editor()
+                    .ok_or_else(|| Error::Invalid("no file is open".to_owned()))?;
+                let path = editor.path();
+                if !is_manifest(&path) {
+                    return Ok(Some("Dependency Lens: not a supported manifest".to_owned()));
+                }
+                // The details of the deferred advisories load now, for this manifest only.
+                let limits = RunLimits {
+                    details_per_query: usize::MAX,
+                    ..RunLimits::standard(deadline_after(self.time_box))
+                };
+                if !self.settings.vulnerabilities {
+                    return Ok(Some(
+                        "Dependency Lens: vulnerabilities are turned off".to_owned(),
+                    ));
+                }
+                let message = match self.refresh(&path, ctx, limits) {
+                    None => "Dependency Lens: a newer request cancelled this one. Run the command again."
+                        .to_owned(),
+                    Some(0) => "Dependency Lens: vulnerabilities loaded".to_owned(),
+                    Some(unloaded) => format!(
+                        "Dependency Lens: {unloaded} advisories are still not loaded. Run the command again."
+                    ),
+                };
+                Ok(Some(message))
             }
             _ => Err(Error::NotFound(format!("command {id}"))),
         }
@@ -363,7 +428,7 @@ impl Plugin for DependencyLens {
         let mut refreshed: HashSet<&str> = HashSet::new();
         for path in changed_paths.into_iter().filter(|path| is_manifest(path)) {
             if refreshed.insert(path) {
-                self.refresh(path, ctx, deadline);
+                self.refresh(path, ctx, RunLimits::standard(deadline));
             }
         }
         // A new setting changes what the shown manifests display. The cache answers most of it
@@ -376,7 +441,7 @@ impl Plugin for DependencyLens {
                 .cloned()
                 .collect();
             for path in &shown_paths {
-                self.refresh(path, ctx, deadline);
+                self.refresh(path, ctx, RunLimits::standard(deadline));
             }
         }
     }

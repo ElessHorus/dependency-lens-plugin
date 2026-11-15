@@ -2,7 +2,8 @@
 
 use crate::analysis::{Analysis, Entry, Status};
 use crate::model::{AdvisorySeverity, Vulnerability};
-use crate::text::to_range;
+use crate::osv::{is_deferred, is_placeholder};
+use crate::text::to_range_in_line;
 use openidea_plugin::{Decoration, Diagnostic, Range, Severity};
 use std::cmp::Reverse;
 
@@ -37,33 +38,89 @@ impl Tone {
 
 /// Editor decorations for every entry with a resolvable version range and something to show.
 pub fn decorations(text: &str, analysis: &Analysis) -> Vec<Decoration> {
+    // The lines are split once, so each entry finds its line without a walk from the text start.
+    let lines: Vec<&str> = text.lines().collect();
     analysis
         .entries
         .iter()
         .filter_map(|entry| {
-            let range = to_range(text, entry.dependency.version_span)?;
+            let range = range_of_version(&lines, entry)?;
             decoration_of(range, entry)
         })
         .collect()
 }
 
+/// The range of the version text of `entry`, found in the split `lines` of its manifest.
+fn range_of_version(lines: &[&str], entry: &Entry) -> Option<Range> {
+    let span = entry.dependency.version_span;
+    to_range_in_line(lines.get(span.line as usize)?, span)
+}
+
 /// One problem per entry with advisories, placed on the version range.
 pub fn diagnostics(text: &str, analysis: &Analysis) -> Vec<Diagnostic> {
+    let lines: Vec<&str> = text.lines().collect();
     analysis
         .entries
         .iter()
         .filter_map(|entry| {
-            let range = to_range(text, entry.dependency.version_span)?;
+            let range = range_of_version(&lines, entry)?;
             diagnostic_of(range, entry)
         })
         .collect()
+}
+
+/// How the advisories of one entry split up for display.
+struct AdvisoryView<'a> {
+    /// Advisories with a known severity, most severe first.
+    known: Vec<&'a Vulnerability>,
+    /// Advisories whose details are not loaded yet. They load by themselves, and their severity is unknown.
+    waiting: Vec<&'a Vulnerability>,
+    /// Advisories whose details load on request.
+    deferred: Vec<&'a Vulnerability>,
+}
+
+impl<'a> AdvisoryView<'a> {
+    fn of(vulnerabilities: &'a [Vulnerability]) -> Self {
+        let mut view = AdvisoryView {
+            known: Vec::new(),
+            waiting: Vec::new(),
+            deferred: Vec::new(),
+        };
+        for vulnerability in vulnerabilities {
+            if is_deferred(vulnerability) {
+                view.deferred.push(vulnerability);
+            } else if is_placeholder(vulnerability) {
+                view.waiting.push(vulnerability);
+            } else {
+                view.known.push(vulnerability);
+            }
+        }
+        // `sort_by_key` is stable, so advisories of equal severity keep their order.
+        view.known
+            .sort_by_key(|vulnerability| Reverse(vulnerability.severity));
+        view
+    }
+
+    /// Every advisory of the entry, loaded or not.
+    fn total(&self) -> usize {
+        self.known.len() + self.waiting.len() + self.deferred.len()
+    }
+
+    /// The worst known severity, or `None` when no advisory has loaded.
+    fn worst(&self) -> Option<AdvisorySeverity> {
+        self.known
+            .first()
+            .map(|vulnerability| vulnerability.severity)
+    }
 }
 
 /// Builds the decoration of one entry, or `None` when it has nothing to show.
 fn decoration_of(range: Range, entry: &Entry) -> Option<Decoration> {
     let parts: Vec<(String, Tone)> = status_part(&entry.status)
         .into_iter()
-        .chain(vulnerability_part(&entry.vulnerabilities))
+        .chain(vulnerability_part(&AdvisoryView::of(
+            &entry.vulnerabilities,
+        )))
         .collect();
     // The strongest tone of the parts sets the style, since `Tone` orders by strength.
     let tone = parts.iter().map(|(_, tone)| *tone).max()?;
@@ -92,18 +149,17 @@ fn status_part(status: &Status) -> Option<(String, Tone)> {
 }
 
 /// The vulnerability part of the `after` text, or `None` without advisories.
-fn vulnerability_part(vulnerabilities: &[Vulnerability]) -> Option<(String, Tone)> {
-    let worst = vulnerabilities
-        .iter()
-        .map(|vulnerability| vulnerability.severity)
-        .max()?;
-    let count = vulnerabilities.len();
+fn vulnerability_part(view: &AdvisoryView<'_>) -> Option<(String, Tone)> {
+    let count = view.total();
+    if count == 0 {
+        return None;
+    }
     let text = if count == 1 {
         "⚠ 1 vulnerability".to_owned()
     } else {
         format!("⚠ {count} vulnerabilities")
     };
-    let tone = if worst >= AdvisorySeverity::High {
+    let tone = if view.worst() >= Some(AdvisorySeverity::High) {
         Tone::Error
     } else {
         Tone::Warning
@@ -123,14 +179,23 @@ fn hover_of(entry: &Entry) -> String {
         Status::Unknown(reason) => blocks.push(format!("Could not check: {reason}")),
         Status::UpToDate | Status::Pending | Status::NotChecked => {}
     }
-    if !entry.vulnerabilities.is_empty() {
+    let view = AdvisoryView::of(&entry.vulnerabilities);
+    if view.total() > 0 {
         if let Some(checked_version) = &entry.checked_version {
             blocks.push(format!("Checked version: {checked_version}"));
         }
-        let advisory_lines: Vec<String> = sorted_by_severity(&entry.vulnerabilities)
-            .into_iter()
-            .map(advisory_line)
+        let mut advisory_lines: Vec<String> = view
+            .known
+            .iter()
+            .chain(&view.waiting)
+            .map(|vulnerability| advisory_line(vulnerability))
             .collect();
+        if !view.deferred.is_empty() {
+            advisory_lines.push(format!(
+                "- {} more not loaded. Run \"Dependency Lens: Load all vulnerabilities\" to load them.",
+                view.deferred.len()
+            ));
+        }
         blocks.push(advisory_lines.join("\n"));
     }
     blocks.join("\n\n")
@@ -138,7 +203,11 @@ fn hover_of(entry: &Entry) -> String {
 
 /// Formats one advisory as a Markdown list item, with a link when it has a URL.
 fn advisory_line(vulnerability: &Vulnerability) -> String {
-    let severity = severity_label(vulnerability.severity);
+    let severity = if is_placeholder(vulnerability) {
+        "severity unknown"
+    } else {
+        severity_label(vulnerability.severity)
+    };
     match &vulnerability.url {
         Some(url) => format!(
             "- [{}]({url}) ({severity}) – {}",
@@ -153,41 +222,38 @@ fn advisory_line(vulnerability: &Vulnerability) -> String {
 
 /// Builds the problem of one entry, or `None` when it has no advisories.
 fn diagnostic_of(range: Range, entry: &Entry) -> Option<Diagnostic> {
-    let sorted = sorted_by_severity(&entry.vulnerabilities);
-    // The first advisory is the worst one, because the list is sorted worst first.
-    let first = sorted.first()?;
-    let worst = first.severity;
+    let view = AdvisoryView::of(&entry.vulnerabilities);
+    // The code names the worst loaded advisory, else the first one that waits for its details.
+    let first = view
+        .known
+        .first()
+        .or_else(|| view.waiting.first())
+        .or_else(|| view.deferred.first())?;
+    let worst = view.worst();
+    // Without a loaded advisory the severity is unknown, so the problem is a warning.
     let severity = match worst {
-        AdvisorySeverity::Critical | AdvisorySeverity::High => Severity::Error,
-        AdvisorySeverity::Medium => Severity::Warning,
-        AdvisorySeverity::Low => Severity::Info,
+        Some(AdvisorySeverity::Critical | AdvisorySeverity::High) => Severity::Error,
+        Some(AdvisorySeverity::Low) => Severity::Info,
+        Some(AdvisorySeverity::Medium) | None => Severity::Warning,
     };
     let version = entry
         .checked_version
         .as_deref()
         .unwrap_or(&entry.dependency.version);
-    let count = sorted.len();
+    let count = view.total();
     let noun = if count == 1 {
         "1 known vulnerability".to_owned()
     } else {
         format!("{count} known vulnerabilities")
     };
+    let severity_text = worst.map_or("details not loaded", severity_label);
     let message = format!(
-        "{} {version}: {noun} ({})",
-        entry.dependency.name,
-        severity_label(worst)
+        "{} {version}: {noun} ({severity_text})",
+        entry.dependency.name
     );
     let mut diagnostic = Diagnostic::new(range, severity, message).code(first.id.clone());
     diagnostic.source = Some(DIAGNOSTIC_SOURCE.to_owned());
     Some(diagnostic)
-}
-
-/// Returns the advisories with the most severe first; equal severities keep their order.
-fn sorted_by_severity(vulnerabilities: &[Vulnerability]) -> Vec<&Vulnerability> {
-    let mut sorted: Vec<&Vulnerability> = vulnerabilities.iter().collect();
-    // `sort_by_key` is stable, so advisories of equal severity keep their order.
-    sorted.sort_by_key(|vulnerability| Reverse(vulnerability.severity));
-    sorted
 }
 
 /// The English label of a severity, as shown to the user.
@@ -570,5 +636,92 @@ mod tests {
                 "serde 1.0.0: 1 known vulnerability (High)",
             ]
         );
+    }
+
+    /// A deferred advisory: its details wait for a request from the user.
+    fn deferred_vulnerability(id: &str) -> Vulnerability {
+        Vulnerability {
+            id: id.to_owned(),
+            severity: AdvisorySeverity::Medium,
+            summary: crate::osv::DEFERRED_SUMMARY.to_owned(),
+            url: None,
+        }
+    }
+
+    /// A retry placeholder: its details are not loaded yet.
+    fn placeholder_vulnerability(id: &str) -> Vulnerability {
+        Vulnerability {
+            summary: crate::osv::PLACEHOLDER_SUMMARY.to_owned(),
+            ..deferred_vulnerability(id)
+        }
+    }
+
+    #[test]
+    fn deferred_advisories_count_in_the_total_and_are_summed_up_in_one_hover_line() {
+        let mut vulnerabilities = vec![
+            vulnerability("GHSA-high", AdvisorySeverity::High, None),
+            vulnerability("GHSA-low", AdvisorySeverity::Low, None),
+        ];
+        vulnerabilities
+            .extend((0..5).map(|number| deferred_vulnerability(&format!("GHSA-d{number}"))));
+        let analysis = serde_entry(Status::NotChecked, vulnerabilities, Some("1.0.0"));
+
+        let decoration = &decorations(SERDE_TEXT, &analysis)[0];
+        assert_eq!(decoration.after.as_deref(), Some("⚠ 7 vulnerabilities"));
+        assert_eq!(decoration.style, "error");
+        let hover = decoration.hover.as_deref().unwrap();
+        assert!(hover.contains("GHSA-high"), "{hover}");
+        assert!(!hover.contains("GHSA-d0"), "{hover}");
+        assert!(
+            hover.contains("5 more not loaded") && hover.contains("Load all vulnerabilities"),
+            "{hover}"
+        );
+
+        let problem = &diagnostics(SERDE_TEXT, &analysis)[0];
+        assert!(
+            problem.message.contains("7 known vulnerabilities (High)"),
+            "{}",
+            problem.message
+        );
+        assert_eq!(problem.code.as_deref(), Some("GHSA-high"));
+    }
+
+    #[test]
+    fn only_deferred_advisories_warn_without_naming_a_severity() {
+        let vulnerabilities = vec![
+            deferred_vulnerability("GHSA-d0"),
+            deferred_vulnerability("GHSA-d1"),
+        ];
+        let analysis = serde_entry(Status::NotChecked, vulnerabilities, Some("1.0.0"));
+
+        let decoration = &decorations(SERDE_TEXT, &analysis)[0];
+        assert_eq!(decoration.after.as_deref(), Some("⚠ 2 vulnerabilities"));
+        assert_eq!(decoration.style, "warning");
+
+        let problem = &diagnostics(SERDE_TEXT, &analysis)[0];
+        assert_eq!(problem.severity, Severity::Warning);
+        assert!(
+            problem
+                .message
+                .contains("2 known vulnerabilities (details not loaded)"),
+            "{}",
+            problem.message
+        );
+        assert_eq!(problem.code.as_deref(), Some("GHSA-d0"));
+    }
+
+    #[test]
+    fn a_placeholder_shows_an_unknown_severity_and_never_the_worst_one() {
+        let vulnerabilities = vec![
+            placeholder_vulnerability("GHSA-wait"),
+            vulnerability("GHSA-low", AdvisorySeverity::Low, None),
+        ];
+        let analysis = serde_entry(Status::NotChecked, vulnerabilities, Some("1.0.0"));
+        let hover = decorations(SERDE_TEXT, &analysis)[0].hover.clone().unwrap();
+        assert!(hover.contains("GHSA-wait (severity unknown)"), "{hover}");
+        let problem = &diagnostics(SERDE_TEXT, &analysis)[0];
+        // The only known severity is Low, so the problem is informational.
+        assert_eq!(problem.severity, Severity::Info);
+        assert!(problem.message.contains("(Low)"), "{}", problem.message);
     }
 }

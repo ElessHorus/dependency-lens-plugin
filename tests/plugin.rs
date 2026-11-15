@@ -286,6 +286,255 @@ fn refresh_command_reports_unsupported_and_refreshed_files() {
     assert_eq!(decorations_of(&host, MANIFEST_PATH).len(), 1);
 }
 
+/// A host whose OSV answers list `advisory_count` advisories for serde, and counts detail requests.
+fn host_with_many_serde_advisories(
+    advisory_count: usize,
+    detail_requests: Rc<Cell<u32>>,
+) -> MockHost {
+    let host = MockHost::install().with_capabilities(&[
+        "events",
+        "project.read",
+        "editor.read",
+        "net:api.osv.dev",
+    ]);
+    host.set_project_root(Some("/p"));
+    host.on_fetch(move |request| {
+        let body = if request.url.ends_with(OSV_BATCH_SUFFIX) {
+            let query_body: Value =
+                serde_json::from_slice(request.body.as_deref().unwrap_or_default())
+                    .unwrap_or(Value::Null);
+            let results: Vec<Value> = query_body["queries"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|query| {
+                    if query["package"]["name"] == "serde" {
+                        let vulns: Vec<Value> = (0..advisory_count)
+                            .map(|number| json!({ "id": format!("GHSA-{number:04}") }))
+                            .collect();
+                        json!({ "vulns": vulns })
+                    } else {
+                        json!({ "vulns": [] })
+                    }
+                })
+                .collect();
+            json!({ "results": results }).to_string()
+        } else if let Some(id) = request.url.strip_prefix(OSV_DETAIL_PREFIX) {
+            detail_requests.set(detail_requests.get() + 1);
+            json!({ "id": id, "summary": "Test advisory", "database_specific": { "severity": "HIGH" } })
+                .to_string()
+        } else {
+            return Err(Error::Failed(format!("unexpected request {}", request.url)));
+        };
+        Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: body.into_bytes(),
+        })
+    });
+    host
+}
+
+#[test]
+fn only_ten_advisories_load_until_the_user_asks_for_the_rest() {
+    let detail_requests = Rc::new(Cell::new(0));
+    let host = host_with_many_serde_advisories(25, detail_requests.clone());
+    let mut plugin = DependencyLens::default();
+    open_manifest(&host, &mut plugin);
+
+    // The total is exact, but only ten advisories cost a detail request.
+    let decorations = decorations_of(&host, MANIFEST_PATH);
+    assert_eq!(
+        decorations[0].after.as_deref(),
+        Some("⚠ 25 vulnerabilities")
+    );
+    assert_eq!(detail_requests.get(), 10);
+    let hover = decorations[0].hover.clone().unwrap();
+    assert!(hover.contains("15 more not loaded"), "{hover}");
+
+    // A refresh keeps the ten and asks for nothing more.
+    host.open_editor(MANIFEST_PATH, "toml", MANIFEST, &[]);
+    plugin
+        .run_command("refresh", &host.invocation(), None)
+        .unwrap();
+    assert_eq!(detail_requests.get(), 10);
+
+    let answer = plugin
+        .run_command("load-vulnerabilities", &host.invocation(), None)
+        .unwrap();
+    assert_eq!(
+        answer,
+        Some("Dependency Lens: vulnerabilities loaded".to_owned())
+    );
+    assert_eq!(detail_requests.get(), 25);
+    let decorations = decorations_of(&host, MANIFEST_PATH);
+    assert_eq!(
+        decorations[0].after.as_deref(),
+        Some("⚠ 25 vulnerabilities")
+    );
+    assert!(
+        !decorations[0]
+            .hover
+            .clone()
+            .unwrap()
+            .contains("more not loaded")
+    );
+}
+
+#[test]
+fn the_load_command_says_how_many_advisories_are_left_and_can_run_again() {
+    let detail_requests = Rc::new(Cell::new(0));
+    let host = host_with_many_serde_advisories(130, detail_requests.clone());
+    let mut plugin = DependencyLens::default();
+    open_manifest(&host, &mut plugin);
+    host.open_editor(MANIFEST_PATH, "toml", MANIFEST, &[]);
+    assert_eq!(detail_requests.get(), 10);
+
+    // One run loads at most 100 details, so 20 of the 120 deferred advisories are left.
+    let first = plugin
+        .run_command("load-vulnerabilities", &host.invocation(), None)
+        .unwrap();
+    assert_eq!(
+        first,
+        Some(
+            "Dependency Lens: 20 advisories are still not loaded. Run the command again."
+                .to_owned()
+        )
+    );
+    assert_eq!(detail_requests.get(), 110);
+
+    let second = plugin
+        .run_command("load-vulnerabilities", &host.invocation(), None)
+        .unwrap();
+    assert_eq!(
+        second,
+        Some("Dependency Lens: vulnerabilities loaded".to_owned())
+    );
+    assert_eq!(detail_requests.get(), 130);
+}
+
+#[test]
+fn the_load_command_says_when_vulnerabilities_are_turned_off() {
+    let host = host_with_many_serde_advisories(15, Rc::new(Cell::new(0)));
+    host.set_setting("vulnerabilities", "false");
+    let mut plugin = DependencyLens::default();
+    plugin.activate(&host.context(PLUGIN_ID)).unwrap();
+    host.open_editor(MANIFEST_PATH, "toml", MANIFEST, &[]);
+    let answer = plugin
+        .run_command("load-vulnerabilities", &host.invocation(), None)
+        .unwrap();
+    assert_eq!(
+        answer,
+        Some("Dependency Lens: vulnerabilities are turned off".to_owned())
+    );
+}
+
+/// A host for a Gemfile whose only gem has `advisory_count` advisories, counting detail requests.
+fn host_with_gem_advisories(advisory_count: usize, detail_requests: Rc<Cell<u32>>) -> MockHost {
+    let host = MockHost::install().with_capabilities(&[
+        "events",
+        "project.read",
+        "editor.read",
+        "net:api.osv.dev",
+        "net:rubygems.org",
+    ]);
+    host.set_project_root(Some("/p"));
+    host.on_fetch(move |request| {
+        let body = if request.url.ends_with(OSV_BATCH_SUFFIX) {
+            let query_body: Value =
+                serde_json::from_slice(request.body.as_deref().unwrap_or_default())
+                    .unwrap_or(Value::Null);
+            let results: Vec<Value> = query_body["queries"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|_| {
+                    let vulns: Vec<Value> = (0..advisory_count)
+                        .map(|number| json!({ "id": format!("GHSA-{number:04}") }))
+                        .collect();
+                    json!({ "vulns": vulns })
+                })
+                .collect();
+            json!({ "results": results }).to_string()
+        } else if let Some(id) = request.url.strip_prefix(OSV_DETAIL_PREFIX) {
+            detail_requests.set(detail_requests.get() + 1);
+            json!({ "id": id, "summary": "Test advisory", "database_specific": { "severity": "HIGH" } })
+                .to_string()
+        } else if request.url.starts_with("https://rubygems.org/api/v1/versions/") {
+            r#"[{"number":"1.16.0","prerelease":false},{"number":"1.10.0","prerelease":false}]"#
+                .to_owned()
+        } else {
+            return Err(Error::Failed(format!("unexpected request {}", request.url)));
+        };
+        Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: body.into_bytes(),
+        })
+    });
+    host
+}
+
+#[test]
+fn a_gemfile_with_many_advisories_loads_only_ten_details_on_open() {
+    let detail_requests = Rc::new(Cell::new(0));
+    let host = host_with_gem_advisories(43, detail_requests.clone());
+    host.add_file(
+        "Gemfile",
+        "source 'https://rubygems.org'\ngem 'nokogiri', '1.10.0'\n",
+    );
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(GEMFILE_PATH.to_owned())],
+        &host.invocation(),
+    );
+    let decorations = decorations_of(&host, GEMFILE_PATH);
+    assert_eq!(decorations.len(), 1);
+    let hover = decorations[0].hover.clone().unwrap();
+    // Count the advisory lines of the hover, as the user reads them.
+    let advisory_lines = hover
+        .lines()
+        .filter(|line| line.starts_with("- [GHSA-"))
+        .count();
+    assert_eq!(detail_requests.get(), 10, "detail requests, hover: {hover}");
+    assert_eq!(advisory_lines, 10, "hover: {hover}");
+    assert!(hover.contains("33 more not loaded"), "{hover}");
+}
+
+#[test]
+fn a_request_cancelled_by_the_host_shows_nothing_and_does_not_block_the_next_open() {
+    // The host cancels a running call when a newer batch of the same kind arrives. The first
+    // OSV request fails with `Cancelled`, and the manifest must not show `?` for the next minute.
+    let host = MockHost::install().with_capabilities(&[
+        "events",
+        "project.read",
+        "editor.read",
+        "net:api.osv.dev",
+    ]);
+    host.set_project_root(Some("/p"));
+    let is_first_batch = Rc::new(Cell::new(true));
+    host.on_fetch(move |request| {
+        if request.url.ends_with(OSV_BATCH_SUFFIX) && is_first_batch.replace(false) {
+            return Err(Error::Cancelled);
+        }
+        answer_osv(request)
+    });
+    let mut plugin = DependencyLens::default();
+    open_manifest(&host, &mut plugin);
+    assert!(decorations_of(&host, MANIFEST_PATH).is_empty());
+    assert!(diagnostics_of(&host, MANIFEST_PATH).is_empty());
+
+    // The newer call, an instant later, asks OSV again and shows the advisory.
+    plugin.handle_events(
+        &[Event::FileOpened(MANIFEST_PATH.to_owned())],
+        &host.invocation(),
+    );
+    let decorations = decorations_of(&host, MANIFEST_PATH);
+    assert_eq!(decorations.len(), 1);
+    assert_eq!(decorations[0].after.as_deref(), Some("⚠ 1 vulnerability"));
+    assert_eq!(osv_batch_requests(&host), 2);
+}
+
 #[test]
 fn unknown_command_is_not_found() {
     let host = host_counting_fetches(Rc::new(Cell::new(0)));

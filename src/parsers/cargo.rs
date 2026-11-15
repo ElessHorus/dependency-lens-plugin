@@ -131,6 +131,17 @@ fn build_dependency(
         None => key_content_range(key)?,
     };
     let version_range = quoted_content_range(version.syntax()?)?;
+    // A span must cover the value itself. An escape sequence or a multi-line quote makes the
+    // source text differ from the value, so such an entry is not returned.
+    let source_text = index.text();
+    let name_value = package.map_or_else(|| key.value(), Str::value);
+    if source_text.get(usize::from(name_range.start())..usize::from(name_range.end()))
+        != Some(name_value)
+        || source_text.get(usize::from(version_range.start())..usize::from(version_range.end()))
+            != Some(version.value())
+    {
+        return None;
+    }
     Some(Dependency {
         name: package.map_or_else(|| key.value(), Str::value).to_owned(),
         version: version.value().to_owned(),
@@ -298,5 +309,18 @@ registry = \"corp\"
         let dependencies = parse(manifest);
         assert_eq!(dependencies.len(), 1);
         assert_eq!(dependencies[0].name, "serde");
+    }
+
+    #[test]
+    fn strings_whose_source_text_differs_from_their_value_are_not_returned() {
+        // An escape or a multi-line quote would make the span point at text that is not the value.
+        let manifest = "[dependencies]\n\"caf\\u00e9\" = \"1.0\"\nescaped = \"1\\u002e0\"\nliteral = '''2.0'''\nplain = \"3.0\"\n";
+        let dependencies = parse(manifest);
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].name, "plain");
+        assert_eq!(
+            to_range(manifest, dependencies[0].version_span).map(|range| range.start.character),
+            Some(9)
+        );
     }
 }
