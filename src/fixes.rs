@@ -206,10 +206,37 @@ struct AdvisoryRanges<'a, V> {
     ranges: Vec<Vec<ParsedEvent<'a, V>>>,
 }
 
-impl<V: UpdateVersion> AdvisoryRanges<'_, V> {
+impl<'a, V: UpdateVersion> AdvisoryRanges<'a, V> {
     /// Returns `true` when the advisory affects `version` through any of its ranges.
     fn affects(&self, version: &V) -> bool {
         self.ranges.iter().any(|range| range_holds(range, version))
+    }
+
+    /// Returns the `fixed` event that ends the intervals holding `current`, as OSV writes it.
+    ///
+    /// Returns `None` when an interval that holds `current` ends with `last_affected`, or does not
+    /// end: the advisory has no fix for this version. Several intervals can hold `current`, and
+    /// the advisory then ends with the last of them.
+    fn fix_for(&self, current: &V) -> Option<&ParsedEvent<'a, V>> {
+        let mut last_fix = None;
+        for range in self
+            .ranges
+            .iter()
+            .filter(|range| range_holds(range, current))
+        {
+            // The events are sorted, so the first event past `current` ends the interval.
+            let end = range.iter().find(|event| {
+                event.version > *current
+                    || (event.version == *current && event.kind == EventKind::LastAffected)
+            })?;
+            if end.kind != EventKind::Fixed {
+                return None;
+            }
+            if last_fix.is_none_or(|fix: &ParsedEvent<'a, V>| fix.version < end.version) {
+                last_fix = Some(end);
+            }
+        }
+        last_fix
     }
 }
 
@@ -229,34 +256,64 @@ fn plan_fix_of<V: UpdateVersion>(
         })
         .filter(|advisory| advisory.affects(&current))
         .collect();
-    // A candidate target is a version where an interval of such an advisory ends. A later interval
-    // of the same advisory may still hold it, so each candidate is checked against every advisory.
+    // The fix of each open advisory for the current version, when it has one.
+    let fixes: Vec<(&AdvisoryRanges<'_, V>, &ParsedEvent<'_, V>)> = open_advisories
+        .iter()
+        .filter_map(|advisory| Some((advisory, advisory.fix_for(&current)?)))
+        .collect();
+    // The least target is the highest allowed fix that OSV names for the current version.
+    let (_, least_fix) = fixes
+        .iter()
+        .filter(|(_, fix)| allows(fix.text))
+        .max_by(|(_, left), (_, right)| left.version.cmp(&right.version))?;
+    let least_target = &least_fix.version;
+    // The target must fix every advisory that this least target is meant to fix. A later interval of
+    // such an advisory may hold the least target, so the target then moves to a higher fix.
+    let must_fix: Vec<&AdvisoryRanges<'_, V>> = fixes
+        .iter()
+        .filter(|(_, fix)| fix.version <= *least_target)
+        .map(|(advisory, _)| *advisory)
+        .collect();
+    // A candidate target is a version where an interval of an open advisory ends. `allows` runs
+    // only on the candidates that the search reaches, because it can be costly.
     let mut candidates: Vec<(&V, &str)> = open_advisories
         .iter()
         .flat_map(|advisory| &advisory.ranges)
         .flatten()
         .filter(|event| event.kind == EventKind::Fixed && event.version > current)
-        .filter(|event| allows(event.text))
         .map(|event| (&event.version, event.text))
         .collect();
     candidates.sort_by(|left, right| left.0.cmp(right.0));
-    // Sorted by version, so the first of the best candidates is the smallest version that fixes the most.
-    let mut best: Option<(usize, &str)> = None;
-    for (version, text) in candidates {
-        let fixed_count = open_advisories
+    let fixed_count_at = |version: &V| {
+        open_advisories
             .iter()
             .filter(|advisory| !advisory.affects(version))
-            .count();
+            .count()
+    };
+    let plan_at = |text: &str, fixed_count: usize| FixPlan {
+        target: text.to_owned(),
+        fixed_count,
+        total_count: advisories.len(),
+    };
+    // The nearest candidate from the least target that fixes every advisory to fix. It does not
+    // chase advisories that have no fix for the current version, so it never jumps further than needed.
+    if let Some((version, text)) = candidates.iter().find(|(version, text)| {
+        **version >= *least_target
+            && must_fix.iter().all(|advisory| !advisory.affects(version))
+            && allows(text)
+    }) {
+        return Some(plan_at(text, fixed_count_at(version)));
+    }
+    // No allowed candidate fixes them all. Take the one that fixes the most, the smallest on a tie.
+    let mut best: Option<(usize, &str)> = None;
+    for (version, text) in candidates.into_iter().filter(|(_, text)| allows(text)) {
+        let fixed_count = fixed_count_at(version);
         if fixed_count > best.map_or(0, |(best_count, _)| best_count) {
             best = Some((fixed_count, text));
         }
     }
-    let (fixed_count, target) = best?;
-    Some(FixPlan {
-        target: target.to_owned(),
-        fixed_count,
-        total_count: advisories.len(),
-    })
+    let (fixed_count, text) = best?;
+    Some(plan_at(text, fixed_count))
 }
 
 /// Reads the constraints of the requirement of `eco` that holds the pin at byte `pin_start` of `line`.
@@ -739,6 +796,58 @@ mod tests {
         let plan = plan_of(&[&commit_end, &advisory_b], |_| true).expect("a fix");
         assert_eq!(plan.target, "1.1.0");
         assert_eq!((plan.fixed_count, plan.total_count), (1, 2));
+    }
+
+    #[test]
+    fn an_advisory_without_a_fix_for_the_current_version_does_not_pull_the_target() {
+        // A is fixed in 1.1.0. C holds 1.0.0 through a `last_affected` interval, so it has no fix for
+        // it, but a later interval of C ends far away. That far end must not become the target.
+        let advisory_a = affected(
+            "crates.io",
+            "review_demo",
+            &[&[("introduced", "0"), ("fixed", "1.1.0")]],
+        );
+        for far_end in ["3.5.0", "4.0.0-beta.2"] {
+            let advisory_c = affected(
+                "crates.io",
+                "review_demo",
+                &[&[
+                    ("introduced", "0"),
+                    ("last_affected", "2.0.0"),
+                    ("introduced", "3.0.0"),
+                    ("fixed", far_end),
+                ]],
+            );
+            let plan = plan_of(&[&advisory_a, &advisory_c], |_| true).expect("a fix");
+            assert_eq!(plan.target, "1.1.0", "{far_end}");
+            assert_eq!((plan.fixed_count, plan.total_count), (1, 2), "{far_end}");
+        }
+    }
+
+    #[test]
+    fn an_advisory_closed_by_last_affected_counts_as_fixed_by_a_higher_target() {
+        // OSV: versions above `last_affected` are unaffected. 0.10.0 fixes B and ends A and C.
+        let fixed = affected(
+            "crates.io",
+            "review_demo",
+            &[&[("introduced", "0"), ("fixed", "0.10.0")]],
+        );
+        let last_affected = affected(
+            "crates.io",
+            "review_demo",
+            &[&[("introduced", "0"), ("last_affected", "0.9.6")]],
+        );
+        let advisories: Vec<&[Affected]> = vec![&fixed, &last_affected, &last_affected];
+        let plan = plan_fix(
+            Ecosystem::Cargo,
+            "review_demo",
+            "0.9.6",
+            &advisories,
+            |_| true,
+        )
+        .expect("a fix");
+        assert_eq!(plan.target, "0.10.0");
+        assert_eq!((plan.fixed_count, plan.total_count), (3, 3));
     }
 
     #[test]
