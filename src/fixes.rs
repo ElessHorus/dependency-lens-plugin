@@ -5,6 +5,8 @@
 //! each range. The rules here pick, for one dependency, the smallest version that fixes every
 //! advisory of its current version.
 
+use std::collections::HashMap;
+
 use crate::model::{Affected, Ecosystem, RangeEvent};
 use crate::registries::dotted::{DottedVersion, PubVersion, segment};
 use crate::registries::gem_version::GemVersion;
@@ -207,40 +209,99 @@ fn range_holds<V: UpdateVersion>(events: &[ParsedEvent<'_, V>], version: &V) -> 
     is_affected
 }
 
+/// The distinct version texts that advisories list, each parsed once.
+///
+/// An advisory lists every release that it affects, so the lists of one package repeat the same
+/// few hundred texts thousands of times. Parsing each list entry again costs several times more
+/// than the rest of the plan.
+struct ListedVersions<'a, V> {
+    ids: HashMap<&'a str, usize>,
+    /// The parsed version of each id, `None` for a text that is not a version.
+    versions: Vec<Option<V>>,
+}
+
+impl<V> Default for ListedVersions<'_, V> {
+    fn default() -> Self {
+        Self {
+            ids: HashMap::new(),
+            versions: Vec::new(),
+        }
+    }
+}
+
+impl<'a, V: UpdateVersion> ListedVersions<'a, V> {
+    /// Returns the id of `text`, which is parsed on its first sight.
+    fn id_of(&mut self, text: &'a str) -> usize {
+        *self.ids.entry(text).or_insert_with(|| {
+            self.versions.push(V::parse_version(text));
+            self.versions.len() - 1
+        })
+    }
+
+    /// Looks up the ids of the listed texts that are the version `version`, whatever their spelling.
+    fn probe<'v>(&self, version: &'v V) -> Probe<'v, V> {
+        let listed_ids = self
+            .versions
+            .iter()
+            .enumerate()
+            .filter(|(_, listed)| listed.as_ref() == Some(version))
+            .map(|(id, _)| id)
+            .collect();
+        Probe {
+            version,
+            listed_ids,
+        }
+    }
+}
+
+/// A version to test against advisories, with the ids of the listed texts that equal it.
+struct Probe<'v, V> {
+    version: &'v V,
+    listed_ids: Vec<usize>,
+}
+
 /// What one advisory says about the package, with its versions parsed.
 struct AdvisoryScope<'a, V> {
     ranges: Vec<Vec<ParsedEvent<'a, V>>>,
-    /// The versions that the advisory lists as affected, besides its ranges.
-    versions: Vec<V>,
+    /// The ids of the versions that the advisory lists as affected, besides its ranges. Sorted.
+    listed_ids: Vec<usize>,
 }
 
 impl<'a, V: UpdateVersion> AdvisoryScope<'a, V> {
     /// Reads the ranges and the listed versions of the entries of `affected` for the package.
-    ///
-    /// A listed version that does not parse is skipped.
-    fn of(eco: Ecosystem, package: &str, affected: &'a [Affected]) -> Self {
+    fn of(
+        eco: Ecosystem,
+        package: &str,
+        affected: &'a [Affected],
+        listed: &mut ListedVersions<'a, V>,
+    ) -> Self {
         let mut scope = Self {
             ranges: Vec::new(),
-            versions: Vec::new(),
+            listed_ids: Vec::new(),
         };
         for entry in entries_of(eco, package, affected) {
             scope
                 .ranges
                 .extend(entry.ranges.iter().map(|events| parse_range(events)));
-            scope.versions.extend(
-                entry
-                    .versions
-                    .iter()
-                    .filter_map(|text| V::parse_version(text)),
-            );
+            scope
+                .listed_ids
+                .extend(entry.versions.iter().map(|text| listed.id_of(text)));
         }
+        // Sorted, so that a probe finds its ids by binary search.
+        scope.listed_ids.sort_unstable();
+        scope.listed_ids.dedup();
         scope
     }
 
-    /// Returns `true` when the advisory affects `version`: it lies in a range or the list holds it.
-    fn affects(&self, version: &V) -> bool {
-        self.ranges.iter().any(|range| range_holds(range, version))
-            || self.versions.contains(version)
+    /// Returns `true` when the advisory affects the probed version: it lies in a range or the list holds it.
+    fn affects(&self, probe: &Probe<'_, V>) -> bool {
+        self.ranges
+            .iter()
+            .any(|range| range_holds(range, probe.version))
+            || probe
+                .listed_ids
+                .iter()
+                .any(|id| self.listed_ids.binary_search(id).is_ok())
     }
 
     /// Returns the `fixed` event that ends the intervals holding `current`, as OSV writes it.
@@ -280,10 +341,15 @@ fn plan_fix_of<V: UpdateVersion>(
 ) -> Option<FixPlan> {
     let current = V::parse_version(current)?;
     // Parse each advisory once. Only an advisory that affects the current version can be fixed.
-    let open_advisories: Vec<AdvisoryScope<'_, V>> = advisories
+    let mut listed = ListedVersions::default();
+    let scopes: Vec<AdvisoryScope<'_, V>> = advisories
         .iter()
-        .map(|affected| AdvisoryScope::of(eco, package, affected))
-        .filter(|advisory| advisory.affects(&current))
+        .map(|affected| AdvisoryScope::of(eco, package, affected, &mut listed))
+        .collect();
+    let current_probe = listed.probe(&current);
+    let open_advisories: Vec<AdvisoryScope<'_, V>> = scopes
+        .into_iter()
+        .filter(|advisory| advisory.affects(&current_probe))
         .collect();
     // The fix of each open advisory for the current version, when it has one.
     let fixes: Vec<(&AdvisoryScope<'_, V>, &ParsedEvent<'_, V>)> = open_advisories
@@ -314,9 +380,10 @@ fn plan_fix_of<V: UpdateVersion>(
         .collect();
     candidates.sort_by(|left, right| left.0.cmp(right.0));
     let fixed_count_at = |version: &V| {
+        let probe = listed.probe(version);
         open_advisories
             .iter()
-            .filter(|advisory| !advisory.affects(version))
+            .filter(|advisory| !advisory.affects(&probe))
             .count()
     };
     let plan_at = |text: &str, fixed_count: usize| FixPlan {
@@ -328,7 +395,10 @@ fn plan_fix_of<V: UpdateVersion>(
     // chase advisories that have no fix for the current version, so it never jumps further than needed.
     if let Some((version, text)) = candidates.iter().find(|(version, text)| {
         **version >= *least_target
-            && must_fix.iter().all(|advisory| !advisory.affects(version))
+            && {
+                let probe = listed.probe(version);
+                must_fix.iter().all(|advisory| !advisory.affects(&probe))
+            }
             && allows(text)
     }) {
         return Some(plan_at(text, fixed_count_at(version)));
@@ -926,6 +996,32 @@ mod tests {
         assert_eq!((plan.fixed_count, plan.total_count), (2, 2));
         // The list alone gives no fix, so the plan is empty when nothing else names one.
         assert!(plan_of(&[&advisory_c], |_| true).is_none());
+    }
+
+    #[test]
+    fn a_listed_version_matches_an_equal_version_written_differently() {
+        // B lists `1.1`, which is the version 1.1.0, so 1.1.0 does not fix B.
+        let advisory_a = two_interval_advisory(("fixed", "1.8.0"));
+        let advisory_b =
+            affected_with_versions(&[&[("introduced", "0"), ("fixed", "1.1.0")]], &["1.1"]);
+        let plan = plan_of(&[&advisory_a, &advisory_b], |_| true).expect("a fix");
+        assert_eq!(plan.target, "1.8.0");
+    }
+
+    #[test]
+    fn listed_versions_are_parsed_once_per_distinct_text() {
+        // Advisories list the same releases again and again, so each text gets one id.
+        let mut listed = ListedVersions::<DottedVersion>::default();
+        let first = listed.id_of("1.0.0");
+        assert_eq!(listed.id_of("1.0.0"), first);
+        let other = listed.id_of("2.0.0");
+        assert_ne!(other, first);
+        // A text that does not parse still gets an id, and no version matches it.
+        let unreadable = listed.id_of("not a version");
+        let version = DottedVersion::parse("1.0.0").expect("a version");
+        let probe = listed.probe(&version);
+        assert_eq!(probe.listed_ids, [first]);
+        assert!(!probe.listed_ids.contains(&unreadable));
     }
 
     #[test]
