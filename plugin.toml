@@ -1,10 +1,10 @@
 id = "elesshorus.dependency-lens"
 name = "Dependency Lens"
-version = "0.1.1"
+version = "0.1.2"
 description = "Shows OSV vulnerabilities and newer versions inline in dependency manifests."
 authors = ["The Dependency Lens authors"]
 license = "MIT"
-change-notes = "0.1.1 — fix: gems inside a Gemfile path, git or source block no longer reach OSV or the registry; PEP 508 constraints in parentheses, such as requests (==2.28.0), are now read. 0.1.0 — first release: OSV vulnerabilities for nine ecosystems; version hints and update quick fixes for Python, PHP, Dart, C# and Ruby."
+change-notes = "0.1.2 — privacy: a private index, repository or source (pip, uv, Poetry, Composer, Maven, Gemfile, Dart hosted, Cargo registry, Go replace) keeps the packages out of OSV and registry lookups, and a manifest-wide private source hides the whole file. New: the details of 10 advisories load per package, and the others load on request (the command Load all vulnerabilities, or the action in the hover); a quick fix that updates a vulnerable dependency to a fixed version, for all nine ecosystems; an informational problem for outdated dependencies (setting outdatedProblems). Fix: a request cancelled by the IDE no longer shows ?. 0.1.1 — fix: gems inside a Gemfile path, git or source block no longer reach OSV or the registry; PEP 508 constraints in parentheses, such as requests (==2.28.0), are now read. 0.1.0 — first release: OSV vulnerabilities for nine ecosystems; version hints and update quick fixes for Python, PHP, Dart, C# and Ruby."
 # Marketplace categories (up to 3): languages, themes, icon-themes, linters,
 # vcs, ai, frameworks, tools, other.
 categories = ["tools"]
