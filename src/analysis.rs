@@ -73,6 +73,9 @@ pub struct Budget {
     details_per_query: usize,
     /// The host cancelled a request of this run, because a newer call supersedes it.
     is_cancelled: bool,
+    /// How many package versions that were never queried may go to OSV in one call, at the least.
+    /// The share doubles with the answers that the cache holds. `None` queries all of them.
+    first_osv_slice: Option<usize>,
 }
 
 impl Budget {
@@ -83,7 +86,21 @@ impl Budget {
             deadline,
             details_per_query: DEFAULT_DETAILS_PER_QUERY,
             is_cancelled: false,
+            first_osv_slice: None,
         }
+    }
+
+    /// Sends a first slice of the package versions that were never queried to OSV, and leaves the
+    /// others pending. A manifest then shows its first dependencies as soon as OSV answers for
+    /// them, and a slow package delays only its own slice. The next calls double the slice.
+    pub fn with_first_osv_slice(mut self, queries: usize) -> Self {
+        self.first_osv_slice = Some(queries);
+        self
+    }
+
+    /// The slice of never-queried package versions that one call sends to OSV, if it is limited.
+    pub(crate) fn first_osv_slice(&self) -> Option<usize> {
+        self.first_osv_slice
     }
 
     /// Records that the host cancelled a request. No lookup starts afterwards.
@@ -184,11 +201,17 @@ pub fn analyze(
             })
             .collect()
     };
-    let pending = if eco.offers_updates() {
-        resolve_registry(eco, &mut entries, cache, http, budget, now)
-    } else {
-        0
-    };
+    // An entry that waits for OSV stays pending, and its registry lookup comes with its slice.
+    let waiting_for_osv = entries
+        .iter()
+        .filter(|entry| entry.status == Status::Pending)
+        .count();
+    let pending = waiting_for_osv
+        + if eco.offers_updates() {
+            resolve_registry(eco, &mut entries, cache, http, budget, now)
+        } else {
+            0
+        };
     Analysis { entries, pending }
 }
 
@@ -212,7 +235,8 @@ fn resolve_registry(
     let mut fresh: HashMap<String, Lookup> = HashMap::new();
     let mut pending_count = 0;
     for entry in entries.iter_mut().filter(|entry| {
-        entry.checked_version.is_some() && !matches!(entry.status, Status::Unknown(_))
+        entry.checked_version.is_some()
+            && !matches!(entry.status, Status::Unknown(_) | Status::Pending)
     }) {
         let name = eco.normalize_package(&entry.dependency.name);
         let declared = entry.dependency.version.as_str();
@@ -388,6 +412,31 @@ fn query_missing_vulnerabilities(
 ) -> FreshOsv {
     let details_per_query = budget.details_per_query();
     let mut fresh = FreshOsv::default();
+    // How many package versions that OSV never answered for may be sent in this call: the slice
+    // of the budget, or as many as the cache already answered, so the slice doubles at each call.
+    let new_pair_limit = budget.first_osv_slice().map(|slice| {
+        let answered: HashSet<(&str, &str)> = deps
+            .iter()
+            .zip(checked_versions)
+            .filter_map(|(dependency, checked_version)| {
+                let version = checked_version.as_deref()?;
+                let is_answered = cache
+                    .vulnerabilities(eco, &dependency.name, version, now)
+                    .is_some()
+                    || cache
+                        .failure(
+                            FailureKind::Osv,
+                            eco,
+                            &osv_failure_key(&dependency.name, version),
+                            now,
+                        )
+                        .is_some();
+                is_answered.then_some((dependency.name.as_str(), version))
+            })
+            .collect();
+        slice.max(answered.len())
+    });
+    let mut new_pairs_taken = 0;
     // Borrowed pairs: duplicates are found without copying the names.
     let mut seen: HashSet<(&str, &str)> = HashSet::new();
     let mut queries: Vec<OsvQuery> = Vec::new();
@@ -415,6 +464,16 @@ fn query_missing_vulnerabilities(
             || !seen.insert((dependency.name.as_str(), version))
         {
             continue;
+        }
+        // A pair that OSV never answered for waits for a later call once the slice is full. A
+        // pair that is queried again for its details is not limited: the user asked for them.
+        if unresolved.is_none()
+            && let Some(limit) = new_pair_limit
+        {
+            if new_pairs_taken >= limit {
+                continue;
+            }
+            new_pairs_taken += 1;
         }
         queries.push(OsvQuery {
             ecosystem: eco,
@@ -511,13 +570,13 @@ fn build_entry(
             checked_version,
         };
     }
-    let vulnerabilities = checked_version
-        .as_deref()
-        .and_then(|version| {
-            fresh
-                .vulnerabilities(&dependency.name, version)
-                .or_else(|| cache.vulnerabilities(eco, &dependency.name, version, now))
-        })
+    let answer = checked_version.as_deref().and_then(|version| {
+        fresh
+            .vulnerabilities(&dependency.name, version)
+            .or_else(|| cache.vulnerabilities(eco, &dependency.name, version, now))
+    });
+    let has_answer = answer.is_some();
+    let vulnerabilities = answer
         .unwrap_or_default()
         .iter()
         .filter_map(|cached| {
@@ -543,8 +602,11 @@ fn build_entry(
             )
         })
     });
+    // A checked version with neither an answer nor a failure was left for a later call.
+    let waits_for_osv = checked_version.is_some() && !has_answer && failure.is_none();
     let status = match failure {
         Some(reason) => Status::Unknown(reason.to_owned()),
+        None if waits_for_osv => Status::Pending,
         None => Status::NotChecked,
     };
     Entry {
@@ -1924,6 +1986,151 @@ mod tests {
         assert_eq!(http.count(DETAIL_PREFIX), 10);
     }
 
+    /// Answers every OSV batch with one empty result per query and records the batch sizes. Any
+    /// other request gets a 404.
+    #[derive(Default)]
+    struct SliceHttp {
+        batch_sizes: std::cell::RefCell<Vec<usize>>,
+        registry_requests: std::cell::Cell<usize>,
+    }
+
+    impl Http for SliceHttp {
+        fn send(
+            &self,
+            request: &openidea_plugin::HttpRequest,
+        ) -> Result<openidea_plugin::HttpResponse, String> {
+            let (status, body) = if request.url == BATCH_URL {
+                let sent: serde_json::Value =
+                    serde_json::from_slice(request.body.as_deref().unwrap_or_default())
+                        .map_err(|error| error.to_string())?;
+                let size = sent["queries"].as_array().map_or(0, Vec::len);
+                self.batch_sizes.borrow_mut().push(size);
+                (200, batch_body(size))
+            } else {
+                self.registry_requests.set(self.registry_requests.get() + 1);
+                (404, String::new())
+            };
+            Ok(openidea_plugin::HttpResponse {
+                status,
+                headers: Vec::new(),
+                body: body.into_bytes(),
+            })
+        }
+    }
+
+    const FIVE_CRATES: &str = "[dependencies]\na = \"1.0.0\"\nb = \"1.0.0\"\nc = \"1.0.0\"\nd = \"1.0.0\"\ne = \"1.0.0\"\n";
+
+    fn analyze_five_crates(cache: &mut Cache, http: &SliceHttp, first_slice: usize) -> Analysis {
+        analyze(
+            Ecosystem::Cargo,
+            parsers::cargo::parse(FIVE_CRATES),
+            cache,
+            http,
+            &Settings::default(),
+            NOW,
+            &mut Budget::new(usize::MAX, None).with_first_osv_slice(first_slice),
+        )
+    }
+
+    fn pending_names(analysis: &Analysis) -> Vec<&str> {
+        analysis
+            .entries
+            .iter()
+            .filter(|entry| entry.status == Status::Pending)
+            .map(|entry| entry.dependency.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_cold_analysis_queries_only_a_first_slice_and_leaves_the_others_pending() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = SliceHttp::default();
+        let analysis = analyze_five_crates(&mut cache, &http, 2);
+        assert_eq!(*http.batch_sizes.borrow(), [2]);
+        assert_eq!(pending_names(&analysis), ["c", "d", "e"]);
+        assert_eq!(analysis.pending, 3);
+        // The two that were queried are settled.
+        assert_eq!(entry(&analysis, "a").status, Status::NotChecked);
+        assert_eq!(entry(&analysis, "b").status, Status::NotChecked);
+    }
+
+    #[test]
+    fn the_slice_doubles_as_the_answers_accumulate() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = SliceHttp::default();
+        let sizes_after_each_call: Vec<usize> = (0..3)
+            .map(|_| analyze_five_crates(&mut cache, &http, 2).pending)
+            .collect();
+        // 2 answered after the first call, then 2 more (4 answered), then the last one.
+        assert_eq!(*http.batch_sizes.borrow(), [2, 2, 1]);
+        assert_eq!(sizes_after_each_call, [3, 1, 0]);
+    }
+
+    #[test]
+    fn without_a_slice_every_dependency_is_queried_at_once() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = SliceHttp::default();
+        let analysis = analyze(
+            Ecosystem::Cargo,
+            parsers::cargo::parse(FIVE_CRATES),
+            &mut cache,
+            &http,
+            &Settings::default(),
+            NOW,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(*http.batch_sizes.borrow(), [5]);
+        assert_eq!(analysis.pending, 0);
+    }
+
+    #[test]
+    fn a_dependency_that_waits_for_osv_makes_no_registry_request_yet() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = SliceHttp::default();
+        let manifest = "a==1.0.0\nb==1.0.0\nc==1.0.0\nd==1.0.0\ne==1.0.0\n";
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            manifest,
+            &mut Budget::new(usize::MAX, None).with_first_osv_slice(2),
+        );
+        // Only the two queried dependencies look up the registry, and they fail with a 404 here.
+        assert_eq!(http.registry_requests.get(), 2);
+        assert_eq!(pending_names(&analysis), ["c", "d", "e"]);
+        assert_eq!(analysis.pending, 3);
+    }
+
+    #[test]
+    fn a_requery_for_unloaded_details_is_not_sliced() {
+        // A cached answer with a deferred advisory is queried again whatever the slice, because the
+        // user asked for its details. Only a pair that was never queried waits for its turn.
+        let mut cache = Cache::new(TTL_SECS);
+        let http = http_with_many_advisories(15);
+        let first = analyze(
+            Ecosystem::Cargo,
+            parsers::cargo::parse(SINGLE_SERDE),
+            &mut cache,
+            &http,
+            &Settings::default(),
+            NOW,
+            &mut Budget::new(usize::MAX, None).with_first_osv_slice(1),
+        );
+        assert!(first.unloaded_advisory_count() > 0);
+        let second = analyze(
+            Ecosystem::Cargo,
+            parsers::cargo::parse(SINGLE_SERDE),
+            &mut cache,
+            &http,
+            &Settings::default(),
+            NOW,
+            &mut Budget::new(usize::MAX, None)
+                .with_first_osv_slice(1)
+                .with_detail_limit(usize::MAX),
+        );
+        assert_eq!(second.unloaded_advisory_count(), 0);
+    }
+
     #[test]
     fn a_larger_detail_limit_loads_the_deferred_advisories() {
         let mut cache = Cache::new(TTL_SECS);
@@ -2092,11 +2299,13 @@ mod tests {
             &mut budget,
         );
         assert!(budget.is_cancelled());
+        // The run learned nothing about the dependencies, so they still wait for OSV. A cancelled
+        // run is not published, so nobody sees this state.
         assert!(
             analysis
                 .entries
                 .iter()
-                .all(|entry| entry.status == Status::NotChecked)
+                .all(|entry| entry.status == Status::Pending)
         );
         assert!(
             cache

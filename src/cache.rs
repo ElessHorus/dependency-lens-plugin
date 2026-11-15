@@ -33,6 +33,9 @@ pub struct Cache {
     advisories: HashMap<String, Entry<Vulnerability>>,
     /// The affected ranges of each advisory, which the fix quick fix reads.
     affected: HashMap<String, Entry<Vec<Affected>>>,
+    /// The revision (`modified` time) of each stored advisory record. It outlives the TTL, so that
+    /// an expired record whose revision did not change is confirmed without a new download.
+    revisions: HashMap<String, String>,
 }
 
 /// Returns the value of an entry that is still valid at `now`.
@@ -54,6 +57,7 @@ impl Cache {
             failures: HashMap::new(),
             advisories: HashMap::new(),
             affected: HashMap::new(),
+            revisions: HashMap::new(),
         }
     }
 
@@ -176,6 +180,38 @@ impl Cache {
                 stored_at: now,
             },
         );
+    }
+
+    /// Stores the revision of the record of the advisory `id`, as a comparable key.
+    pub fn put_revision(&mut self, id: &str, revision: &str) {
+        if self.stores_entries() {
+            self.revisions.insert(id.to_owned(), revision.to_owned());
+        }
+    }
+
+    /// Returns `true` when the stored record of the advisory `id` is the one to use.
+    ///
+    /// A stored revision that equals `revision` confirms the record, even after its TTL, and
+    /// restarts its lifetime. A different revision rejects it, even inside its TTL. When one side
+    /// has no revision, the TTL decides. The record needs both its advisory and its affected ranges.
+    pub fn confirm_advisory(&mut self, id: &str, revision: Option<&str>, now: u64) -> bool {
+        let (Some(advisory), Some(affected)) =
+            (self.advisories.get_mut(id), self.affected.get_mut(id))
+        else {
+            return false;
+        };
+        match (self.revisions.get(id).map(String::as_str), revision) {
+            (Some(stored), Some(wanted)) if stored == wanted => {
+                advisory.stored_at = now;
+                affected.stored_at = now;
+                true
+            }
+            (Some(_), Some(_)) => false,
+            _ => {
+                fresh_value(Some(&*advisory), now, self.ttl_secs).is_some()
+                    && fresh_value(Some(&*affected), now, self.ttl_secs).is_some()
+            }
+        }
     }
 
     /// Stores an advisory under its `id`, replacing any previous value.
@@ -379,5 +415,59 @@ mod tests {
             None
         );
         assert_eq!(cache.advisory("GHSA-1", START_SECS), None);
+    }
+
+    #[test]
+    fn an_advisory_with_an_unchanged_revision_stays_valid_after_the_ttl() {
+        let mut cache = Cache::new(TTL_SECS);
+        cache.put_advisory(sample_vulnerability("GHSA-1"), START_SECS);
+        cache.put_affected("GHSA-1", Vec::new(), START_SECS);
+        cache.put_revision("GHSA-1", "2025-01-01T00:00:00.000001Z");
+        let later = START_SECS + TTL_SECS + 5;
+        assert!(cache.advisory("GHSA-1", later).is_none());
+        // The same revision confirms the record and restarts its lifetime.
+        assert!(cache.confirm_advisory("GHSA-1", Some("2025-01-01T00:00:00.000001Z"), later));
+        assert!(cache.advisory("GHSA-1", later).is_some());
+        assert!(cache.affected("GHSA-1", later).is_some());
+        assert!(cache.advisory("GHSA-1", later + TTL_SECS - 1).is_some());
+    }
+
+    #[test]
+    fn a_new_revision_does_not_confirm_the_advisory() {
+        let mut cache = Cache::new(TTL_SECS);
+        cache.put_advisory(sample_vulnerability("GHSA-1"), START_SECS);
+        cache.put_affected("GHSA-1", Vec::new(), START_SECS);
+        cache.put_revision("GHSA-1", "2025-01-01T00:00:00.000001Z");
+        // Even inside the lifetime, a newer revision means the record is out of date.
+        assert!(!cache.confirm_advisory(
+            "GHSA-1",
+            Some("2025-02-01T00:00:00.000001Z"),
+            START_SECS + 1
+        ));
+    }
+
+    #[test]
+    fn without_a_revision_the_ttl_decides() {
+        let mut cache = Cache::new(TTL_SECS);
+        cache.put_advisory(sample_vulnerability("GHSA-1"), START_SECS);
+        cache.put_affected("GHSA-1", Vec::new(), START_SECS);
+        assert!(cache.confirm_advisory(
+            "GHSA-1",
+            Some("2025-01-01T00:00:00.000001Z"),
+            START_SECS + 1
+        ));
+        assert!(cache.confirm_advisory("GHSA-1", None, START_SECS + 1));
+        assert!(!cache.confirm_advisory("GHSA-1", None, START_SECS + TTL_SECS));
+        // An advisory that was never stored is never confirmed.
+        assert!(!cache.confirm_advisory("GHSA-2", None, START_SECS));
+    }
+
+    #[test]
+    fn a_cache_that_stores_nothing_confirms_nothing() {
+        let mut cache = Cache::new(0);
+        cache.put_advisory(sample_vulnerability("GHSA-1"), START_SECS);
+        cache.put_affected("GHSA-1", Vec::new(), START_SECS);
+        cache.put_revision("GHSA-1", "r1");
+        assert!(!cache.confirm_advisory("GHSA-1", Some("r1"), START_SECS));
     }
 }

@@ -19,10 +19,25 @@ pub const DEFAULT_DETAILS_PER_QUERY: usize = 10;
 /// Most queries that OSV accepts in one `querybatch` request.
 const MAX_BATCH_QUERIES: usize = 1000;
 
+/// A full query costs one request plus the transfer of every record, which is about as long as
+/// one request by id for this many advisories (measured on OSV: 170 ms a request, 4 to 8 ms a record).
+/// The query is used when it replaces enough requests by id: at most this many advisories for
+/// each request that it saves.
+const FULL_QUERY_IDS_PER_SAVED_REQUEST: usize = 25;
+
+/// Most advisories of one package version that a full query reads. A larger answer would hold
+/// too much in memory, so such a package is read by id.
+const FULL_QUERY_MAX_IDS: usize = 1500;
+
+/// Time allowed to a full query, in milliseconds.
+const FULL_QUERY_TIMEOUT_MS: u32 = 30_000;
+
 /// Longest advisory id that is used in a URL.
 const MAX_ADVISORY_ID_LEN: usize = 64;
 
 const BATCH_URL: &str = "https://api.osv.dev/v1/querybatch";
+/// Returns the full records of every advisory of one package version in a single request.
+const QUERY_URL: &str = "https://api.osv.dev/v1/query";
 const DETAIL_URL_PREFIX: &str = "https://api.osv.dev/v1/vulns/";
 const ADVISORY_URL_PREFIX: &str = "https://osv.dev/vulnerability/";
 /// Summary of the placeholder shown while the details of an advisory are not loaded.
@@ -231,26 +246,28 @@ pub fn query_batch_limited(
     deadline: Option<Instant>,
     details_per_query: usize,
 ) -> Result<Vec<Vec<Vulnerability>>, String> {
-    let mut advisory_ids_per_query: Vec<Vec<String>> = Vec::with_capacity(queries.len());
+    let mut advisories_per_query: Vec<Vec<AdvisoryRef>> = Vec::with_capacity(queries.len());
     for chunk in queries.chunks(MAX_BATCH_QUERIES) {
-        advisory_ids_per_query.extend(query_chunk(http, chunk)?);
+        advisories_per_query.extend(query_chunk(http, chunk)?);
     }
     let fetched = fetch_missing_details(
         http,
         cache,
-        &advisory_ids_per_query,
+        queries,
+        &advisories_per_query,
         now,
         deadline,
         details_per_query,
     );
     let cache: &Cache = cache;
-    Ok(advisory_ids_per_query
+    Ok(advisories_per_query
         .iter()
-        .map(|advisory_ids| {
-            advisory_ids
+        .map(|advisories| {
+            advisories
                 .iter()
                 .enumerate()
-                .map(|(position, id)| {
+                .map(|(position, reference)| {
+                    let id = &reference.id;
                     let advisory = resolve_advisory(id, &fetched, cache, now);
                     // Past the window, an advisory stays deferred unless its details are known already.
                     if position >= details_per_query && is_placeholder(&advisory) {
@@ -265,7 +282,7 @@ pub fn query_batch_limited(
 }
 
 /// Sends one `querybatch` request and returns the advisory ids of each query.
-fn query_chunk(http: &dyn Http, chunk: &[OsvQuery]) -> Result<Vec<Vec<String>>, String> {
+fn query_chunk(http: &dyn Http, chunk: &[OsvQuery]) -> Result<Vec<Vec<AdvisoryRef>>, String> {
     // Borrowed fields: the request body is built without copying the queries.
     let body = BatchRequest {
         queries: chunk
@@ -299,54 +316,120 @@ fn query_chunk(http: &dyn Http, chunk: &[OsvQuery]) -> Result<Vec<Vec<String>>, 
                 .vulns
                 .unwrap_or_default()
                 .into_iter()
-                .filter_map(|vulnerability| {
-                    is_valid_advisory_id(&vulnerability.id).then_some(vulnerability.id)
+                .filter(|vulnerability| is_valid_advisory_id(&vulnerability.id))
+                .map(|vulnerability| AdvisoryRef {
+                    revision: vulnerability.modified.as_deref().map(revision_key),
+                    id: vulnerability.id,
                 })
                 .collect()
         })
         .collect())
 }
 
-/// Fetches the details of uncached advisory ids, at most [`MAX_DETAIL_FETCHES_PER_RUN`].
+/// What the record of one advisory gives: the advisory, its affected ranges and its revision.
+struct AdvisoryRecord {
+    advisory: Vulnerability,
+    affected: Vec<Affected>,
+    /// The comparable key of the `modified` time (see [`revision_key`]).
+    revision: Option<String>,
+}
+
+/// Reads the record of `detail`, which the caller has checked to be valid.
+fn record_of(detail: &AdvisoryDetail) -> AdvisoryRecord {
+    AdvisoryRecord {
+        advisory: advisory_from_detail(&detail.id, detail),
+        affected: affected_from_detail(detail).collect(),
+        revision: detail.modified.as_deref().map(revision_key),
+    }
+}
+
+/// Stores a record in `cache` and returns its advisory.
+fn store_record(cache: &mut Cache, record: AdvisoryRecord, now: u64) -> Vulnerability {
+    let id = record.advisory.id.clone();
+    cache.put_advisory(record.advisory.clone(), now);
+    cache.put_affected(&id, record.affected, now);
+    if let Some(revision) = &record.revision {
+        cache.put_revision(&id, revision);
+    }
+    record.advisory
+}
+
+/// Returns `true` when a full query is the cheaper way to read `missing` advisories of a package
+/// version that has `total` advisories (see [`FULL_QUERY_IDS_PER_SAVED_REQUEST`]).
+fn is_full_query_worth_it(missing: usize, total: usize) -> bool {
+    missing >= 2
+        && total <= FULL_QUERY_MAX_IDS
+        && total <= FULL_QUERY_IDS_PER_SAVED_REQUEST * (missing - 1)
+}
+
+/// Loads the details of the advisories that the queries matched and that `cache` does not hold.
 ///
-/// Only the first `details_per_query` ids of each query count. Stops before the first
-/// request that would start at or after `deadline`.
+/// Only the first `details_per_query` advisories of each query count. A record that the cache
+/// holds with the revision that the batch names is kept, whatever its age. For the others, a
+/// package version with enough missing records is read by one full query, which also stores the
+/// records beyond the window. The rest are read by id, at most [`MAX_DETAIL_FETCHES_PER_RUN`]
+/// of them. No request starts at or after `deadline`.
 /// Stores each fetched advisory in `cache` and returns the fetched advisories by id.
 fn fetch_missing_details<'a>(
     http: &dyn Http,
     cache: &mut Cache,
-    advisory_ids_per_query: &'a [Vec<String>],
+    queries: &[OsvQuery],
+    advisories_per_query: &'a [Vec<AdvisoryRef>],
     now: u64,
     deadline: Option<Instant>,
     details_per_query: usize,
 ) -> HashMap<&'a str, Vulnerability> {
-    // One pass: `seen` drops repeats, and `take` stops the scan at the cap.
+    // The caller's deadline bounds the requests: a sequence of them would outlast the host's limit.
+    let is_past_deadline = || deadline.is_some_and(|limit| Instant::now() >= limit);
+    let mut fetched: HashMap<&'a str, Vulnerability> = HashMap::new();
+    // One pass: `seen` drops repeats across queries.
     let mut seen: HashSet<&str> = HashSet::new();
-    let missing_ids: Vec<&str> = advisory_ids_per_query
-        .iter()
-        .flat_map(|advisory_ids| advisory_ids.iter().take(details_per_query))
-        .map(String::as_str)
-        .filter(|id| cache.advisory(id, now).is_none() && seen.insert(*id))
-        .take(MAX_DETAIL_FETCHES_PER_RUN)
-        .collect();
-
-    let mut fetched = HashMap::with_capacity(missing_ids.len());
-    for id in missing_ids {
-        // The caller's deadline bounds this loop: a sequence of GETs would otherwise outlast the host's limit.
-        if deadline.is_some_and(|limit| Instant::now() >= limit) {
+    // The ids that no full query settled, to read one by one.
+    let mut by_id: Vec<&'a str> = Vec::new();
+    for (query, advisories) in queries.iter().zip(advisories_per_query) {
+        let missing: Vec<&'a str> = advisories
+            .iter()
+            .enumerate()
+            .filter(|(_, reference)| {
+                !cache.confirm_advisory(&reference.id, reference.revision.as_deref(), now)
+            })
+            .filter(|(position, reference)| {
+                *position < details_per_query && seen.insert(reference.id.as_str())
+            })
+            .map(|(_, reference)| reference.id.as_str())
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        // A full query does not use the budget of requests by id: it replaces many of them, and the
+        // deadline bounds the time of the run.
+        if is_full_query_worth_it(missing.len(), advisories.len()) && !is_past_deadline() {
+            let wanted: HashSet<&'a str> = advisories
+                .iter()
+                .map(|reference| reference.id.as_str())
+                .collect();
+            for record in fetch_full_query(http, query).into_iter().flatten() {
+                // A record that the batch did not name is not stored under a key that nobody asked for.
+                if let Some(id) = wanted.get(record.advisory.id.as_str()).copied() {
+                    fetched.insert(id, store_record(cache, record, now));
+                }
+            }
+        }
+        by_id.extend(missing.into_iter().filter(|id| !fetched.contains_key(id)));
+    }
+    for id in by_id.into_iter().take(MAX_DETAIL_FETCHES_PER_RUN) {
+        if is_past_deadline() {
             break;
         }
-        if let Some((advisory, affected)) = fetch_detail(http, id) {
-            cache.put_advisory(advisory.clone(), now);
-            cache.put_affected(id, affected, now);
-            fetched.insert(id, advisory);
+        if let Some(record) = fetch_detail(http, id) {
+            fetched.insert(id, store_record(cache, record, now));
         }
     }
     fetched
 }
 
 /// Fetches and parses one advisory with its affected ranges. Returns `None` on any failure.
-fn fetch_detail(http: &dyn Http, id: &str) -> Option<(Vulnerability, Vec<Affected>)> {
+fn fetch_detail(http: &dyn Http, id: &str) -> Option<AdvisoryRecord> {
     let url = format!("{DETAIL_URL_PREFIX}{id}");
     let response = http.send(&HttpRequest::get(&url)).ok()?;
     if !is_success(response.status) {
@@ -354,12 +437,43 @@ fn fetch_detail(http: &dyn Http, id: &str) -> Option<(Vulnerability, Vec<Affecte
     }
     let detail: AdvisoryDetail = serde_json::from_slice(&response.body).ok()?;
     // A record for another id would be cached under the wrong key, so it is rejected.
-    (detail.id == id).then(|| {
-        (
-            advisory_from_detail(id, &detail),
-            affected_from_detail(&detail).collect(),
-        )
-    })
+    (detail.id == id).then(|| record_of(&detail))
+}
+
+/// Fetches the full records of every advisory of the package version of `query`.
+///
+/// Returns `None` when the request or its answer fails. A record that does not parse, or whose
+/// id is not valid, is left out. An answer in several pages gives its first page only: the
+/// advisories of the other pages are read by id.
+fn fetch_full_query(http: &dyn Http, query: &OsvQuery) -> Option<Vec<AdvisoryRecord>> {
+    let body = BatchQuery {
+        package: BatchPackage {
+            name: &query.name,
+            ecosystem: query.ecosystem.osv_name(),
+        },
+        version: &query.version,
+    };
+    let payload = serde_json::to_vec(&body).ok()?;
+    let request = HttpRequest {
+        // A package with hundreds of advisories answers with megabytes.
+        timeout_ms: Some(FULL_QUERY_TIMEOUT_MS),
+        ..HttpRequest::post(QUERY_URL, payload).header("Content-Type", "application/json")
+    };
+    let response = http.send(&request).ok()?;
+    if !is_success(response.status) {
+        return None;
+    }
+    let answer: FullQueryResponse = serde_json::from_slice(&response.body).ok()?;
+    Some(
+        answer
+            .vulns
+            .into_iter()
+            .flatten()
+            .filter_map(|raw| serde_json::from_str::<AdvisoryDetail>(raw.get()).ok())
+            .filter(|detail| is_valid_advisory_id(&detail.id))
+            .map(|detail| record_of(&detail))
+            .collect(),
+    )
 }
 
 /// Reads the affected ranges of an advisory.
@@ -471,6 +585,23 @@ fn ensure_success(response: &HttpResponse) -> Result<(), String> {
     }
 }
 
+/// Returns the key that compares two spellings of the `modified` time of an advisory.
+///
+/// `querybatch` cuts the time at the microsecond, while a full record keeps the nanoseconds.
+/// The key keeps at most six digits of the fraction.
+fn revision_key(modified: &str) -> String {
+    let Some((seconds, after_point)) = modified.split_once('.') else {
+        return modified.to_owned();
+    };
+    let digits = after_point
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count()
+        .min(6);
+    let rest = after_point.trim_start_matches(|c: char| c.is_ascii_digit());
+    format!("{seconds}.{}{rest}", &after_point[..digits])
+}
+
 /// Returns `true` when `id` matches `[A-Za-z0-9-]{1,64}`.
 ///
 /// Checks bytes: only ASCII passes, so the byte length is the character count.
@@ -574,6 +705,8 @@ fn severity_from_score(score: f64) -> AdvisorySeverity {
 #[derive(Debug, Deserialize)]
 struct AdvisoryDetail {
     id: String,
+    /// The revision of the record, with its nanoseconds.
+    modified: Option<String>,
     summary: Option<String>,
     details: Option<String>,
     severity: Option<Vec<SeverityEntry>>,
@@ -661,6 +794,21 @@ struct BatchResult {
 #[derive(Debug, Deserialize)]
 struct BatchVulnerability {
     id: String,
+    /// The revision of the record, cut at the microsecond.
+    modified: Option<String>,
+}
+
+/// An advisory that a query matched: its id and the revision of its record.
+struct AdvisoryRef {
+    id: String,
+    /// The comparable key of the `modified` time (see [`revision_key`]).
+    revision: Option<String>,
+}
+
+/// Body of a `POST /v1/query`. Each record is read on its own, so a malformed one costs only itself.
+#[derive(Debug, Deserialize)]
+struct FullQueryResponse {
+    vulns: Option<Vec<Box<serde_json::value::RawValue>>>,
 }
 
 #[cfg(test)]
@@ -1152,6 +1300,9 @@ mod tests {
             http.requests(),
             vec![
                 ("POST".to_owned(), BATCH_URL.to_owned()),
+                // This fake has no route for the full query of the two advisories of smallvec, so
+                // it fails and they are read by id.
+                ("POST".to_owned(), QUERY_URL.to_owned()),
                 ("GET".to_owned(), detail_url("RUSTSEC-2021-0003")),
                 ("GET".to_owned(), detail_url("GHSA-43w2-9j62-hq99")),
                 ("GET".to_owned(), detail_url("GHSA-5rcv-m4m3-hfh7")),
@@ -1597,6 +1748,267 @@ mod tests {
             .expect("affected is cached");
         assert_eq!(affected.len(), 1);
         assert_eq!(affected[0].name, "ok");
+    }
+
+    /// Builds a `querybatch` body for one query, with a revision per advisory.
+    fn batch_body_with_revisions(entries: &[(&str, &str)]) -> String {
+        let vulns: Vec<Value> = entries
+            .iter()
+            .map(|(id, modified)| json!({ "id": id, "modified": modified }))
+            .collect();
+        json!({ "results": [{ "vulns": vulns }] }).to_string()
+    }
+
+    /// Builds the body of a `POST /v1/query`: the full records of the advisories.
+    fn full_query_body(records: &[(&str, &str)]) -> String {
+        let vulns: Vec<Value> = records
+            .iter()
+            .map(|(id, modified)| {
+                json!({ "id": id, "summary": format!("Summary of {id}"), "modified": modified })
+            })
+            .collect();
+        json!({ "vulns": vulns }).to_string()
+    }
+
+    /// Returns `count` advisory ids such as `GHSA-0001`.
+    fn numbered_advisory_ids(count: usize) -> Vec<String> {
+        (1..=count)
+            .map(|number| format!("GHSA-{number:04}"))
+            .collect()
+    }
+
+    /// The requests that were not the `querybatch`, as `(method, url)`.
+    fn detail_requests(http: &FakeHttp) -> Vec<(String, String)> {
+        http.requests()
+            .into_iter()
+            .filter(|(_, url)| url != BATCH_URL)
+            .collect()
+    }
+
+    const REVISION: &str = "2025-01-01T00:00:00.000001Z";
+
+    #[test]
+    fn several_missing_advisories_of_a_package_come_from_one_full_query() {
+        let ids = numbered_advisory_ids(5);
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let records: Vec<(&str, &str)> = id_refs.iter().map(|id| (*id, REVISION)).collect();
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(&[&id_refs]))
+            .route("POST", QUERY_URL, 200, &full_query_body(&records));
+        let mut cache = Cache::new(TTL_SECS);
+        let results = query_batch(&http, &mut cache, &[query("pkg", "1.0.0")], NOW, None).unwrap();
+        assert_eq!(
+            detail_requests(&http),
+            [("POST".to_owned(), QUERY_URL.to_owned())]
+        );
+        assert_eq!(results[0].len(), 5);
+        for id in &ids {
+            assert!(cache.advisory(id, NOW).is_some(), "{id}");
+            assert!(cache.affected(id, NOW).is_some(), "{id}");
+        }
+        assert_eq!(results[0][0].summary, "Summary of GHSA-0001");
+        // The request names the package and the version of the query.
+        let sent: Value = serde_json::from_str(&http.request_bodies()[1]).unwrap();
+        assert_eq!(sent["package"]["name"], "pkg");
+        assert_eq!(sent["version"], "1.0.0");
+    }
+
+    #[test]
+    fn a_single_missing_advisory_is_fetched_by_id() {
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(&[&["GHSA-0001"]]))
+            .route(
+                "GET",
+                &detail_url("GHSA-0001"),
+                200,
+                &detail_body("GHSA-0001"),
+            );
+        let mut cache = Cache::new(TTL_SECS);
+        query_batch(&http, &mut cache, &[query("pkg", "1.0.0")], NOW, None).unwrap();
+        assert_eq!(
+            detail_requests(&http),
+            [("GET".to_owned(), detail_url("GHSA-0001"))]
+        );
+    }
+
+    #[test]
+    fn a_big_package_with_a_small_window_is_fetched_by_id() {
+        // 300 advisories and a window of 10: ten requests by id are cheaper than a 300-record answer.
+        let ids = numbered_advisory_ids(300);
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mut http = FakeHttp::new().route("POST", BATCH_URL, 200, &batch_body(&[&id_refs]));
+        for id in &ids[..10] {
+            http = http.route("GET", &detail_url(id), 200, &detail_body(id));
+        }
+        let mut cache = Cache::new(TTL_SECS);
+        query_batch_limited(&http, &mut cache, &[query("pkg", "1.0.0")], NOW, None, 10).unwrap();
+        let requests = detail_requests(&http);
+        assert_eq!(requests.len(), 10);
+        assert!(requests.iter().all(|(method, _)| method == "GET"));
+    }
+
+    #[test]
+    fn loading_everything_reads_a_big_package_in_one_full_query() {
+        let ids = numbered_advisory_ids(300);
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let records: Vec<(&str, &str)> = id_refs.iter().map(|id| (*id, REVISION)).collect();
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(&[&id_refs]))
+            .route("POST", QUERY_URL, 200, &full_query_body(&records));
+        let mut cache = Cache::new(TTL_SECS);
+        query_batch(&http, &mut cache, &[query("pkg", "1.0.0")], NOW, None).unwrap();
+        assert_eq!(
+            detail_requests(&http),
+            [("POST".to_owned(), QUERY_URL.to_owned())]
+        );
+        assert!(ids.iter().all(|id| cache.advisory(id, NOW).is_some()));
+    }
+
+    #[test]
+    fn the_records_beyond_the_window_are_kept_and_not_deferred() {
+        let ids = numbered_advisory_ids(5);
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let records: Vec<(&str, &str)> = id_refs.iter().map(|id| (*id, REVISION)).collect();
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(&[&id_refs]))
+            .route("POST", QUERY_URL, 200, &full_query_body(&records));
+        let mut cache = Cache::new(TTL_SECS);
+        let results =
+            query_batch_limited(&http, &mut cache, &[query("pkg", "1.0.0")], NOW, None, 3).unwrap();
+        // The query answered for all five, so none waits for a later request.
+        assert!(
+            results[0]
+                .iter()
+                .all(|advisory| !is_deferred(advisory) && !is_placeholder(advisory))
+        );
+    }
+
+    #[test]
+    fn a_failed_full_query_falls_back_to_fetching_by_id() {
+        let ids = numbered_advisory_ids(3);
+        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let mut http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(&[&id_refs]))
+            .route("POST", QUERY_URL, 500, "{}");
+        for id in &ids {
+            http = http.route("GET", &detail_url(id), 200, &detail_body(id));
+        }
+        let mut cache = Cache::new(TTL_SECS);
+        let results = query_batch(&http, &mut cache, &[query("pkg", "1.0.0")], NOW, None).unwrap();
+        let requests = detail_requests(&http);
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0], ("POST".to_owned(), QUERY_URL.to_owned()));
+        assert!(results[0].iter().all(|advisory| !is_placeholder(advisory)));
+    }
+
+    #[test]
+    fn a_full_query_record_for_another_id_is_ignored_and_the_gap_is_fetched_by_id() {
+        let http = FakeHttp::new()
+            .route(
+                "POST",
+                BATCH_URL,
+                200,
+                &batch_body(&[&["GHSA-0001", "GHSA-0002"]]),
+            )
+            // The answer holds GHSA-0001 and a record that the batch never named.
+            .route(
+                "POST",
+                QUERY_URL,
+                200,
+                &full_query_body(&[("GHSA-0001", REVISION), ("GHSA-9999", REVISION)]),
+            )
+            .route(
+                "GET",
+                &detail_url("GHSA-0002"),
+                200,
+                &detail_body("GHSA-0002"),
+            );
+        let mut cache = Cache::new(TTL_SECS);
+        query_batch(&http, &mut cache, &[query("pkg", "1.0.0")], NOW, None).unwrap();
+        assert!(cache.advisory("GHSA-0001", NOW).is_some());
+        assert!(cache.advisory("GHSA-9999", NOW).is_none());
+        assert!(cache.advisory("GHSA-0002", NOW).is_some());
+        assert_eq!(
+            detail_requests(&http),
+            [
+                ("POST".to_owned(), QUERY_URL.to_owned()),
+                ("GET".to_owned(), detail_url("GHSA-0002"))
+            ]
+        );
+    }
+
+    #[test]
+    fn an_advisory_with_an_unchanged_revision_needs_no_request_after_the_ttl() {
+        let http = FakeHttp::new()
+            .route(
+                "POST",
+                BATCH_URL,
+                200,
+                &batch_body_with_revisions(&[("GHSA-0001", REVISION)]),
+            )
+            .route(
+                "GET",
+                &detail_url("GHSA-0001"),
+                200,
+                &json!({ "id": "GHSA-0001", "summary": "S", "modified": REVISION }).to_string(),
+            );
+        let mut cache = Cache::new(TTL_SECS);
+        query_batch(&http, &mut cache, &[query("pkg", "1.0.0")], NOW, None).unwrap();
+        assert_eq!(detail_requests(&http).len(), 1);
+        // After the lifetime, the batch repeats the same revision: no detail request follows.
+        let later = NOW + TTL_SECS + 10;
+        let results =
+            query_batch(&http, &mut cache, &[query("pkg", "1.0.0")], later, None).unwrap();
+        assert_eq!(detail_requests(&http).len(), 1);
+        assert_eq!(results[0][0].summary, "S");
+    }
+
+    #[test]
+    fn a_new_revision_of_an_advisory_is_fetched_again() {
+        let detail = |revision: &str| {
+            json!({ "id": "GHSA-0001", "summary": "S", "modified": revision }).to_string()
+        };
+        let first = FakeHttp::new()
+            .route(
+                "POST",
+                BATCH_URL,
+                200,
+                &batch_body_with_revisions(&[("GHSA-0001", REVISION)]),
+            )
+            .route("GET", &detail_url("GHSA-0001"), 200, &detail(REVISION));
+        let mut cache = Cache::new(TTL_SECS);
+        query_batch(&first, &mut cache, &[query("pkg", "1.0.0")], NOW, None).unwrap();
+        let newer = "2025-03-01T00:00:00.000001Z";
+        let second = FakeHttp::new()
+            .route(
+                "POST",
+                BATCH_URL,
+                200,
+                &batch_body_with_revisions(&[("GHSA-0001", newer)]),
+            )
+            .route("GET", &detail_url("GHSA-0001"), 200, &detail(newer));
+        // Still inside the lifetime, yet the revision changed.
+        query_batch(&second, &mut cache, &[query("pkg", "1.0.0")], NOW + 5, None).unwrap();
+        assert_eq!(detail_requests(&second).len(), 1);
+    }
+
+    #[test]
+    fn revisions_compare_at_the_microsecond() {
+        // `querybatch` cuts the time at the microsecond. A full record keeps the nanoseconds.
+        assert_eq!(
+            revision_key("2026-09-10T03:51:10.140141450Z"),
+            revision_key("2026-09-10T03:51:10.140141Z")
+        );
+        assert_ne!(
+            revision_key("2026-09-10T03:51:10.140141Z"),
+            revision_key("2026-09-10T03:51:10.140142Z")
+        );
+        // A time with fewer digits, or none, is kept as it is.
+        assert_eq!(revision_key("2026-09-10T03:51:10Z"), "2026-09-10T03:51:10Z");
+        assert_eq!(
+            revision_key("2026-09-10T03:51:10.5Z"),
+            "2026-09-10T03:51:10.5Z"
+        );
     }
 
     #[test]
