@@ -601,6 +601,112 @@ fn a_vulnerable_crate_gets_a_fix_to_the_version_that_osv_names() {
 }
 
 #[test]
+fn picking_the_load_action_loads_the_other_advisories_and_refreshes_the_manifest() {
+    let detail_requests = Rc::new(Cell::new(0));
+    let host = host_with_gem_advisories(43, detail_requests.clone());
+    host.add_file(
+        "Gemfile",
+        "source 'https://rubygems.org'\ngem 'nokogiri', '1.10.0'\n",
+    );
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(GEMFILE_PATH.to_owned())],
+        &host.invocation(),
+    );
+    assert_eq!(detail_requests.get(), 10);
+
+    let document = Document {
+        path: GEMFILE_PATH.to_owned(),
+        language: "ruby".to_owned(),
+        version: 1,
+        text: "source 'https://rubygems.org'\ngem 'nokogiri', '1.10.0'\n".to_owned(),
+    };
+    let cursor = Range::new(Position::new(1, 20), Position::new(1, 20));
+    let actions = Providers::code_actions(&mut plugin, &document, cursor);
+    let load = actions
+        .iter()
+        .find(|action| action.title.starts_with("Load "))
+        .expect("a load action");
+    assert_eq!(load.title, "Load 33 more vulnerabilities of nokogiri");
+    // Listing the actions reads the cache and sends nothing.
+    assert_eq!(detail_requests.get(), 10);
+
+    // Picking the action loads the 33 others, and gives the editor no edit.
+    let resolved = Providers::resolve_code_action(&mut plugin, &document, load.clone()).unwrap();
+    assert!(resolved.edits.is_empty());
+    assert_eq!(detail_requests.get(), 43);
+
+    // The manifest shows all of them without another event.
+    let decorations = decorations_of(&host, GEMFILE_PATH);
+    assert_eq!(
+        decorations[0]
+            .after
+            .as_deref()
+            .map(|text| text.contains("43")),
+        Some(true)
+    );
+    let hover = decorations[0].hover.clone().unwrap();
+    let advisory_lines = hover
+        .lines()
+        .filter(|line| line.starts_with("- [GHSA-"))
+        .count();
+    assert_eq!(advisory_lines, 43, "{hover}");
+    assert!(!hover.contains("more not loaded"), "{hover}");
+    // Nothing is left to load, so the action is gone.
+    let after = Providers::code_actions(&mut plugin, &document, cursor);
+    assert!(
+        after
+            .iter()
+            .all(|action| !action.title.starts_with("Load "))
+    );
+
+    // An action that is not ours is returned as it came.
+    let other = openidea_plugin::providers::CodeAction {
+        title: "Other".to_owned(),
+        kind: None,
+        preferred: false,
+        edits: Vec::new(),
+        data: Some("something-else".to_owned()),
+    };
+    let same = Providers::resolve_code_action(&mut plugin, &document, other.clone()).unwrap();
+    assert_eq!(same, other);
+}
+
+#[test]
+fn picking_the_load_action_does_nothing_when_vulnerabilities_are_turned_off() {
+    let detail_requests = Rc::new(Cell::new(0));
+    let host = host_with_gem_advisories(43, detail_requests.clone());
+    host.add_file(
+        "Gemfile",
+        "source 'https://rubygems.org'\ngem 'nokogiri', '1.10.0'\n",
+    );
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(GEMFILE_PATH.to_owned())],
+        &host.invocation(),
+    );
+    let document = Document {
+        path: GEMFILE_PATH.to_owned(),
+        language: "ruby".to_owned(),
+        version: 1,
+        text: "source 'https://rubygems.org'\ngem 'nokogiri', '1.10.0'\n".to_owned(),
+    };
+    let cursor = Range::new(Position::new(1, 20), Position::new(1, 20));
+    let load = Providers::code_actions(&mut plugin, &document, cursor)
+        .into_iter()
+        .find(|action| action.title.starts_with("Load "))
+        .expect("a load action");
+    let requests_before = host.requests().len();
+
+    // The setting changes between listing the action and picking it.
+    host.set_setting("vulnerabilities", "false");
+    plugin.activate(&host.context(PLUGIN_ID)).unwrap();
+    Providers::resolve_code_action(&mut plugin, &document, load).unwrap();
+    assert_eq!(host.requests().len(), requests_before);
+    assert_eq!(detail_requests.get(), 10);
+}
+
+#[test]
 fn unknown_command_is_not_found() {
     let host = host_counting_fetches(Rc::new(Cell::new(0)));
     let mut plugin = DependencyLens::default();

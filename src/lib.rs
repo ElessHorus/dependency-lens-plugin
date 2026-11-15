@@ -36,6 +36,9 @@ const SKIPPED_DIRECTORIES: [&str; 4] = ["node_modules", "target", "vendor", ".gi
 const TIME_BOX: Duration = Duration::from_secs(300);
 /// Hard limit of one chunk. Its lookups that start after this limit stay pending.
 const CHUNK_LIMIT: Duration = Duration::from_secs(40);
+/// How long the action that loads the deferred advisories may fetch details. The refresh that
+/// follows must fit in the 60 s that an open task allows, so this stays well below it.
+const LOAD_ACTION_LIMIT: Duration = Duration::from_secs(30);
 /// Registry lookups per chunk. Each chunk publishes its results before the next one starts.
 const REGISTRY_CHUNK: usize = 20;
 /// Offset of the fallback deadline used when a time box is too large for the clock.
@@ -123,12 +126,18 @@ impl DependencyLens {
     ///
     /// Returns the number of advisories of the manifest whose details are still not loaded,
     /// or `None` when the host cancelled the run because a newer call supersedes it.
-    fn refresh(&mut self, path: &str, ctx: &Invocation, limits: RunLimits) -> Option<usize> {
+    fn refresh(
+        &mut self,
+        path: &str,
+        ctx: Option<&Invocation>,
+        limits: RunLimits,
+    ) -> Option<usize> {
         let Some(eco) = Ecosystem::detect(path) else {
             return Some(0);
         };
         // The deepest open project holding the path wins; the window's project is only a fallback.
-        let Some(project) = host::project_of(path).or_else(|| ctx.project()) else {
+        let Some(project) = host::project_of(path).or_else(|| ctx.and_then(Invocation::project))
+        else {
             self.forget_shown(path);
             return Some(0);
         };
@@ -356,7 +365,7 @@ impl Plugin for DependencyLens {
                 // A command is one batch of its own: it gets a fresh time box.
                 self.refresh(
                     &path,
-                    ctx,
+                    Some(ctx),
                     RunLimits::standard(deadline_after(self.time_box)),
                 );
                 Ok(Some("Dependency Lens: refreshed".to_owned()))
@@ -379,7 +388,7 @@ impl Plugin for DependencyLens {
                         "Dependency Lens: vulnerabilities are turned off".to_owned(),
                     ));
                 }
-                let message = match self.refresh(&path, ctx, limits) {
+                let message = match self.refresh(&path, Some(ctx), limits) {
                     None => "Dependency Lens: a newer request cancelled this one. Run the command again."
                         .to_owned(),
                     Some(0) => "Dependency Lens: vulnerabilities loaded".to_owned(),
@@ -429,7 +438,7 @@ impl Plugin for DependencyLens {
         let mut refreshed: HashSet<&str> = HashSet::new();
         for path in changed_paths.into_iter().filter(|path| is_manifest(path)) {
             if refreshed.insert(path) {
-                self.refresh(path, ctx, RunLimits::standard(deadline));
+                self.refresh(path, Some(ctx), RunLimits::standard(deadline));
             }
         }
         // A new setting changes what the shown manifests display. The cache answers most of it
@@ -442,13 +451,74 @@ impl Plugin for DependencyLens {
                 .cloned()
                 .collect();
             for path in &shown_paths {
-                self.refresh(path, ctx, RunLimits::standard(deadline));
+                self.refresh(path, Some(ctx), RunLimits::standard(deadline));
             }
         }
     }
 }
 
+impl DependencyLens {
+    /// Loads the deferred advisories of the dependency `name` of the manifest `doc`, then shows them.
+    ///
+    /// A first run, limited to that dependency, puts every detail in the cache. It makes no registry
+    /// lookup and publishes nothing. A standard refresh then publishes the manifest from the cache.
+    fn load_vulnerabilities_of(&mut self, doc: &Document, name: &str) {
+        let Some(eco) = Ecosystem::detect(&doc.path) else {
+            return;
+        };
+        // The setting may have changed since the action was listed.
+        if !self.settings.vulnerabilities {
+            return;
+        }
+        let deps: Vec<Dependency> = eco
+            .parse(&doc.text)
+            .into_iter()
+            .filter(|dependency| dependency.name == name)
+            .collect();
+        if deps.is_empty() {
+            return;
+        }
+        // The call has a budget of 5 s. An open task lifts it to 60 s, so up to 100 details fit,
+        // and the chunk limit stops the fetches before the budget ends.
+        let task = host::begin_task(TASK_TITLE, true);
+        let deadline = Instant::now() + LOAD_ACTION_LIMIT;
+        let mut budget = Budget::new(0, Some(deadline)).with_detail_limit(usize::MAX);
+        analyze(
+            eco,
+            deps,
+            &mut self.cache,
+            &HostHttp,
+            &self.settings,
+            now_secs(),
+            &mut budget,
+        );
+        // The refresh opens its own task, so this one ends first.
+        drop(task);
+        // A superseded run leaves the manifest as it is. The newer call refreshes it.
+        if !budget.is_cancelled() {
+            self.refresh(&doc.path, None, RunLimits::standard(deadline));
+        }
+    }
+}
+
 impl Providers for DependencyLens {
+    fn resolve_code_action(
+        &mut self,
+        doc: &Document,
+        action: CodeAction,
+    ) -> Result<CodeAction, Error> {
+        let package = action
+            .data
+            .as_deref()
+            .and_then(|data| data.strip_prefix(actions::LOAD_ACTION_PREFIX))
+            .map(str::to_owned);
+        if let Some(package) = package {
+            self.load_vulnerabilities_of(doc, &package);
+        }
+        // The action has no edit, so the editor changes nothing.
+        Ok(action)
+    }
+
     fn code_actions(&mut self, doc: &Document, selection: Range) -> Vec<CodeAction> {
         actions::code_actions(
             &self.cache,
