@@ -11,6 +11,7 @@ pub mod parsers;
 pub mod publish;
 pub mod registries;
 pub mod settings;
+pub mod store;
 pub mod text;
 pub mod update;
 
