@@ -556,10 +556,23 @@ fn placeholder(id: &str) -> Vulnerability {
 }
 
 /// Returns the advisory shown for an id whose details wait for a request from the user.
-fn deferred(id: &str) -> Vulnerability {
+pub fn deferred(id: &str) -> Vulnerability {
     Vulnerability {
         summary: DEFERRED_SUMMARY.to_owned(),
         ..placeholder(id)
+    }
+}
+
+/// Returns the deferred entry that stands for an advisory whose id is not known.
+///
+/// The disk cache keeps the ids of the first advisories of a list and only the count of the
+/// others. This entry fills the rest of the list: it has no id and no link, so nothing can name it.
+pub fn anonymous_deferred() -> Vulnerability {
+    Vulnerability {
+        id: String::new(),
+        severity: AdvisorySeverity::Medium,
+        summary: DEFERRED_SUMMARY.to_owned(),
+        url: None,
     }
 }
 
@@ -573,7 +586,8 @@ pub fn is_placeholder(vulnerability: &Vulnerability) -> bool {
     vulnerability.summary == PLACEHOLDER_SUMMARY
 }
 
-fn advisory_url(id: &str) -> String {
+/// Returns the OSV page of the advisory `id`.
+pub fn advisory_url(id: &str) -> String {
     format!("{ADVISORY_URL_PREFIX}{id}")
 }
 
@@ -605,7 +619,7 @@ fn revision_key(modified: &str) -> String {
 /// Returns `true` when `id` matches `[A-Za-z0-9-]{1,64}`.
 ///
 /// Checks bytes: only ASCII passes, so the byte length is the character count.
-fn is_valid_advisory_id(id: &str) -> bool {
+pub(crate) fn is_valid_advisory_id(id: &str) -> bool {
     (1..=MAX_ADVISORY_ID_LEN).contains(&id.len())
         && id
             .bytes()
@@ -1265,6 +1279,14 @@ mod tests {
     }
 
     // query_batch
+
+    #[test]
+    fn anonymous_deferred_has_no_id_and_no_link() {
+        let entry = anonymous_deferred();
+        assert!(is_deferred(&entry));
+        assert_eq!(entry.id, "");
+        assert_eq!(entry.url, None);
+    }
 
     #[test]
     fn results_align_with_queries_and_details_are_cached() {

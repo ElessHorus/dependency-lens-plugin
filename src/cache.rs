@@ -3,6 +3,8 @@
 use crate::model::{Affected, Ecosystem, VersionInfo, Vulnerability};
 use std::collections::HashMap;
 
+pub mod persist;
+
 /// Lifetime of a cached failure, in seconds. Independent of the cache TTL.
 const FAILURE_TTL_SECS: u64 = 60;
 
