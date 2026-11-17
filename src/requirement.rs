@@ -39,13 +39,14 @@ impl Requirement {
 
     /// Reads the requirement text of a manifest.
     ///
-    /// Supports PyPI (Poetry text), Packagist and Pub. Returns `None` for any other ecosystem and
+    /// Supports PyPI (Poetry text), Packagist, Pub and NuGet. Returns `None` for any other ecosystem and
     /// for text that names no single readable range: wildcards, hyphen ranges, branches, `any`.
     pub fn parse(eco: Ecosystem, text: &str) -> Option<Self> {
         match eco {
             Ecosystem::PyPI | Ecosystem::Packagist | Ecosystem::Pub => {
                 parse_operator_text(eco, text)
             }
+            Ecosystem::NuGet => parse_nuget_range(text),
             _ => None,
         }
     }
@@ -104,6 +105,51 @@ impl Requirement {
             })
             .cloned()
     }
+}
+
+/// Reads a NuGet version range: a bare version is a minimum, `[1.0]` is exact, and
+/// `[1.0,2.0)` is an interval whose brackets include a bound and whose parentheses exclude it.
+fn parse_nuget_range(text: &str) -> Option<Requirement> {
+    let text = text.trim();
+    let is_plain = |version: &str| {
+        version.starts_with(|character: char| character.is_ascii_digit())
+            && !version.contains(['*', '$', ',', ' '])
+    };
+    let constraint = |operator: &str, version: &str| Constraint {
+        operator: operator.to_owned(),
+        version: version.to_owned(),
+    };
+    let (Some(opening), Some(closing)) = (text.chars().next(), text.chars().last()) else {
+        return None;
+    };
+    if !matches!(opening, '[' | '(') {
+        return is_plain(text)
+            .then(|| Requirement::from_constraints(vec![constraint(">=", text)]))
+            .flatten();
+    }
+    // Both brackets are ASCII, so the slice falls on character boundaries.
+    let inner = text.get(1..text.len().checked_sub(1)?)?;
+    let constraints = match inner.split_once(',') {
+        None if opening == '[' && closing == ']' && is_plain(inner.trim()) => {
+            vec![constraint("==", inner.trim())]
+        }
+        None => return None,
+        Some((low, high)) => {
+            let (low, high) = (low.trim(), high.trim());
+            let mut bounds = Vec::new();
+            if !low.is_empty() {
+                bounds.push(constraint(if opening == '[' { ">=" } else { ">" }, low));
+            }
+            if !high.is_empty() {
+                bounds.push(constraint(if closing == ']' { "<=" } else { "<" }, high));
+            }
+            if !bounds.iter().all(|bound| is_plain(&bound.version)) {
+                return None;
+            }
+            bounds
+        }
+    };
+    Requirement::from_constraints(constraints)
 }
 
 /// Operators that a word of the requirement text may start with.
@@ -527,5 +573,44 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn nuget_text_reads_minimums_and_intervals() {
+        let cases: [(&str, Option<Requirement>); 9] = [
+            ("1.0", Some(requirement(&[&[(">=", "1.0")]]))),
+            ("[1.0]", Some(requirement(&[&[("==", "1.0")]]))),
+            (
+                "[1.0,2.0)",
+                Some(requirement(&[&[(">=", "1.0"), ("<", "2.0")]])),
+            ),
+            ("(1.0,)", Some(requirement(&[&[(">", "1.0")]]))),
+            ("(,2.0]", Some(requirement(&[&[("<=", "2.0")]]))),
+            ("(,)", None),
+            ("1.*", None),
+            ("$(Ver)", None),
+            ("", None),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(
+                Requirement::parse(Ecosystem::NuGet, text),
+                expected,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_nuget_range_gives_its_lowest_allowed_version() {
+        let minimum = Requirement::parse(Ecosystem::NuGet, "1.0").expect("a minimum");
+        assert_eq!(
+            minimum.lowest_allowed(Ecosystem::NuGet, &versions(&["2.0.0", "1.1.0"])),
+            Some("1.1.0".to_owned())
+        );
+        let interval = Requirement::parse(Ecosystem::NuGet, "[1.0,2.0)").expect("an interval");
+        assert_eq!(
+            interval.lowest_allowed(Ecosystem::NuGet, &versions(&["2.0.0", "1.9.0", "1.0.0"])),
+            Some("1.0.0".to_owned())
+        );
     }
 }
