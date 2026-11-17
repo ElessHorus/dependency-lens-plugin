@@ -96,8 +96,9 @@ fn entries_of<'a>(
 ) -> impl Iterator<Item = &'a Affected> {
     let wanted_package = eco.normalize_package(package);
     affected.iter().filter(move |entry| {
+        // OSV writes `*` for an advisory that covers every package of an ecosystem.
         entry.ecosystem.eq_ignore_ascii_case(eco.osv_name())
-            && eco.normalize_package(&entry.name) == wanted_package
+            && (entry.name == "*" || eco.normalize_package(&entry.name) == wanted_package)
     })
 }
 
@@ -1377,6 +1378,57 @@ mod tests {
         // A milestone is older than its release, so it is no fix for the release.
         assert_eq!(
             render_fix(Ecosystem::Maven, "9.0.0.RELEASE", "9.0.0.M1"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_wildcard_entry_applies_to_every_package_of_its_ecosystem() {
+        let wildcard = affected(
+            "crates.io",
+            "*",
+            &[&[("introduced", "0"), ("fixed", "1.2.0")]],
+        );
+        for package in ["review_demo", "other_crate"] {
+            let plan = plan_fix(Ecosystem::Cargo, package, "1.0.0", &[&wildcard], |_| true)
+                .expect("a fix");
+            assert_eq!(plan.target, "1.2.0", "{package}");
+        }
+    }
+
+    #[test]
+    fn a_wildcard_entry_of_another_ecosystem_does_not_apply() {
+        for ecosystem in ["npm", "Maven"] {
+            let wildcard = affected(
+                ecosystem,
+                "*",
+                &[&[("introduced", "0"), ("fixed", "1.2.0")]],
+            );
+            assert_eq!(
+                plan_fix(
+                    Ecosystem::Cargo,
+                    "review_demo",
+                    "1.0.0",
+                    &[&wildcard],
+                    |_| true
+                ),
+                None,
+                "{ecosystem}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_named_entry_still_needs_its_own_name() {
+        let other = affected(
+            "crates.io",
+            "other",
+            &[&[("introduced", "0"), ("fixed", "1.2.0")]],
+        );
+        assert_eq!(
+            plan_fix(Ecosystem::Cargo, "review_demo", "1.0.0", &[&other], |_| {
+                true
+            }),
             None
         );
     }
