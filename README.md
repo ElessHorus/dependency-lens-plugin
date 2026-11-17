@@ -40,7 +40,7 @@ Example: `→ 2.31.0 · ⚠ 2 vulnerabilities`.
 
 ### Hover
 
-The hover shows the package name and the declared version. It adds the latest version when one is newer, and the reason when a check failed. When advisories exist, it adds the checked version and one line per advisory. Each advisory line links to its OSV page when OSV gives a link.
+The hover shows the package name and the declared version. It adds the latest version when one is newer, and the reason when a check failed. When advisories exist, it adds the checked version and one line per advisory. When the checked version is not the text of the lower bound, one more line says so. Each advisory line links to its OSV page when OSV gives a link.
 
 ### Many advisories
 
@@ -136,7 +136,7 @@ Add the package name to `ignore`, for example `["serde", "left-pad"]`. The name 
 - For Cargo, npm, Go and Maven, the plugin shows no version hint and no update to the latest release. It still offers the fix for a vulnerability.
 - For a Maven dependency, the fix orders versions as Maven does, including text qualifiers such as `RELEASE`, `M1` and `SR0`.
 - The plugin checks the version declared in the manifest, not a lockfile.
-- For a requirement with a range (`^1.2`, `>=2.0`, `||`), the plugin checks the lower bound of the first alternative. A newer release is then shown as outdated against that bound.
+- For a requirement with a range (`^1.2`, `>=2.0`, `>1.12,<2.10`, `||`) in PyPI, Packagist, Pub, NuGet and RubyGems, the plugin checks the lowest version of the registry list that the requirement allows. For `requests>1.12,<2.10` it checks `2.0.0`, because `1.12` does not exist. A dependency with such a range waits for its registry lookup before its OSV query. When the registry gives no list, or no listed version fits, the plugin checks the text of the lower bound of the first alternative. Cargo, npm, Go and Maven have no registry list, so they keep the text of the lower bound. A newer release is still shown as outdated against the lower bound, even when the requirement excludes it.
 - The first lookup of a large manifest takes seconds. The lookups run one after another. The status bar shows the progress, and you can cancel the task. Each chunk of 20 lookups shows its results before the next chunk starts. After a five-minute soft cap, the entries that still show `…` finish on the next open, save or "Dependency Lens: Refresh" of their manifest.
 - Answers are cached in memory for `cacheTtlSeconds` (one hour by default). OSV gives a revision (the `modified` time) with each advisory. After the lifetime, an advisory whose revision did not change stays valid without a new download, and one whose revision changed is downloaded again. The cache is also kept on disk (see Cache on disk). A failed lookup is retried after 60 seconds.
 - The IDE unloads an idle plugin after about five minutes. The next open reads the cache again from the disk and shows it at once. The quick fix reads only answers younger than `cacheTtlSeconds`, so for older ones it appears after the check that follows the open.
