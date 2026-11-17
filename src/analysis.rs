@@ -196,14 +196,7 @@ pub fn analyze(
         resolve_checked_versions(eco, &kept, cache, http, budget, now, &mut registry_answers)
     } else {
         kept.iter()
-            .map(|dependency| {
-                CheckedVersion::Known(checked_version_of(
-                    eco,
-                    &dependency.version,
-                    dependency.requirement.as_ref(),
-                    None,
-                ))
-            })
+            .map(|dependency| checked_with_list(eco, dependency, None))
             .collect()
     };
     // An entry that waits for its list sends nothing to OSV yet.
@@ -302,12 +295,7 @@ fn resolve_checked_versions(
         .iter()
         .map(|dependency| {
             if !needs_list(eco, &dependency.version, dependency.requirement.as_ref()) {
-                return Some(CheckedVersion::Known(checked_version_of(
-                    eco,
-                    &dependency.version,
-                    dependency.requirement.as_ref(),
-                    None,
-                )));
+                return Some(checked_with_list(eco, dependency, None));
             }
             let name = eco.normalize_package(&dependency.name);
             checked_from_known_list(eco, dependency, &name, cache, answers, now)
@@ -338,12 +326,7 @@ fn resolve_checked_versions(
         }
         // An invalid name costs no lookup. The registry step reports it.
         let Some(request) = eco.registry_request(&dependency.name) else {
-            *state = Some(CheckedVersion::Known(checked_version_of(
-                eco,
-                &dependency.version,
-                dependency.requirement.as_ref(),
-                None,
-            )));
+            *state = Some(checked_with_list(eco, dependency, None));
             continue;
         };
         if lookups_done >= list_limit || !budget.take() {
@@ -396,12 +379,23 @@ fn checked_from_known_list(
             None => return None,
         },
     };
-    Some(CheckedVersion::Known(checked_version_of(
+    Some(checked_with_list(eco, dependency, list))
+}
+
+/// The checked version of `dependency` read with `list`, the registry list newest first.
+///
+/// Without a list, the text of the lower bound is the checked version.
+fn checked_with_list(
+    eco: Ecosystem,
+    dependency: &Dependency,
+    list: Option<&[String]>,
+) -> CheckedVersion {
+    CheckedVersion::Known(checked_version_of(
         eco,
         &dependency.version,
         dependency.requirement.as_ref(),
         list,
-    )))
+    ))
 }
 
 /// Registry outcome of one package name: its versions, or the failure reason.

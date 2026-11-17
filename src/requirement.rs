@@ -108,6 +108,14 @@ impl Requirement {
     }
 }
 
+/// Builds the constraint of `operator` and `version`.
+fn constraint(operator: &str, version: &str) -> Constraint {
+    Constraint {
+        operator: operator.to_owned(),
+        version: version.to_owned(),
+    }
+}
+
 /// Reads a NuGet version range: a bare version is a minimum, `[1.0]` is exact, and
 /// `[1.0,2.0)` is an interval whose brackets include a bound and whose parentheses exclude it.
 fn parse_nuget_range(text: &str) -> Option<Requirement> {
@@ -115,10 +123,6 @@ fn parse_nuget_range(text: &str) -> Option<Requirement> {
     let is_plain = |version: &str| {
         version.starts_with(|character: char| character.is_ascii_digit())
             && !version.contains(['*', '$', ',', ' '])
-    };
-    let constraint = |operator: &str, version: &str| Constraint {
-        operator: operator.to_owned(),
-        version: version.to_owned(),
     };
     let (Some(opening), Some(closing)) = (text.chars().next(), text.chars().last()) else {
         return None;
@@ -248,10 +252,6 @@ fn parse_word(eco: Ecosystem, word: &str) -> Option<Vec<Constraint>> {
     {
         return None;
     }
-    let constraint = |operator: &str, version: &str| Constraint {
-        operator: operator.to_owned(),
-        version: version.to_owned(),
-    };
     Some(match (operator, eco) {
         ("" | "=" | "==", _) => vec![constraint("==", version)],
         ("^", _) => {
