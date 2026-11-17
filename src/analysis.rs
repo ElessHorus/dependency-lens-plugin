@@ -4,9 +4,9 @@ use crate::cache::{Cache, FailureKind};
 use crate::http::{Http, is_cancelled_message, is_success};
 use crate::model::{Dependency, Ecosystem, VersionInfo, Vulnerability};
 use crate::osv::{
-    DEFAULT_DETAILS_PER_QUERY, OsvQuery, declared_version_for_osv, is_deferred, is_placeholder,
-    query_batch_limited,
+    DEFAULT_DETAILS_PER_QUERY, OsvQuery, is_deferred, is_placeholder, query_batch_limited,
 };
+use crate::requirement::{checked_version_of, needs_list};
 use crate::settings::Settings;
 use crate::update::is_outdated;
 use openidea_plugin::HttpRequest;
@@ -188,10 +188,31 @@ pub fn analyze(
         .into_iter()
         .filter(|dependency| !ignored.contains(&eco.normalize_package(&dependency.name)))
         .collect();
-    // Each declared version is parsed once; the query and the entry both reuse it.
-    let checked_versions: Vec<Option<String>> = kept
+    // Registry answers of this call, with their full lists. They serve the checked versions and the
+    // registry status alike, so a package is requested once even when the cache keeps nothing.
+    let mut registry_answers: HashMap<String, Lookup> = HashMap::new();
+    // Each checked version is resolved once; the query and the entry both reuse it.
+    let resolved_versions = if settings.vulnerabilities {
+        resolve_checked_versions(eco, &kept, cache, http, budget, now, &mut registry_answers)
+    } else {
+        kept.iter()
+            .map(|dependency| {
+                CheckedVersion::Known(checked_version_of(
+                    eco,
+                    &dependency.version,
+                    dependency.requirement.as_ref(),
+                    None,
+                ))
+            })
+            .collect()
+    };
+    // An entry that waits for its list sends nothing to OSV yet.
+    let checked_versions: Vec<Option<String>> = resolved_versions
         .iter()
-        .map(|dependency| declared_version_for_osv(&dependency.version))
+        .map(|resolved| match resolved {
+            CheckedVersion::Known(version) => version.clone(),
+            CheckedVersion::WaitingForList => None,
+        })
         .collect();
     let fresh_osv = if settings.vulnerabilities {
         query_missing_vulnerabilities(eco, &kept, &checked_versions, cache, http, now, budget)
@@ -201,16 +222,10 @@ pub fn analyze(
     let mut entries: Vec<Entry> = {
         let cache_view: &Cache = cache;
         kept.into_iter()
-            .zip(checked_versions)
-            .map(|(dependency, checked_version)| {
+            .zip(resolved_versions)
+            .map(|(dependency, resolved)| {
                 build_entry(
-                    eco,
-                    dependency,
-                    checked_version,
-                    cache_view,
-                    &fresh_osv,
-                    settings,
-                    now,
+                    eco, dependency, resolved, cache_view, &fresh_osv, settings, now,
                 )
             })
             .collect()
@@ -222,15 +237,175 @@ pub fn analyze(
         .count();
     let pending = waiting_for_osv
         + if eco.offers_updates() {
-            resolve_registry(eco, &mut entries, cache, http, budget, now)
+            resolve_registry(
+                eco,
+                &mut entries,
+                cache,
+                http,
+                budget,
+                now,
+                &mut registry_answers,
+            )
         } else {
             0
         };
     Analysis { entries, pending }
 }
 
-/// Registry outcome of one package name: the newest release, or the failure reason.
-type Lookup = Result<Option<String>, String>;
+/// Whether the cache holds an OSV answer or an OSV failure for one version of `dependency`.
+fn is_osv_answered(
+    cache: &Cache,
+    eco: Ecosystem,
+    dependency: &Dependency,
+    version: &str,
+    now: u64,
+) -> bool {
+    cache
+        .vulnerabilities(eco, &dependency.name, version, now)
+        .is_some()
+        || cache
+            .failure(
+                FailureKind::Osv,
+                eco,
+                &osv_failure_key(&dependency.name, version),
+                now,
+            )
+            .is_some()
+}
+
+/// How the checked version of one dependency stands before the OSV query.
+enum CheckedVersion {
+    /// The version to send to OSV, or `None` when the requirement is not audited.
+    Known(Option<String>),
+    /// The registry list that names the version is not known yet. The entry stays pending.
+    WaitingForList,
+}
+
+/// Names the checked version of every dependency, and looks up the registry lists that it needs.
+///
+/// A dependency whose requirement is not an exact pin needs the registry list of its package. The
+/// list comes from the answers of this call, then from the cache. A package that is in neither is
+/// looked up here, before its OSV query. The lookups of one call follow the first slice of the
+/// budget, as the OSV pairs do, so the first dependencies show at once. A lookup that fails sends
+/// the text of the lower bound to OSV, and the registry step reports the failure.
+fn resolve_checked_versions(
+    eco: Ecosystem,
+    deps: &[Dependency],
+    cache: &mut Cache,
+    http: &dyn Http,
+    budget: &mut Budget,
+    now: u64,
+    answers: &mut HashMap<String, Lookup>,
+) -> Vec<CheckedVersion> {
+    // Pass 1 makes no request: it settles every dependency that the cache or the call already answers.
+    let mut resolved: Vec<Option<CheckedVersion>> = deps
+        .iter()
+        .map(|dependency| {
+            if !needs_list(eco, &dependency.version, dependency.requirement.as_ref()) {
+                return Some(CheckedVersion::Known(checked_version_of(
+                    eco,
+                    &dependency.version,
+                    dependency.requirement.as_ref(),
+                    None,
+                )));
+            }
+            let name = eco.normalize_package(&dependency.name);
+            checked_from_known_list(eco, dependency, &name, cache, answers, now)
+        })
+        .collect();
+    let answered = deps
+        .iter()
+        .zip(&resolved)
+        .filter(|(dependency, state)| {
+            matches!(state, Some(CheckedVersion::Known(Some(version)))
+                if is_osv_answered(cache, eco, dependency, version, now))
+        })
+        .count();
+    let list_limit = budget
+        .first_osv_slice()
+        .map_or(usize::MAX, |slice| slice.max(answered));
+    // Pass 2 looks up the lists that are still missing, in manifest order.
+    let mut lookups_done = 0;
+    for (dependency, state) in deps.iter().zip(resolved.iter_mut()) {
+        if state.is_some() {
+            continue;
+        }
+        let name = eco.normalize_package(&dependency.name);
+        // A name that an earlier dependency of this call looked up answers its duplicates.
+        if let Some(known) = checked_from_known_list(eco, dependency, &name, cache, answers, now) {
+            *state = Some(known);
+            continue;
+        }
+        // An invalid name costs no lookup. The registry step reports it.
+        let Some(request) = eco.registry_request(&dependency.name) else {
+            *state = Some(CheckedVersion::Known(checked_version_of(
+                eco,
+                &dependency.version,
+                dependency.requirement.as_ref(),
+                None,
+            )));
+            continue;
+        };
+        if lookups_done >= list_limit || !budget.take() {
+            *state = Some(CheckedVersion::WaitingForList);
+            continue;
+        }
+        lookups_done += 1;
+        let lookup = lookup_registry(eco, request, &name, http, cache, now);
+        if lookup
+            .as_ref()
+            .is_err_and(|reason| is_cancelled_message(reason))
+        {
+            // The host superseded this call. The entry stays pending, and no lookup follows.
+            budget.cancel();
+            *state = Some(CheckedVersion::WaitingForList);
+            continue;
+        }
+        answers.insert(name.clone().into_owned(), lookup);
+        *state = checked_from_known_list(eco, dependency, &name, cache, answers, now);
+    }
+    resolved
+        .into_iter()
+        .map(|state| state.unwrap_or(CheckedVersion::WaitingForList))
+        .collect()
+}
+
+/// The checked version of `dependency` when its registry list is known, or its failure is.
+///
+/// Returns `None` when the package was not looked up yet. A failed lookup gives the text of the
+/// lower bound, because no list names a version.
+fn checked_from_known_list(
+    eco: Ecosystem,
+    dependency: &Dependency,
+    name: &str,
+    cache: &Cache,
+    answers: &HashMap<String, Lookup>,
+    now: u64,
+) -> Option<CheckedVersion> {
+    let list: Option<&[String]> = match answers.get(name) {
+        Some(Ok(info)) => Some(info.versions.as_slice()),
+        Some(Err(_)) => None,
+        None => match cache.version_info(eco, name, now) {
+            Some(info) => Some(info.versions.as_slice()),
+            None if cache
+                .failure(FailureKind::Registry, eco, name, now)
+                .is_some() =>
+            {
+                None
+            }
+            None => return None,
+        },
+    };
+    Some(CheckedVersion::Known(checked_version_of(
+        eco,
+        &dependency.version,
+        dependency.requirement.as_ref(),
+        list,
+    )))
+}
+
+/// Registry outcome of one package name: its versions, or the failure reason.
+type Lookup = Result<VersionInfo, String>;
 
 /// Sets the registry status of every entry with a checked version. Returns how many stay pending.
 ///
@@ -245,8 +420,8 @@ fn resolve_registry(
     http: &dyn Http,
     budget: &mut Budget,
     now: u64,
+    fresh: &mut HashMap<String, Lookup>,
 ) -> usize {
-    let mut fresh: HashMap<String, Lookup> = HashMap::new();
     let mut pending_count = 0;
     for entry in entries.iter_mut().filter(|entry| {
         entry.checked_version.is_some()
@@ -296,7 +471,7 @@ fn resolve_registry(
 fn lookup_view(lookup: &Lookup) -> Result<Option<&str>, &str> {
     lookup
         .as_ref()
-        .map(|latest| latest.as_deref())
+        .map(|info| info.latest.as_deref())
         .map_err(String::as_str)
 }
 
@@ -327,9 +502,9 @@ fn lookup_registry(
 ) -> Lookup {
     match request_version_info(eco, &request, http) {
         Ok(info) => {
-            let latest = info.latest.clone();
-            cache.put_version_info(eco, name, info, now);
-            Ok(latest)
+            // The call keeps its own copy of the list: the cache may store nothing.
+            cache.put_version_info(eco, name, info.clone(), now);
+            Ok(info)
         }
         Err(reason) => {
             // A cancelled request is not a registry failure: the newer call asks the registry again.
@@ -437,18 +612,8 @@ fn query_missing_vulnerabilities(
             .zip(checked_versions)
             .filter_map(|(dependency, checked_version)| {
                 let version = checked_version.as_deref()?;
-                let is_answered = cache
-                    .vulnerabilities(eco, &dependency.name, version, now)
-                    .is_some()
-                    || cache
-                        .failure(
-                            FailureKind::Osv,
-                            eco,
-                            &osv_failure_key(&dependency.name, version),
-                            now,
-                        )
-                        .is_some();
-                is_answered.then_some((dependency.name.as_str(), version))
+                is_osv_answered(cache, eco, dependency, version, now)
+                    .then_some((dependency.name.as_str(), version))
             })
             .collect();
         slice.max(answered.len())
@@ -573,12 +738,16 @@ impl FreshOsv {
 fn build_entry(
     eco: Ecosystem,
     dependency: Dependency,
-    checked_version: Option<String>,
+    resolved: CheckedVersion,
     cache: &Cache,
     fresh: &FreshOsv,
     settings: &Settings,
     now: u64,
 ) -> Entry {
+    let (checked_version, waits_for_list) = match resolved {
+        CheckedVersion::Known(version) => (version, false),
+        CheckedVersion::WaitingForList => (None, true),
+    };
     if !settings.vulnerabilities {
         return Entry {
             dependency,
@@ -623,7 +792,7 @@ fn build_entry(
     let waits_for_osv = checked_version.is_some() && !has_answer && failure.is_none();
     let status = match failure {
         Some(reason) => Status::Unknown(reason.to_owned()),
-        None if waits_for_osv => Status::Pending,
+        None if waits_for_osv || waits_for_list => Status::Pending,
         None => Status::NotChecked,
     };
     Entry {
@@ -2536,5 +2705,177 @@ mod tests {
 
         assert_eq!(stale.pending, 1);
         assert_eq!(stale.entries[0].status, Status::Pending);
+    }
+
+    /// A PyPI answer that has the 1.x line up to 1.2.3 and the 2.x line up to 2.34.2.
+    const RANGE_BODY: &str = r#"{"info":{"version":"2.34.2"},"releases":{"1.2.3":[{"yanked":false}],"2.0.0":[{"yanked":false}],"2.9.2":[{"yanked":false}],"2.10.0":[{"yanked":false}],"2.34.2":[{"yanked":false}]}}"#;
+    const RANGE_TEXT: &str = "requests>1.12,<2.10\n";
+
+    /// The OSV batch bodies that the fake received, in order.
+    fn batch_bodies(http: &FakeHttp) -> Vec<String> {
+        http.requests()
+            .into_iter()
+            .zip(http.request_bodies())
+            .filter(|((method, url), _)| method == "POST" && url == BATCH_URL)
+            .map(|(_, body)| body)
+            .collect()
+    }
+
+    #[test]
+    fn a_range_is_queried_with_the_lowest_allowed_version() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", REQUESTS_URL, 200, RANGE_BODY);
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            RANGE_TEXT,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(
+            entry(&analysis, "requests").checked_version.as_deref(),
+            Some("2.0.0")
+        );
+        let bodies = batch_bodies(&http);
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].contains("\"2.0.0\""), "{}", bodies[0]);
+        assert!(!bodies[0].contains("1.12"), "{}", bodies[0]);
+    }
+
+    #[test]
+    fn an_exact_pin_is_queried_without_waiting_for_the_registry() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", REQUESTS_URL, 200, RANGE_BODY);
+        analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            "requests==2.0.0\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        let methods: Vec<String> = http
+            .requests()
+            .into_iter()
+            .map(|(method, _)| method)
+            .collect();
+        assert_eq!(methods, ["POST", "GET"]);
+    }
+
+    #[test]
+    fn a_registry_failure_queries_the_bound_text_and_keeps_the_failure() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", REQUESTS_URL, 500, "");
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            RANGE_TEXT,
+            &mut Budget::new(usize::MAX, None),
+        );
+        let requests = entry(&analysis, "requests");
+        assert_eq!(requests.checked_version.as_deref(), Some("1.12"));
+        assert!(
+            matches!(&requests.status, Status::Unknown(reason) if reason.starts_with("registry:")),
+            "{:?}",
+            requests.status
+        );
+        assert!(batch_bodies(&http)[0].contains("\"1.12\""));
+    }
+
+    #[test]
+    fn an_ignored_package_with_a_range_makes_no_request() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new();
+        let settings = Settings {
+            ignore: vec!["requests".to_owned()],
+            ..Settings::default()
+        };
+        let analysis = analyze(
+            Ecosystem::PyPI,
+            parsers::python::parse(RANGE_TEXT),
+            &mut cache,
+            &http,
+            &settings,
+            NOW,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert!(analysis.entries.is_empty());
+        assert!(http.requests().is_empty());
+    }
+
+    #[test]
+    fn a_cache_that_stores_nothing_still_gives_the_list() {
+        let mut cache = Cache::new(0);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", REQUESTS_URL, 200, RANGE_BODY);
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            RANGE_TEXT,
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert_eq!(
+            entry(&analysis, "requests").checked_version.as_deref(),
+            Some("2.0.0")
+        );
+        assert_eq!(http.count(PYPI_PREFIX), 1);
+    }
+
+    #[test]
+    fn the_first_slice_limits_the_list_lookups_and_the_pending_count_falls() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", PYPI_PREFIX, 200, RANGE_BODY);
+        let text = "a>1.12,<2.10\nb>1.12,<2.10\nc>1.12,<2.10\nd>1.12,<2.10\ne>1.12,<2.10\n";
+        let run = |cache: &mut Cache| {
+            analyze_python(
+                cache,
+                &http,
+                NOW,
+                text,
+                &mut Budget::new(20, None).with_first_osv_slice(1),
+            )
+        };
+        let first = run(&mut cache);
+        assert_eq!(http.count(PYPI_PREFIX), 1);
+        assert_eq!(first.pending, 4);
+        let second = run(&mut cache);
+        assert_eq!(http.count(PYPI_PREFIX), 2);
+        assert_eq!(second.pending, 3);
+    }
+
+    #[test]
+    fn an_offline_run_uses_a_cached_list_and_leaves_an_unknown_one_pending() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", REQUESTS_URL, 200, RANGE_BODY);
+        let cold = analyze_python(&mut cache, &http, NOW, RANGE_TEXT, &mut Budget::offline());
+        assert_eq!(cold.pending, 1);
+        assert_eq!(entry(&cold, "requests").checked_version, None);
+        assert!(http.requests().is_empty());
+
+        analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            RANGE_TEXT,
+            &mut Budget::new(usize::MAX, None),
+        );
+        let warm = analyze_python(&mut cache, &http, NOW, RANGE_TEXT, &mut Budget::offline());
+        assert_eq!(warm.pending, 0);
+        assert_eq!(
+            entry(&warm, "requests").checked_version.as_deref(),
+            Some("2.0.0")
+        );
     }
 }
