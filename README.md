@@ -146,6 +146,7 @@ Add the package name to `ignore`, for example `["serde", "left-pad"]`. The name 
 - Unlisted and deprecated package states are not shown. For NuGet, the latest release can be a version that its author unlisted, because the version index does not tell them apart.
 - The Maven parser reads the `project/properties` block only, for `${name}` version placeholders.
 - Composer `-p1` and `-patch` stabilities count as prereleases.
+- A Python requirement that a `\` continues on the next line is not read: its name and its version sit on different lines, so the plugin shows no result for it.
 
 ## Building
 
