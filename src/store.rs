@@ -44,6 +44,7 @@ pub struct MemoryStore {
     entries: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
     is_failing: bool,
     is_failing_reads: bool,
+    is_failing_deletes: bool,
 }
 
 #[cfg(test)]
@@ -65,6 +66,14 @@ impl MemoryStore {
     pub fn failing_reads() -> Self {
         Self {
             is_failing_reads: true,
+            ..Self::new()
+        }
+    }
+
+    /// Creates a store that deletes nothing: `delete` returns `Err("store unavailable")`, the rest works.
+    pub fn failing_deletes() -> Self {
+        Self {
+            is_failing_deletes: true,
             ..Self::new()
         }
     }
@@ -103,6 +112,9 @@ impl Store for MemoryStore {
 
     fn delete(&self, key: &str) -> Result<(), String> {
         self.check()?;
+        if self.is_failing_deletes {
+            return Err("store unavailable".to_owned());
+        }
         self.entries.borrow_mut().remove(key);
         Ok(())
     }

@@ -268,14 +268,28 @@ impl DependencyLens {
         self.unreadable_blocks.clear();
     }
 
-    /// Deletes the disk block of every ecosystem.
-    fn clear_disk(&mut self, store: &dyn Store) {
+    /// Deletes the disk block of every ecosystem. Returns the ecosystems whose block stays on the disk.
+    fn clear_disk(&mut self, store: &dyn Store) -> Vec<Ecosystem> {
+        let mut not_deleted = Vec::new();
         for ecosystem in Ecosystem::ALL {
             let key = block_key(ecosystem);
             if let Err(error) = store.delete(&key) {
                 self.warn_about_store(&format!("cannot delete {key}: {error}"));
+                not_deleted.push(ecosystem);
             }
         }
+        not_deleted
+    }
+
+    /// Empties the cache in memory and on the disk.
+    ///
+    /// A block that stays on the disk because its delete failed counts as read, so it does not come
+    /// back after the clear: the next save of its ecosystem replaces it.
+    fn clear_cache_and_disk(&mut self, store: &dyn Store) {
+        self.cache.clear();
+        self.forget_loaded_blocks();
+        let not_deleted = self.clear_disk(store);
+        self.loaded_blocks.extend(not_deleted);
     }
 
     /// Logs a failure of the disk store, the first time only.
@@ -387,18 +401,27 @@ impl DependencyLens {
                 // chunk, what the editor shows is already a published result, so it stays as it is.
                 return previous_pending.is_some().then_some(0);
             }
+            let pending = analysis.pending;
+            let cancelled = task.is_cancelled();
+            // Whether the loop ends here is known before the publication: the last one must not
+            // present old data as current for an entry that this run never re-checked.
+            let is_last_chunk = !should_continue(
+                pending,
+                previous_pending,
+                cancelled,
+                Instant::now(),
+                limits.deadline,
+            );
             let cache = &self.cache;
             publish_over_old_data(
                 path,
                 text,
                 &analysis,
-                old_data.as_ref(),
+                old_data.as_ref().filter(|_| !is_last_chunk),
                 self.settings.outdated_problems,
                 |entry| has_vulnerability_answer(cache, eco, entry, run_started_at),
             );
             self.save_blocks(&HostStore);
-            let pending = analysis.pending;
-            let unloaded = analysis.unloaded_advisory_count();
             // Pending entries are the only ones without a status, so the done count is a subtraction, not a scan.
             let total = analysis.entries.len();
             let done = total.saturating_sub(pending);
@@ -407,15 +430,8 @@ impl DependencyLens {
                 Some(total as u32),
                 Some(&format!("{done} of {total}")),
             );
-            let cancelled = task.is_cancelled();
-            if !should_continue(
-                pending,
-                previous_pending,
-                cancelled,
-                Instant::now(),
-                limits.deadline,
-            ) {
-                return Some(unloaded);
+            if is_last_chunk {
+                return Some(analysis.unloaded_advisory_count());
             }
             previous_pending = Some(pending);
         }
@@ -667,9 +683,7 @@ impl Plugin for DependencyLens {
                 Ok(Some(message))
             }
             "clear-cache" => {
-                self.cache.clear();
-                self.forget_loaded_blocks();
-                self.clear_disk(&HostStore);
+                self.clear_cache_and_disk(&HostStore);
                 // What the manifests show comes from the cache, so they are analyzed again.
                 let deadline = deadline_after(self.time_box);
                 self.refresh_shown_manifests(ctx, deadline, &HashSet::new());
@@ -1012,6 +1026,38 @@ mod disk_cache_tests {
         // OSV has not answered: the old entry shows as it was.
         let replaced = fill_pending_from_old(&analysis, &old, |_| false);
         assert!(replaced.entries[0].vulnerabilities.is_empty());
+    }
+
+    #[test]
+    fn a_block_that_could_not_be_deleted_is_not_read_back_after_a_clear() {
+        use crate::cache::persist::{BLOCK_VERSION, Block, RegistryRecord, encode_block};
+        let _host = MockHost::install();
+        let mut plugin = DependencyLens::default();
+        let mut block = Block {
+            v: BLOCK_VERSION,
+            ..Block::default()
+        };
+        block.registry.insert(
+            "requests".to_owned(),
+            RegistryRecord {
+                at: now_secs(),
+                latest: Some("2.0".to_owned()),
+                all: Vec::new(),
+            },
+        );
+        let store = MemoryStore::failing_deletes();
+        store.set("cache/PyPI", &encode_block(&block)).unwrap();
+
+        plugin.clear_cache_and_disk(&store);
+        plugin.load_block(Ecosystem::PyPI, &store);
+
+        // The block is still on the disk, but the user cleared the cache: it must not come back.
+        assert!(
+            plugin
+                .cache
+                .version_info(Ecosystem::PyPI, "requests", now_secs())
+                .is_none()
+        );
     }
 
     #[test]

@@ -322,15 +322,16 @@ impl Cache {
             value: advisory.clone(),
             stored_at,
         });
-        // A record that the network gave is complete. One that the disk gave holds the entries of
+        // A record that the network gave is complete and authoritative: an older one from the disk
+        // adds nothing to it, whatever its ranges say. One that the disk gave holds the entries of
         // one ecosystem, so it must not stand for the others (see `has_affected_for`).
         if !self.has_complete_affected(id) {
             self.partial_affected
                 .entry(id.to_owned())
                 .or_default()
                 .insert(ecosystem);
+            self.merge_affected(id, affected, stored_at);
         }
-        self.merge_affected(id, affected, stored_at);
         if let Some(revision) = record.revision {
             self.revisions.entry(id.to_owned()).or_insert(revision);
         }
@@ -403,13 +404,14 @@ fn stored_at_on_load(at: u64, now: u64) -> u64 {
     at.min(now)
 }
 
-/// The serialized size of a record under `key`, with a few bytes for the quotes and separators.
-fn record_size<T: Serialize>(key: &str, record: &T) -> usize {
+/// The serialized size of a record under a key of `key_len` bytes, with a few bytes for the quotes
+/// and separators. The key length is enough: no text of the key is built to measure it.
+fn record_size<T: Serialize>(key_len: usize, record: &T) -> usize {
     // The record is counted as it is written, without building its text.
     let mut counter = ByteCounter(0);
     let written =
         serde_json::to_writer(&mut counter, record).map_or(usize::MAX / 4, |()| counter.0);
-    key.len() + written + 4
+    key_len + written + 4
 }
 
 /// A writer that keeps only the number of bytes it was given.
@@ -443,7 +445,8 @@ enum Place {
 ///
 /// A record over the entry limit is dropped. Past the block limit, the registry answers and lists
 /// leave oldest first, and an advisory leaves with the last list that names it.
-/// A list holds at most ten ids, so only the other records can exceed the entry limit.
+/// A list holds at most ten ids, so its record is small. Only the key of a list, built from the
+/// declared version text, has no bound, and the block limit still applies to it.
 fn apply_limits(block: &mut Block) {
     let sizes = measure_records(block);
     remove_oldest_records(block, sizes);
@@ -467,7 +470,7 @@ fn measure_records(block: &mut Block) -> BlockSizes {
     let mut total = 0;
     let mut removable: Vec<Removable> = Vec::new();
     block.registry.retain(|name, record| {
-        let size = record_size(name, record);
+        let size = record_size(name.len(), record);
         if size > MAX_ENTRY_BYTES {
             return false;
         }
@@ -481,7 +484,7 @@ fn measure_records(block: &mut Block) -> BlockSizes {
     });
     let mut advisory_sizes: HashMap<String, usize> = HashMap::new();
     block.advisories.retain(|id, record| {
-        let size = record_size(id, record);
+        let size = record_size(id.len(), record);
         if size > MAX_ENTRY_BYTES {
             return false;
         }
@@ -492,7 +495,7 @@ fn measure_records(block: &mut Block) -> BlockSizes {
     let mut references: HashMap<String, usize> = HashMap::new();
     for (package, versions) in &block.lists {
         for (version, record) in versions {
-            let size = record_size(&format!("{package}/{version}"), record);
+            let size = record_size(package.len() + 1 + version.len(), record);
             total += size;
             removable.push(Removable {
                 at: record.at,
@@ -556,7 +559,7 @@ fn remove_list(
     package: &str,
     version: &str,
 ) -> Option<ListRecord> {
-    let versions = lists.entry(package.to_owned()).or_default();
+    let versions = lists.get_mut(package)?;
     let removed = versions.remove(version)?;
     if versions.is_empty() {
         lists.remove(package);
@@ -1241,9 +1244,43 @@ mod tests {
         };
         let written = serde_json::to_string(&record).unwrap();
         assert_eq!(
-            record_size("requests", &record),
+            record_size("requests".len(), &record),
             "requests".len() + written.len() + 4
         );
+    }
+
+    #[test]
+    fn a_complete_record_from_the_network_is_not_changed_by_a_disk_record() {
+        // The disk holds an older revision of the advisory, with another range for the same package.
+        let mut older = Cache::new(LONG_TTL_SECS);
+        store_details(&mut older, "GHSA-x", NOW);
+        let older_entry = Affected {
+            ranges: vec![vec![
+                RangeEvent::Introduced("0".to_owned()),
+                RangeEvent::Fixed("1.5.0".to_owned()),
+            ]],
+            ..affected("PyPI", PACKAGE)
+        };
+        older.put_affected("GHSA-x", vec![older_entry], NOW);
+        older.put_vulnerabilities(
+            Ecosystem::PyPI,
+            PACKAGE,
+            VERSION,
+            vec![known("GHSA-x")],
+            NOW,
+        );
+        let block = decode_block(&encode_block(&older.export_block(Ecosystem::PyPI))).unwrap();
+
+        // The cache already holds the record that the network gave, which is the authority.
+        let mut cache = Cache::new(LONG_TTL_SECS);
+        store_details(&mut cache, "GHSA-x", NOW);
+        cache.import_block(Ecosystem::PyPI, block, NOW);
+
+        assert_eq!(
+            cache.affected("GHSA-x", NOW),
+            Some(&[affected("PyPI", PACKAGE)][..])
+        );
+        assert!(cache.has_affected_for("GHSA-x", Ecosystem::Npm));
     }
 
     #[test]

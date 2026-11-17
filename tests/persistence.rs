@@ -564,6 +564,9 @@ fn a_cold_open_without_old_data_publishes_nothing_before_the_first_answer() {
     assert!(decorations_of(&host).is_empty());
 }
 
+/// A time box that the two-package runs never reach.
+const LONG_TIME_BOX: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Opens a two-package requirements file whose old data is two hours old and says "→ 3.0" for both.
 ///
 /// The chunk is one registry lookup, so after the first chunk the second package waits for its
@@ -571,8 +574,10 @@ fn a_cold_open_without_old_data_publishes_nothing_before_the_first_answer() {
 /// the two packages in one batch. With `new_advisory_for_second`, it reports one advisory for the
 /// second package that the old data did not have. Returns the text after each version, last
 /// publication.
-fn open_two_pypi_packages_with_old_data(new_advisory_for_second: bool) -> Vec<Option<String>> {
-    use std::time::Duration;
+fn open_two_pypi_packages_with_old_data(
+    new_advisory_for_second: bool,
+    time_box: std::time::Duration,
+) -> Vec<Option<String>> {
     const PYPI_BODY: &str = r#"{"info":{"version":"2.0"},"releases":{"1.0":[{"yanked":false}],"2.0":[{"yanked":false}]}}"#;
     let host = MockHost::install().with_capabilities(&[
         "events",
@@ -619,7 +624,7 @@ fn open_two_pypi_packages_with_old_data(new_advisory_for_second: bool) -> Vec<Op
     });
     host::storage::set("cache/PyPI", &block.to_string()).unwrap();
 
-    let mut plugin = DependencyLens::with_limits(Duration::from_secs(300), 1);
+    let mut plugin = DependencyLens::with_limits(time_box, 1);
     host.add_file("requirements.txt", "requests==1.0.0\nflask==1.0.0\n");
     plugin.handle_events(
         &[Event::FileOpened("/p/requirements.txt".to_owned())],
@@ -630,15 +635,24 @@ fn open_two_pypi_packages_with_old_data(new_advisory_for_second: bool) -> Vec<Op
 
 #[test]
 fn an_entry_that_still_waits_keeps_its_old_data_between_chunks() {
-    let shown = open_two_pypi_packages_with_old_data(false);
+    let shown = open_two_pypi_packages_with_old_data(false, LONG_TIME_BOX);
 
     // The first package has its new answer. The second still shows the old one, not "…".
     assert_eq!(shown, [Some("→ 2.0".to_owned()), Some("→ 3.0".to_owned())]);
 }
 
 #[test]
+fn an_entry_that_the_run_leaves_waiting_shows_dots_not_old_data() {
+    // The time box ends the run after its first chunk: the second package was never re-checked,
+    // so the last publication must not present its old data as current.
+    let shown = open_two_pypi_packages_with_old_data(false, std::time::Duration::ZERO);
+
+    assert_eq!(shown, [Some("→ 2.0".to_owned()), Some("…".to_owned())]);
+}
+
+#[test]
 fn an_advisory_that_just_arrived_is_not_hidden_by_the_old_data_of_an_entry_that_waits() {
-    let shown = open_two_pypi_packages_with_old_data(true);
+    let shown = open_two_pypi_packages_with_old_data(true, LONG_TIME_BOX);
 
     // The second package waits only for its registry answer: OSV has answered, and its news shows.
     assert_eq!(
