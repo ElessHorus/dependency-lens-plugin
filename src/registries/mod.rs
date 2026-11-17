@@ -2,6 +2,7 @@
 
 pub mod dotted;
 pub mod gem_version;
+pub mod maven_version;
 pub mod nuget;
 pub mod packagist;
 pub mod pep440;
