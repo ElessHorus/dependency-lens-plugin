@@ -6,7 +6,7 @@ use crate::fixes::{line_constraints, plan_fix, render_fix};
 use crate::is_manifest_in;
 use crate::model::{Affected, Dependency, Ecosystem};
 use crate::osv::{declared_version_for_osv, is_deferred, is_placeholder};
-use crate::requirement::satisfies_all;
+use crate::requirement::{checked_version_of, needs_list, satisfies_all};
 use crate::settings::Settings;
 use crate::text::to_range;
 use crate::update::{UpdateKind, is_outdated, render_update, update_kind};
@@ -84,6 +84,21 @@ pub fn code_actions(
     actions
 }
 
+/// The version that the analysis checked for `dep`: the lowest version of the cached registry
+/// list that its requirement allows, or the text of the lower bound without such a list.
+fn checked_version_for(
+    cache: &Cache,
+    eco: Ecosystem,
+    dep: &Dependency,
+    now: u64,
+) -> Option<String> {
+    let versions = needs_list(eco, &dep.version, dep.requirement.as_ref())
+        .then(|| cache.version_info(eco, &eco.normalize_package(&dep.name), now))
+        .flatten()
+        .map(|info| info.versions.as_slice());
+    checked_version_of(eco, &dep.version, dep.requirement.as_ref(), versions)
+}
+
 /// The action that loads the deferred advisories of `dep`, `None` when none waits for its details.
 ///
 /// The action has no edit. Its `data` names the package, and picking it resolves the action,
@@ -94,7 +109,7 @@ fn load_action_for(
     dep: &Dependency,
     now: u64,
 ) -> Option<CodeAction> {
-    let current = declared_version_for_osv(&dep.version)?;
+    let current = checked_version_for(cache, eco, dep, now)?;
     let waiting = cache
         .vulnerabilities(eco, &dep.name, &current, now)?
         .iter()
@@ -134,7 +149,7 @@ fn fix_action_for(
     if eco == Ecosystem::Maven && dep.has_additional_version_constraints {
         return None;
     }
-    let current = declared_version_for_osv(&dep.version)?;
+    let current = checked_version_for(cache, eco, dep, now)?;
     let listed = cache.vulnerabilities(eco, &dep.name, &current, now)?;
     let affected: Vec<&[Affected]> = listed
         .iter()
@@ -975,5 +990,53 @@ mod tests {
             FIX_NOW,
         );
         assert_eq!(actions.len(), 1);
+    }
+
+    /// The versions that the registry lists for flask, newest first.
+    fn flask_versions() -> VersionInfo {
+        VersionInfo {
+            latest: Some("2.3.2".to_owned()),
+            versions: ["2.3.2", "0.12.3", "0.12.2"].map(str::to_owned).to_vec(),
+        }
+    }
+
+    #[test]
+    fn the_fix_and_the_load_action_read_the_lowest_allowed_version_of_a_range() {
+        // `0.12.1` does not exist: the analysis checked `0.12.2`, so the actions must read its advisories.
+        let pyproject = "[project]\ndependencies = [\n  \"flask>=0.12.1,<1\",\n]\n";
+        let mut cache = fix_cache(
+            Ecosystem::PyPI,
+            "flask",
+            "0.12.2",
+            &[("GHSA-1", HIGH, &events("0.12.3"))],
+        );
+        cache.put_version_info(Ecosystem::PyPI, "flask", flask_versions(), FIX_NOW);
+        assert_eq!(
+            summary_of(&actions_at(
+                &cache,
+                &Settings::default(),
+                "/p/pyproject.toml",
+                pyproject,
+                2
+            )),
+            [(
+                "Fix 1 vulnerability: update flask to 0.12.3".to_owned(),
+                "0.12.3".to_owned()
+            )]
+        );
+
+        let mut deferred = deferred_cache(Ecosystem::PyPI, "flask", "0.12.2", 2);
+        deferred.put_version_info(Ecosystem::PyPI, "flask", flask_versions(), FIX_NOW);
+        let titles: Vec<String> = actions_at(
+            &deferred,
+            &Settings::default(),
+            "/p/pyproject.toml",
+            pyproject,
+            2,
+        )
+        .into_iter()
+        .map(|action| action.title)
+        .collect();
+        assert_eq!(titles, ["Load 2 more vulnerabilities of flask"]);
     }
 }

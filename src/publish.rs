@@ -2,7 +2,7 @@
 
 use crate::analysis::{Analysis, Entry, Status};
 use crate::model::{AdvisorySeverity, Vulnerability};
-use crate::osv::{is_deferred, is_placeholder};
+use crate::osv::{declared_version_for_osv, is_deferred, is_placeholder};
 use crate::text::to_range_in_line;
 use openidea_plugin::{Decoration, Diagnostic, Range, Severity};
 use std::cmp::Reverse;
@@ -194,6 +194,14 @@ fn hover_of(entry: &Entry) -> String {
     if view.total() > 0 {
         if let Some(checked_version) = &entry.checked_version {
             blocks.push(format!("Checked version: {checked_version}"));
+            // The lowest allowed version differs from the text of the bound: say why.
+            if let Some(bound_text) = declared_version_for_osv(&entry.dependency.version)
+                && bound_text != *checked_version
+            {
+                blocks.push(format!(
+                    "Lowest version that the requirement allows (the manifest writes {bound_text})."
+                ));
+            }
         }
         let mut advisory_lines: Vec<String> = view
             .known
@@ -841,5 +849,17 @@ mod tests {
             codes,
             [Some("GHSA-high".to_owned()), Some("outdated".to_owned())]
         );
+    }
+
+    #[test]
+    fn the_hover_says_when_the_checked_version_is_not_the_written_bound() {
+        let high = vulnerability("GHSA-high", AdvisorySeverity::High, None);
+        let range = serde_entry(Status::UpToDate, vec![high.clone()], Some("2.0.0"));
+        assert_eq!(
+            hover_of(&range.entries[0]),
+            "**serde** 2.0.0\n\nChecked version: 2.0.0\n\nLowest version that the requirement allows (the manifest writes 1.0.0).\n\n- GHSA-high (High) – Summary of GHSA-high"
+        );
+        let same = serde_entry(Status::UpToDate, vec![high], Some("1.0.0"));
+        assert!(!hover_of(&same.entries[0]).contains("Lowest version"));
     }
 }
