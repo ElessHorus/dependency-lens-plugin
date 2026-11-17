@@ -71,47 +71,62 @@ impl Osv {
             }
             let body = if request.url.ends_with(BATCH_SUFFIX) {
                 batch_requests.set(batch_requests.get() + 1);
-                let query: Value =
-                    serde_json::from_slice(request.body.as_deref().unwrap_or_default())
-                        .unwrap_or(Value::Null);
-                let results: Vec<Value> = query["queries"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|query| {
-                        let count = if query["package"]["name"] == "serde" {
-                            advisories.get()
-                        } else {
-                            0
-                        };
-                        let vulns: Vec<Value> = (0..count)
-                            .map(|number| json!({ "id": format!("GHSA-{number:04}") }))
-                            .collect();
-                        json!({ "vulns": vulns })
-                    })
-                    .collect();
-                json!({ "results": results }).to_string()
+                batch_answer(request.body.as_deref(), advisories.get())
             } else if let Some(id) = request.url.strip_prefix(DETAIL_PREFIX) {
                 detail_requests.set(detail_requests.get() + 1);
-                json!({
-                    "id": id,
-                    "summary": "Test advisory",
-                    "database_specific": { "severity": "HIGH" },
-                    "affected": [{
-                        "package": { "name": "serde", "ecosystem": "crates.io" },
-                        "ranges": [{ "type": "SEMVER", "events": [{ "introduced": "0" }, { "fixed": "1.0.5" }] }]
-                    }]
-                })
-                .to_string()
+                detail_answer(id)
             } else {
                 return Err(Error::Failed(format!("unexpected request {}", request.url)));
             };
-            Ok(HttpResponse {
-                status: 200,
-                headers: Vec::new(),
-                body: body.into_bytes(),
-            })
+            Ok(ok_response(body))
         });
+    }
+}
+
+/// The OSV answer to the batch query `request_body`: `serde_advisories` advisories for serde, none
+/// for the other packages.
+fn batch_answer(request_body: Option<&[u8]>, serde_advisories: usize) -> String {
+    let query: Value =
+        serde_json::from_slice(request_body.unwrap_or_default()).unwrap_or(Value::Null);
+    let results: Vec<Value> = query["queries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|query| {
+            let count = if query["package"]["name"] == "serde" {
+                serde_advisories
+            } else {
+                0
+            };
+            let vulns: Vec<Value> = (0..count)
+                .map(|number| json!({ "id": format!("GHSA-{number:04}") }))
+                .collect();
+            json!({ "vulns": vulns })
+        })
+        .collect();
+    json!({ "results": results }).to_string()
+}
+
+/// The OSV record of the advisory `id`: a high-severity serde advisory, fixed in 1.0.5.
+fn detail_answer(id: &str) -> String {
+    json!({
+        "id": id,
+        "summary": "Test advisory",
+        "database_specific": { "severity": "HIGH" },
+        "affected": [{
+            "package": { "name": "serde", "ecosystem": "crates.io" },
+            "ranges": [{ "type": "SEMVER", "events": [{ "introduced": "0" }, { "fixed": "1.0.5" }] }]
+        }]
+    })
+    .to_string()
+}
+
+/// A `200 OK` answer with `body`.
+fn ok_response(body: String) -> HttpResponse {
+    HttpResponse {
+        status: 200,
+        headers: Vec::new(),
+        body: body.into_bytes(),
     }
 }
 
@@ -131,18 +146,31 @@ fn open_manifest(host: &MockHost, plugin: &mut DependencyLens, text: &str) {
     );
 }
 
-fn decorations_of(host: &MockHost) -> Vec<Decoration> {
+fn decorations_at(host: &MockHost, path: &str) -> Vec<Decoration> {
     host.decorations()
-        .get(&(DECORATION_SET.to_owned(), MANIFEST_PATH.to_owned()))
+        .get(&(DECORATION_SET.to_owned(), path.to_owned()))
         .cloned()
         .unwrap_or_default()
 }
 
-fn after_texts(host: &MockHost) -> Vec<Option<String>> {
-    decorations_of(host)
+fn decorations_of(host: &MockHost) -> Vec<Decoration> {
+    decorations_at(host, MANIFEST_PATH)
+}
+
+fn after_texts_at(host: &MockHost, path: &str) -> Vec<Option<String>> {
+    decorations_at(host, path)
         .into_iter()
         .map(|decoration| decoration.after)
         .collect()
+}
+
+fn after_texts(host: &MockHost) -> Vec<Option<String>> {
+    after_texts_at(host, MANIFEST_PATH)
+}
+
+/// The Cargo block that the host storage holds, as JSON.
+fn stored_cargo_block(host: &MockHost) -> Value {
+    serde_json::from_str(&host.storage()[CARGO_KEY]).unwrap()
 }
 
 /// Writes a Cargo block that names one advisory for `serde 1.0.0`, stored at `at`.
@@ -256,8 +284,7 @@ fn an_undecodable_block_is_deleted_and_the_analysis_runs() {
     open_manifest(&host, &mut plugin, MANIFEST);
 
     assert_eq!(after_texts(&host), [Some("⚠ 1 vulnerability".to_owned())]);
-    let block: Value = serde_json::from_str(&host.storage()[CARGO_KEY]).unwrap();
-    assert_eq!(block["v"], 1);
+    assert_eq!(stored_cargo_block(&host)["v"], 1);
 }
 
 #[test]
@@ -325,7 +352,7 @@ fn load_all_still_works_after_a_restore_from_disk() {
     assert!(!hover.contains("more not loaded"), "{hover}");
 
     // The disk still keeps the standard ten, however many the session loaded.
-    let block: Value = serde_json::from_str(&host.storage()[CARGO_KEY]).unwrap();
+    let block = stored_cargo_block(&host);
     let list = &block["lists"]["serde"]["1.0.0"];
     assert_eq!(list["total"], 25);
     assert_eq!(list["ids"].as_array().unwrap().len(), 10);
@@ -484,17 +511,13 @@ fn a_package_added_to_ignore_leaves_the_disk_cache() {
     let host = host_with(&STORAGE_CAPABILITIES, &osv);
     let mut plugin = DependencyLens::default();
     open_manifest(&host, &mut plugin, MANIFEST);
-    let package_lists = |host: &MockHost| -> Value {
-        let block: Value = serde_json::from_str(&host.storage()[CARGO_KEY]).unwrap();
-        block["lists"].clone()
-    };
-    assert!(package_lists(&host).get("serde").is_some());
+    assert!(stored_cargo_block(&host)["lists"].get("serde").is_some());
 
     host.set_setting("ignore", r#"["serde"]"#);
     send_settings_changed(&host, &mut plugin, "ignore");
 
     // The advisory records are public OSV data and may still name serde. The project's list may not.
-    assert!(package_lists(&host).get("serde").is_none());
+    assert!(stored_cargo_block(&host)["lists"].get("serde").is_none());
 }
 
 #[test]
@@ -569,11 +592,7 @@ fn an_entry_that_still_waits_keeps_its_old_data_between_chunks() {
         } else {
             return Err(Error::Failed(format!("unexpected request {}", request.url)));
         };
-        Ok(HttpResponse {
-            status: 200,
-            headers: Vec::new(),
-            body: body.into_bytes(),
-        })
+        Ok(ok_response(body))
     });
     let at = now_secs() - 2 * HOUR_SECS;
     let old_registry = json!({ "at": at, "latest": "3.0", "all": ["3.0", "2.0", "1.0"] });
@@ -594,14 +613,7 @@ fn an_entry_that_still_waits_keeps_its_old_data_between_chunks() {
         &host.invocation(),
     );
 
-    let shown: Vec<Option<String>> = host
-        .decorations()
-        .get(&(DECORATION_SET.to_owned(), "/p/requirements.txt".to_owned()))
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|decoration| decoration.after)
-        .collect();
+    let shown = after_texts_at(&host, "/p/requirements.txt");
     // The first package has its new answer. The second still shows the old one, not "…".
     assert_eq!(shown, [Some("→ 2.0".to_owned()), Some("→ 3.0".to_owned())]);
 }

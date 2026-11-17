@@ -209,40 +209,31 @@ impl DependencyLens {
                 return self.warn_about_store(&format!("cannot read {key}: {error}"));
             }
         };
-        match decode_block(&text) {
-            Some(mut block) => {
-                // A package that was ignored since the block was written leaves it, and the block is written again.
-                if self.drop_ignored(ecosystem, &mut block) {
-                    self.cache.mark_dirty(ecosystem);
-                }
-                let record_count = block.registry.len()
-                    + block
-                        .lists
-                        .values()
-                        .map(|versions| versions.len())
-                        .sum::<usize>()
-                    + block.advisories.len();
-                self.cache.import_block(ecosystem, block, now_secs());
-                // The cost of the disk path, for the cold-start check of docs/MAINTAINING.md.
-                host::log(
-                    LogLevel::Debug,
-                    &format!(
-                        "cache: loaded {} ({record_count} records, {} bytes) in {} ms",
-                        ecosystem.osv_name(),
-                        text.len(),
-                        started_at.elapsed().as_millis()
-                    ),
-                );
+        let Some(mut block) = decode_block(&text) else {
+            self.warn_about_store(&format!(
+                "{key} is not a readable cache block, so it is dropped"
+            ));
+            if let Err(error) = store.delete(&key) {
+                self.warn_about_store(&format!("cannot delete {key}: {error}"));
             }
-            None => {
-                self.warn_about_store(&format!(
-                    "{key} is not a readable cache block, so it is dropped"
-                ));
-                if let Err(error) = store.delete(&key) {
-                    self.warn_about_store(&format!("cannot delete {key}: {error}"));
-                }
-            }
+            return;
+        };
+        // A package that was ignored since the block was written leaves it, and the block is written again.
+        if self.drop_ignored(ecosystem, &mut block) {
+            self.cache.mark_dirty(ecosystem);
         }
+        let record_count = block.record_count();
+        self.cache.import_block(ecosystem, block, now_secs());
+        // The cost of the disk path, for the cold-start check of docs/MAINTAINING.md.
+        host::log(
+            LogLevel::Debug,
+            &format!(
+                "cache: loaded {} ({record_count} records, {} bytes) in {} ms",
+                ecosystem.osv_name(),
+                text.len(),
+                started_at.elapsed().as_millis()
+            ),
+        );
     }
 
     /// Writes the disk block of every ecosystem whose cache changed since the last save.
@@ -396,15 +387,11 @@ impl DependencyLens {
                 // chunk, what the editor shows is already a published result, so it stays as it is.
                 return previous_pending.is_some().then_some(0);
             }
-            // An entry that still waits keeps what the old data showed for it until its answer comes.
-            let shown = old_data
-                .as_ref()
-                .filter(|_| analysis.pending > 0)
-                .map(|old| fill_pending_from_old(&analysis, old));
-            publish_analysis(
+            publish_over_old_data(
                 path,
                 text,
-                shown.as_ref().unwrap_or(&analysis),
+                &analysis,
+                old_data.as_ref(),
                 self.settings.outdated_problems,
             );
             self.save_blocks(&HostStore);
@@ -463,6 +450,27 @@ fn publish_analysis(path: &str, text: &str, analysis: &Analysis, outdated_proble
     let editor_decorations = publish::decorations(text, analysis);
     let problems = publish::diagnostics(text, analysis, outdated_problems);
     publish_results(path, &editor_decorations, &problems);
+}
+
+/// Publishes `analysis` like [`publish_analysis`], with `old_data` shown for the entries that still wait.
+///
+/// An entry that still waits keeps what the old data showed for it until its answer comes.
+fn publish_over_old_data(
+    path: &str,
+    text: &str,
+    analysis: &Analysis,
+    old_data: Option<&Analysis>,
+    outdated_problems: bool,
+) {
+    let shown = old_data
+        .filter(|_| analysis.pending > 0)
+        .map(|old| fill_pending_from_old(analysis, old));
+    publish_analysis(
+        path,
+        text,
+        shown.as_ref().unwrap_or(analysis),
+        outdated_problems,
+    );
 }
 
 /// Returns `analysis` with each entry that still waits replaced by what `old` showed for it.

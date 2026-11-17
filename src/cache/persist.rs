@@ -107,6 +107,12 @@ impl Block {
         self.lists.retain(|name, _| is_kept(name));
         before != self.registry.len() + self.lists.len()
     }
+
+    /// The number of records of the block: registry answers, vulnerability lists and advisories.
+    pub fn record_count(&self) -> usize {
+        let list_count: usize = self.lists.values().map(HashMap::len).sum();
+        self.registry.len() + list_count + self.advisories.len()
+    }
 }
 
 /// Reads a block from its text. Returns `None` for invalid JSON or another format version.
@@ -128,8 +134,30 @@ impl Cache {
     /// A list keeps `total` and the ids of its first [`DEFAULT_DETAILS_PER_QUERY`] entries. An
     /// advisory record is written only for an id whose details and affected ranges are cached.
     pub fn export_block(&self, ecosystem: Ecosystem) -> Block {
-        let registry = self
-            .version_info
+        let mut lists: HashMap<String, HashMap<String, ListRecord>> = HashMap::new();
+        let mut advisories: HashMap<String, AdvisoryRecord> = HashMap::new();
+        for (package, versions) in self.vulnerabilities.get(&ecosystem).into_iter().flatten() {
+            for (version, entry) in versions {
+                let record = self.export_list(ecosystem, entry, &mut advisories);
+                lists
+                    .entry(package.clone())
+                    .or_default()
+                    .insert(version.clone(), record);
+            }
+        }
+        let mut block = Block {
+            v: BLOCK_VERSION,
+            registry: self.export_registry(ecosystem),
+            lists,
+            advisories,
+        };
+        apply_limits(&mut block);
+        block
+    }
+
+    /// Builds the registry records of `ecosystem`, by package name.
+    fn export_registry(&self, ecosystem: Ecosystem) -> HashMap<String, RegistryRecord> {
+        self.version_info
             .get(&ecosystem)
             .into_iter()
             .flatten()
@@ -141,45 +169,37 @@ impl Cache {
                 };
                 (name.clone(), record)
             })
+            .collect()
+    }
+
+    /// Builds the record of one vulnerability list, and adds to `advisories` the records of the
+    /// advisories it names that are not there yet.
+    fn export_list(
+        &self,
+        ecosystem: Ecosystem,
+        entry: &Entry<Vec<Vulnerability>>,
+        advisories: &mut HashMap<String, AdvisoryRecord>,
+    ) -> ListRecord {
+        // An entry without an id comes from a restored list. It names nothing to keep.
+        let first: Vec<&Vulnerability> = entry
+            .value
+            .iter()
+            .take(DEFAULT_DETAILS_PER_QUERY)
+            .filter(|listed| !listed.id.is_empty())
             .collect();
-        let mut lists: HashMap<String, HashMap<String, ListRecord>> = HashMap::new();
-        let mut advisories: HashMap<String, AdvisoryRecord> = HashMap::new();
-        for (package, versions) in self.vulnerabilities.get(&ecosystem).into_iter().flatten() {
-            for (version, entry) in versions {
-                // An entry without an id comes from a restored list. It names nothing to keep.
-                let first: Vec<&Vulnerability> = entry
-                    .value
-                    .iter()
-                    .take(DEFAULT_DETAILS_PER_QUERY)
-                    .filter(|listed| !listed.id.is_empty())
-                    .collect();
-                for listed in &first {
-                    if advisories.contains_key(&listed.id) {
-                        continue;
-                    }
-                    if let Some(record) = self.advisory_record(ecosystem, listed, entry.stored_at) {
-                        advisories.insert(listed.id.clone(), record);
-                    }
-                }
-                let record = ListRecord {
-                    at: entry.stored_at,
-                    total: entry.value.len(),
-                    ids: first.iter().map(|listed| listed.id.clone()).collect(),
-                };
-                lists
-                    .entry(package.clone())
-                    .or_default()
-                    .insert(version.clone(), record);
+        for listed in &first {
+            if advisories.contains_key(&listed.id) {
+                continue;
+            }
+            if let Some(record) = self.advisory_record(ecosystem, listed, entry.stored_at) {
+                advisories.insert(listed.id.clone(), record);
             }
         }
-        let mut block = Block {
-            v: BLOCK_VERSION,
-            registry,
-            lists,
-            advisories,
-        };
-        apply_limits(&mut block);
-        block
+        ListRecord {
+            at: entry.stored_at,
+            total: entry.value.len(),
+            ids: first.iter().map(|listed| listed.id.clone()).collect(),
+        }
     }
 
     /// Builds the record of the advisory named by `listed`, when its details and ranges are cached.
@@ -222,10 +242,21 @@ impl Cache {
     /// A record older than [`STALE_MAX_AGE_SECS`] at `now` is skipped. An entry that the cache
     /// already holds is kept. The TTL still decides later whether a loaded record is fresh.
     pub fn import_block(&mut self, ecosystem: Ecosystem, block: Block, now: u64) {
-        // A record dated after `now` (the clock moved back) counts as age zero.
-        let is_recent = |at: u64| now.saturating_sub(at) <= STALE_MAX_AGE_SECS;
-        for (name, record) in block.registry {
-            if !is_recent(record.at) {
+        self.import_registry(ecosystem, block.registry, now);
+        // Advisories first, so that the lists can name their records.
+        let loaded = self.import_advisories(ecosystem, block.advisories, now);
+        self.import_lists(ecosystem, block.lists, &loaded, now);
+    }
+
+    /// Loads the recent registry records of a block.
+    fn import_registry(
+        &mut self,
+        ecosystem: Ecosystem,
+        registry: HashMap<String, RegistryRecord>,
+        now: u64,
+    ) {
+        for (name, record) in registry {
+            if !is_recent(record.at, now) {
                 continue;
             }
             self.version_info
@@ -237,75 +268,112 @@ impl Cache {
                         latest: record.latest,
                         versions: record.all,
                     },
-                    stored_at: record.at.min(now),
+                    stored_at: stored_at_on_load(record.at, now),
                 });
         }
-        // Advisories first, so that the lists can name their records.
+    }
+
+    /// Loads the recent advisory records of a block. Returns the loaded advisories, by id.
+    fn import_advisories(
+        &mut self,
+        ecosystem: Ecosystem,
+        advisories: HashMap<String, AdvisoryRecord>,
+        now: u64,
+    ) -> HashMap<String, Vulnerability> {
         let mut loaded: HashMap<String, Vulnerability> = HashMap::new();
-        for (id, record) in block.advisories {
+        for (id, record) in advisories {
             // The id goes into links and requests, so a damaged one is not trusted.
-            if !is_recent(record.at) || !is_valid_advisory_id(&id) {
+            if !is_recent(record.at, now) || !is_valid_advisory_id(&id) {
                 continue;
             }
-            let advisory = Vulnerability {
-                id: id.clone(),
-                severity: record.severity,
-                summary: record.summary,
-                url: Some(advisory_url(&id)),
-            };
-            let affected: Vec<Affected> = record
-                .affected
-                .into_iter()
-                .map(|entry| Affected {
-                    ecosystem: ecosystem.osv_name().to_owned(),
-                    name: entry.name,
-                    ranges: entry.ranges,
-                    versions: entry.versions,
-                })
-                .collect();
-            // A record dated after `now` (a clock that ran ahead) is dated `now`, so it is checked again in time.
-            let stored_at = record.at.min(now);
-            self.advisories.entry(id.clone()).or_insert(Entry {
-                value: advisory.clone(),
-                stored_at,
-            });
-            // A record that the network gave is complete. One that the disk gave holds the entries of
-            // one ecosystem, so it must not stand for the others (see `has_affected_for`).
-            if !self.has_complete_affected(&id) {
-                self.partial_affected
-                    .entry(id.clone())
-                    .or_default()
-                    .insert(ecosystem);
-            }
-            // An advisory can name packages of several ecosystems, one block each: merge them.
-            match self.affected.entry(id.clone()) {
-                MapEntry::Occupied(mut known) => {
-                    for entry in affected {
-                        if !known.get().value.contains(&entry) {
-                            known.get_mut().value.push(entry);
-                        }
-                    }
-                }
-                MapEntry::Vacant(slot) => {
-                    slot.insert(Entry {
-                        value: affected,
-                        stored_at,
-                    });
-                }
-            }
-            if let Some(revision) = record.revision {
-                self.revisions.entry(id.clone()).or_insert(revision);
-            }
+            let advisory = self.import_advisory(ecosystem, &id, record, now);
             loaded.insert(id, advisory);
         }
+        loaded
+    }
+
+    /// Loads one advisory record of the block of `ecosystem`: its details, its affected ranges and
+    /// its revision. Returns the advisory.
+    fn import_advisory(
+        &mut self,
+        ecosystem: Ecosystem,
+        id: &str,
+        record: AdvisoryRecord,
+        now: u64,
+    ) -> Vulnerability {
+        let advisory = Vulnerability {
+            id: id.to_owned(),
+            severity: record.severity,
+            summary: record.summary,
+            url: Some(advisory_url(id)),
+        };
+        let affected: Vec<Affected> = record
+            .affected
+            .into_iter()
+            .map(|entry| Affected {
+                ecosystem: ecosystem.osv_name().to_owned(),
+                name: entry.name,
+                ranges: entry.ranges,
+                versions: entry.versions,
+            })
+            .collect();
+        let stored_at = stored_at_on_load(record.at, now);
+        self.advisories.entry(id.to_owned()).or_insert(Entry {
+            value: advisory.clone(),
+            stored_at,
+        });
+        // A record that the network gave is complete. One that the disk gave holds the entries of
+        // one ecosystem, so it must not stand for the others (see `has_affected_for`).
+        if !self.has_complete_affected(id) {
+            self.partial_affected
+                .entry(id.to_owned())
+                .or_default()
+                .insert(ecosystem);
+        }
+        self.merge_affected(id, affected, stored_at);
+        if let Some(revision) = record.revision {
+            self.revisions.entry(id.to_owned()).or_insert(revision);
+        }
+        advisory
+    }
+
+    /// Adds the `affected` entries of one block to those that the cache holds for the advisory `id`.
+    ///
+    /// An advisory can name packages of several ecosystems, one block each: their entries add up.
+    fn merge_affected(&mut self, id: &str, affected: Vec<Affected>, stored_at: u64) {
+        match self.affected.entry(id.to_owned()) {
+            MapEntry::Occupied(mut known) => {
+                for entry in affected {
+                    if !known.get().value.contains(&entry) {
+                        known.get_mut().value.push(entry);
+                    }
+                }
+            }
+            MapEntry::Vacant(slot) => {
+                slot.insert(Entry {
+                    value: affected,
+                    stored_at,
+                });
+            }
+        }
+    }
+
+    /// Loads the recent vulnerability lists of a block, with the `loaded` advisories they name.
+    fn import_lists(
+        &mut self,
+        ecosystem: Ecosystem,
+        lists: HashMap<String, HashMap<String, ListRecord>>,
+        loaded: &HashMap<String, Vulnerability>,
+        now: u64,
+    ) {
         let mut budget = MAX_IMPORTED_ENTRIES;
-        for (package, versions) in block.lists {
+        for (package, versions) in lists {
             for (version, record) in versions {
-                if !is_recent(record.at) {
+                if !is_recent(record.at, now) {
                     continue;
                 }
                 // A list that is too long for the limits is not loaded, so the next lookup builds it again.
-                let Some(list) = rebuild_list(&record, &loaded, &mut budget) else {
+                let Some(list) = rebuild_list(&record, loaded, &mut budget) else {
                     continue;
                 };
                 self.vulnerabilities
@@ -316,11 +384,23 @@ impl Cache {
                     .entry(version)
                     .or_insert(Entry {
                         value: list,
-                        stored_at: record.at.min(now),
+                        stored_at: stored_at_on_load(record.at, now),
                     });
             }
         }
     }
+}
+
+/// Returns `true` when a record stored at `at` is young enough to load at `now`.
+fn is_recent(at: u64, now: u64) -> bool {
+    // A record dated after `now` (the clock moved back) counts as age zero.
+    now.saturating_sub(at) <= STALE_MAX_AGE_SECS
+}
+
+/// The stored time that a record stored at `at` keeps once loaded at `now`.
+fn stored_at_on_load(at: u64, now: u64) -> u64 {
+    // A record dated after `now` (a clock that ran ahead) is dated `now`, so it is checked again in time.
+    at.min(now)
 }
 
 /// The serialized size of a record under `key`, with a few bytes for the quotes and separators.
@@ -365,6 +445,24 @@ enum Place {
 /// leave oldest first, and an advisory leaves with the last list that names it.
 /// A list holds at most ten ids, so only the other records can exceed the entry limit.
 fn apply_limits(block: &mut Block) {
+    let sizes = measure_records(block);
+    remove_oldest_records(block, sizes);
+}
+
+/// What [`apply_limits`] learns of a block in its one measuring pass.
+struct BlockSizes {
+    /// The serialized size of every record that stays in the block.
+    total: usize,
+    /// The registry answers and lists, each with its size.
+    removable: Vec<Removable>,
+    /// The serialized size of each advisory record.
+    advisory_sizes: HashMap<String, usize>,
+    /// How many lists name each advisory: an advisory leaves with its last list.
+    references: HashMap<String, usize>,
+}
+
+/// Drops the records over [`MAX_ENTRY_BYTES`] and measures the others.
+fn measure_records(block: &mut Block) -> BlockSizes {
     // Each record is measured once here and its size is kept, so no removal serializes it again.
     let mut total = 0;
     let mut removable: Vec<Removable> = Vec::new();
@@ -391,7 +489,6 @@ fn apply_limits(block: &mut Block) {
         advisory_sizes.insert(id.clone(), size);
         true
     });
-    // How many lists name each advisory: an advisory leaves with its last list.
     let mut references: HashMap<String, usize> = HashMap::new();
     for (package, versions) in &block.lists {
         for (version, record) in versions {
@@ -407,6 +504,23 @@ fn apply_limits(block: &mut Block) {
             }
         }
     }
+    BlockSizes {
+        total,
+        removable,
+        advisory_sizes,
+        references,
+    }
+}
+
+/// Removes the oldest registry answers and lists until the block fits in [`MAX_BLOCK_BYTES`].
+/// An advisory leaves with the last list that names it.
+fn remove_oldest_records(block: &mut Block, sizes: BlockSizes) {
+    let BlockSizes {
+        mut total,
+        mut removable,
+        advisory_sizes,
+        mut references,
+    } = sizes;
     removable.sort_unstable_by_key(|record| record.at);
     for record in removable {
         if total <= MAX_BLOCK_BYTES {
@@ -418,13 +532,9 @@ fn apply_limits(block: &mut Block) {
                 block.registry.remove(&name);
             }
             Place::List(package, version) => {
-                let versions = block.lists.entry(package.clone()).or_default();
-                let Some(removed) = versions.remove(&version) else {
+                let Some(removed) = remove_list(&mut block.lists, &package, &version) else {
                     continue;
                 };
-                if versions.is_empty() {
-                    block.lists.remove(&package);
-                }
                 for id in &removed.ids {
                     let Some(count) = references.get_mut(id) else {
                         continue;
@@ -438,6 +548,20 @@ fn apply_limits(block: &mut Block) {
             }
         }
     }
+}
+
+/// Removes the list of `package` at `version`, and the package when it has no list left.
+fn remove_list(
+    lists: &mut HashMap<String, HashMap<String, ListRecord>>,
+    package: &str,
+    version: &str,
+) -> Option<ListRecord> {
+    let versions = lists.entry(package.to_owned()).or_default();
+    let removed = versions.remove(version)?;
+    if versions.is_empty() {
+        lists.remove(package);
+    }
+    Some(removed)
 }
 
 /// Rebuilds a vulnerability list: the advisory of each stored id when its record is `loaded`, else
