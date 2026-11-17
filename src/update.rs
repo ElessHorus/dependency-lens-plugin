@@ -101,7 +101,7 @@ impl UpdateVersion for MavenVersion {
     }
 
     fn release_segments(&self) -> Cow<'_, [u64]> {
-        Cow::Borrowed(self.release())
+        Cow::Owned(self.release())
     }
 }
 

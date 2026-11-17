@@ -60,9 +60,12 @@ impl Item {
                 Item::Number(_) if self.is_null() => Ordering::Equal,
                 Item::Number(_) => Ordering::Greater,
                 Item::Qualifier(qualifier) => qualifier.cmp(&RELEASE),
+                // All the items count, not only the first one (Maven 3.9, MNG-6964): `1-0.1` is newer than `1`.
                 Item::List(items) => items
-                    .first()
-                    .map_or(Ordering::Equal, |first| first.compare_to(None)),
+                    .iter()
+                    .map(|item| item.compare_to(None))
+                    .find(|ordering| ordering.is_ne())
+                    .unwrap_or(Ordering::Equal),
             };
         };
         match (self, other) {
@@ -145,12 +148,17 @@ fn item_of(is_digit: bool, text: &str) -> Item {
     }
 }
 
+/// Opens a sub-list: `current` joins `ancestors` and a new empty list receives the next items.
+fn open_sublist(current: &mut Vec<Item>, ancestors: &mut Vec<Vec<Item>>) {
+    ancestors.push(std::mem::take(current));
+}
+
 /// A parsed Maven version such as `2.15.0`, `9.0.0.M1` or `2.2.11.RELEASE`.
 #[derive(Clone, Debug)]
 pub struct MavenVersion {
     items: Vec<Item>,
-    /// The leading numbers as written, such as `[9, 0, 0]` for `9.0.0.M1`. `items` has dropped the zeros at its end.
-    release: Vec<u64>,
+    /// The lowercased text. `items` has dropped the zeros at its end, and `release` reads them back from here.
+    text: String,
 }
 
 impl MavenVersion {
@@ -163,12 +171,12 @@ impl MavenVersion {
             return None;
         }
         let lowered = trimmed.to_ascii_lowercase();
-        // The last list is the one that receives items. A sub-list joins its parent when the text ends.
-        let mut lists: Vec<Vec<Item>> = vec![Vec::new()];
+        // `current` receives the items. Each sub-list joins its parent when the text ends.
+        let mut current: Vec<Item> = Vec::new();
+        let mut ancestors: Vec<Vec<Item>> = Vec::new();
         let mut is_digit = false;
         let mut start = 0;
         for (index, byte) in lowered.bytes().enumerate() {
-            let current = lists.last_mut()?;
             match byte {
                 b'.' | b'-' => {
                     current.push(if index == start {
@@ -178,21 +186,18 @@ impl MavenVersion {
                     });
                     start = index + 1;
                     if byte == b'-' {
-                        lists.push(Vec::new());
+                        open_sublist(&mut current, &mut ancestors);
                     }
                 }
                 b'0'..=b'9' => {
                     if !is_digit && index > start {
                         // `1.0.0.X1` sorts like `1.0.0-X1`: a qualifier before a digit opens a sub-list.
-                        let current = if current.is_empty() {
-                            current
-                        } else {
-                            lists.push(Vec::new());
-                            lists.last_mut()?
-                        };
+                        if !current.is_empty() {
+                            open_sublist(&mut current, &mut ancestors);
+                        }
                         current.push(Item::Qualifier(qualifier_of(&lowered[start..index], true)));
                         start = index;
-                        lists.push(Vec::new());
+                        open_sublist(&mut current, &mut ancestors);
                     }
                     is_digit = true;
                 }
@@ -200,35 +205,29 @@ impl MavenVersion {
                     if is_digit && index > start {
                         current.push(item_of(true, &lowered[start..index]));
                         start = index;
-                        lists.push(Vec::new());
+                        open_sublist(&mut current, &mut ancestors);
                     }
                     is_digit = false;
                 }
             }
         }
         if start < lowered.len() {
-            if !is_digit && !lists.last()?.is_empty() {
-                lists.push(Vec::new());
+            if !is_digit && !current.is_empty() {
+                open_sublist(&mut current, &mut ancestors);
             }
-            lists.last_mut()?.push(item_of(is_digit, &lowered[start..]));
+            current.push(item_of(is_digit, &lowered[start..]));
         }
-        // The top list still holds its zeros here: they are the release as written.
-        let release = lists[0]
-            .iter()
-            .map_while(|item| match item {
-                Item::Number(Number::Small(number)) => Some(*number),
-                _ => None,
-            })
-            .collect();
-        let mut items = Vec::new();
-        while let Some(mut list) = lists.pop() {
-            normalize(&mut list);
-            match lists.last_mut() {
-                Some(parent) => parent.push(Item::List(list)),
-                None => items = list,
-            }
+        // Close the lists from the innermost one: each is normalized, then joins its parent.
+        while let Some(mut parent) = ancestors.pop() {
+            normalize(&mut current);
+            parent.push(Item::List(current));
+            current = parent;
         }
-        Some(MavenVersion { items, release })
+        normalize(&mut current);
+        Some(MavenVersion {
+            items: current,
+            text: lowered,
+        })
     }
 
     /// Returns `true` when the first qualifier is below the release one, such as `alpha`, `M1` or `SNAPSHOT`.
@@ -244,9 +243,29 @@ impl MavenVersion {
         }
     }
 
-    /// Returns the leading numbers, such as `[2, 15, 0]`.
-    pub fn release(&self) -> &[u64] {
-        &self.release
+    /// Returns the leading numbers as written, such as `[9, 0, 0]` for `9.0.0.M1`.
+    ///
+    /// It reads the text again, so that `parse` keeps no second list. As in `parse`, an empty segment
+    /// is a zero, except the one after the last `.`: a qualifier or the end of the text follows it.
+    pub fn release(&self) -> Vec<u64> {
+        let numbers_end = self
+            .text
+            .find(|character: char| !(character.is_ascii_digit() || character == '.'))
+            .unwrap_or(self.text.len());
+        let mut segments = self.text[..numbers_end].split('.').peekable();
+        let mut numbers = Vec::new();
+        while let Some(segment) = segments.next() {
+            let is_last = segments.peek().is_none();
+            match segment {
+                "" if is_last => break,
+                "" => numbers.push(0),
+                digits => match digits.parse() {
+                    Ok(number) => numbers.push(number),
+                    Err(_) => break,
+                },
+            }
+        }
+        numbers
     }
 }
 
@@ -386,5 +405,29 @@ mod tests {
         ] {
             assert!(MavenVersion::parse(text).is_some(), "{text}");
         }
+    }
+
+    #[test]
+    fn a_sublist_is_compared_with_a_missing_item_by_all_its_items() {
+        // Maven 3.9 (MNG-6964): `1-0.1` holds a `0` first, but its `1` still makes it newer than `1`.
+        assert_ascending(&["1", "1-0.1"]);
+        assert_ascending(&["1.0-0.0.1", "1.0-1"]);
+        assert_eq!(version("1-0.0"), version("1"));
+    }
+
+    #[test]
+    fn release_stops_at_the_first_qualifier_hyphen_or_overflow() {
+        assert_eq!(version("1.0-1").release(), [1, 0]);
+        assert_eq!(version("2.5.7.SR0").release(), [2, 5, 7]);
+        assert!(version("alpha1").release().is_empty());
+        assert_eq!(version("1.99999999999999999999.3").release(), [1]);
+    }
+
+    #[test]
+    fn release_reads_an_empty_segment_as_zero_like_the_parser() {
+        assert_eq!(version(".1").release(), [0, 1]);
+        assert_eq!(version("1..2").release(), [1, 0, 2]);
+        assert_eq!(version("1.0.").release(), [1, 0]);
+        assert_eq!(version("9.0.0.M1").release(), [9, 0, 0]);
     }
 }
