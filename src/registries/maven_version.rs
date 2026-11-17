@@ -75,14 +75,17 @@ impl Item {
 
 /// Compares two lists item by item. The shorter list ends with missing items.
 fn compare_lists(left: &[Item], right: &[Item]) -> Ordering {
-    (0..left.len().max(right.len()))
-        .map(|index| match (left.get(index), right.get(index)) {
+    for index in 0..left.len().max(right.len()) {
+        let ordering = match (left.get(index), right.get(index)) {
             (Some(left_item), right_item) => left_item.compare_to(right_item),
             (None, Some(right_item)) => right_item.compare_to(None).reverse(),
-            (None, None) => Ordering::Equal,
-        })
-        .find(|ordering| ordering.is_ne())
-        .unwrap_or(Ordering::Equal)
+            (None, None) => unreachable!("the index is below the longer length"),
+        };
+        if ordering.is_ne() {
+            return ordering;
+        }
+    }
+    Ordering::Equal
 }
 
 /// Removes the null items at the end of `items`, looking through the sub-lists that stay.
@@ -267,7 +270,6 @@ impl Eq for MavenVersion {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cmp::Ordering;
 
     fn version(text: &str) -> MavenVersion {
         MavenVersion::parse(text).unwrap_or_else(|| panic!("`{text}` should parse"))
@@ -372,5 +374,82 @@ mod tests {
     fn release_gives_the_leading_integers() {
         assert_eq!(version("2.15.0").release(), [2, 15, 0]);
         assert_eq!(version("9.0.0.M1").release(), [9, 0, 0]);
+    }
+
+    #[test]
+    fn odd_separators_and_non_ascii_text_parse_without_panic() {
+        for text in [
+            "-1", "1..2", "1--2", "1-", "1.", ".", "-", "é1", "1é", "1-é",
+        ] {
+            assert!(MavenVersion::parse(text).is_some(), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_order_is_transitive_on_a_pool_of_real_shapes() {
+        // `sort_by` may panic on an order that is not total, so a broken triple must show up here.
+        let pool: Vec<MavenVersion> = [
+            "0",
+            "1",
+            "1.0",
+            "1.0.0",
+            "1.0.1",
+            "1.1",
+            "2",
+            "1-alpha",
+            "1-alpha1",
+            "1-alpha-1",
+            "1-beta",
+            "1-beta2",
+            "1-m1",
+            "1.0.M1",
+            "1.0.0.M1",
+            "1-rc1",
+            "1-cr1",
+            "1-snapshot",
+            "1.0-SNAPSHOT",
+            "1-ga",
+            "1.0.RELEASE",
+            "1-final",
+            "1-sp",
+            "1-sp1",
+            "1.0.SR0",
+            "1.0.SR1",
+            "1-abc",
+            "1-abc1",
+            "1-1",
+            "1-1-snapshot",
+            "1-2",
+            "1.0-1",
+            "1.0.1-1",
+            "2.5.7.SR0",
+            "2.5.7",
+            "2.5.8",
+            "9.0.0.M1",
+            "9.0.0.RELEASE",
+            "alpha",
+            "a1",
+            "-1",
+            "1..2",
+            "1.a",
+            "1.a1",
+            "1.0.0-a-1",
+            "11.a2",
+            "11b",
+            "11",
+            "11m",
+        ]
+        .into_iter()
+        .map(version)
+        .collect();
+        for left in &pool {
+            for middle in &pool {
+                for right in &pool {
+                    if left <= middle && middle <= right {
+                        assert!(left <= right, "{left:?} <= {middle:?} <= {right:?}");
+                    }
+                }
+            }
+        }
     }
 }

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use crate::model::{Affected, Ecosystem, RangeEvent};
 use crate::registries::dotted::{DottedVersion, PubVersion, segment};
 use crate::registries::gem_version::GemVersion;
+use crate::registries::maven_version::MavenVersion;
 use crate::registries::pep440::Pep440;
 use crate::update::{UpdateVersion, split_operator};
 
@@ -67,6 +68,9 @@ pub fn fixed_version(
         }
         Ecosystem::Pub => {
             fixed_version_of::<PubVersion>(eco, package, current, affected).map(|(_, text)| text)
+        }
+        Ecosystem::Maven => {
+            fixed_version_of::<MavenVersion>(eco, package, current, affected).map(|(_, text)| text)
         }
         _ => {
             fixed_version_of::<DottedVersion>(eco, package, current, affected).map(|(_, text)| text)
@@ -147,6 +151,7 @@ pub fn plan_fix(
         Ecosystem::PyPI => plan_fix_of::<Pep440>(eco, package, current, advisories, allows),
         Ecosystem::RubyGems => plan_fix_of::<GemVersion>(eco, package, current, advisories, allows),
         Ecosystem::Pub => plan_fix_of::<PubVersion>(eco, package, current, advisories, allows),
+        Ecosystem::Maven => plan_fix_of::<MavenVersion>(eco, package, current, advisories, allows),
         _ => plan_fix_of::<DottedVersion>(eco, package, current, advisories, allows),
     }
 }
@@ -492,6 +497,7 @@ pub fn satisfies_all(eco: Ecosystem, target: &str, constraints: &[Constraint]) -
         Ecosystem::PyPI => satisfies_all_of::<Pep440>(target, constraints),
         Ecosystem::RubyGems => satisfies_all_of::<GemVersion>(target, constraints),
         Ecosystem::Pub => satisfies_all_of::<PubVersion>(target, constraints),
+        Ecosystem::Maven => satisfies_all_of::<MavenVersion>(target, constraints),
         _ => satisfies_all_of::<DottedVersion>(target, constraints),
     }
 }
@@ -536,6 +542,7 @@ pub fn render_fix(eco: Ecosystem, declared: &str, target: &str) -> Option<String
         Ecosystem::PyPI => render_fix_of::<Pep440>(declared, target),
         Ecosystem::RubyGems => render_fix_of::<GemVersion>(declared, target),
         Ecosystem::Pub => render_fix_of::<PubVersion>(declared, target),
+        Ecosystem::Maven => render_fix_of::<MavenVersion>(declared, target),
         _ => render_fix_of::<DottedVersion>(declared, target),
     }
 }
@@ -1276,6 +1283,100 @@ mod tests {
         );
         assert_eq!(
             fixed_version(Ecosystem::Pub, "demo", "0.4.0+2", &pub_package),
+            None
+        );
+    }
+
+    #[test]
+    fn a_maven_range_with_a_milestone_start_is_read() {
+        // The `introduced` is a milestone: an unreadable one would hide the whole interval.
+        let advisory = affected(
+            "Maven",
+            "org.example:lib",
+            &[&[("introduced", "9.0.0.M1"), ("fixed", "9.0.0.RELEASE")]],
+        );
+        let plan = plan_fix(
+            Ecosystem::Maven,
+            "org.example:lib",
+            "9.0.0.M2",
+            &[&advisory],
+            |_| true,
+        )
+        .expect("a fix");
+        assert_eq!(plan.target, "9.0.0.RELEASE");
+        assert_eq!((plan.fixed_count, plan.total_count), (1, 1));
+    }
+
+    #[test]
+    fn a_maven_release_suffix_is_ordered_as_maven_does() {
+        let advisory = affected(
+            "Maven",
+            "org.example:lib",
+            &[&[("introduced", "2.2.0.RELEASE"), ("fixed", "2.2.12.RELEASE")]],
+        );
+        assert_eq!(
+            fixed_version(
+                Ecosystem::Maven,
+                "org.example:lib",
+                "2.2.11.RELEASE",
+                &advisory
+            )
+            .as_deref(),
+            Some("2.2.12.RELEASE")
+        );
+        assert_eq!(
+            fixed_version(
+                Ecosystem::Maven,
+                "org.example:lib",
+                "2.2.12.RELEASE",
+                &advisory
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_service_release_is_above_its_base_version() {
+        let advisory = affected(
+            "Maven",
+            "org.example:lib",
+            &[&[("introduced", "0"), ("fixed", "2.5.7.SR1")]],
+        );
+        for current in ["2.5.7", "2.5.7.SR0"] {
+            assert_eq!(
+                fixed_version(Ecosystem::Maven, "org.example:lib", current, &advisory).as_deref(),
+                Some("2.5.7.SR1"),
+                "{current}"
+            );
+        }
+    }
+
+    #[test]
+    fn maven_satisfies_all_and_render_fix_use_maven_order() {
+        let below_next_minor = [Constraint {
+            operator: "<".to_owned(),
+            version: "2.3".to_owned(),
+        }];
+        assert!(satisfies_all(
+            Ecosystem::Maven,
+            "2.2.12.RELEASE",
+            &below_next_minor
+        ));
+        assert!(!satisfies_all(
+            Ecosystem::Maven,
+            "2.3.0.M1.1",
+            &[Constraint {
+                operator: "<".to_owned(),
+                version: "2.3.0.M1".to_owned(),
+            }]
+        ));
+        assert_eq!(
+            render_fix(Ecosystem::Maven, "2.2.11.RELEASE", "2.2.12.RELEASE").as_deref(),
+            Some("2.2.12.RELEASE")
+        );
+        // A milestone is older than its release, so it is no fix for the release.
+        assert_eq!(
+            render_fix(Ecosystem::Maven, "9.0.0.RELEASE", "9.0.0.M1"),
             None
         );
     }

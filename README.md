@@ -123,6 +123,7 @@ Add the package name to `ignore`, for example `["serde", "left-pad"]`. The name 
 ## Limitations
 
 - For Cargo, npm, Go and Maven, the plugin shows no version hint and no update to the latest release. It still offers the fix for a vulnerability.
+- For a Maven dependency, the fix orders versions as Maven does, including text qualifiers such as `RELEASE`, `M1` and `SR0`.
 - The plugin checks the version declared in the manifest, not a lockfile.
 - For a requirement with a range (`^1.2`, `>=2.0`, `||`), the plugin checks the lower bound of the first alternative. A newer release is then shown as outdated against that bound.
 - The first lookup of a large manifest takes seconds. The lookups run one after another. The status bar shows the progress, and you can cancel the task. Each chunk of 20 lookups shows its results before the next chunk starts. After a five-minute soft cap, the entries that still show `…` finish on the next open, save or "Dependency Lens: Refresh" of their manifest.
