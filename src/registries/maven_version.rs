@@ -53,21 +53,23 @@ impl Item {
         }
     }
 
-    /// Compares with `other`, where `None` is the missing item of a shorter list.
-    fn compare_to(&self, other: Option<&Item>) -> Ordering {
-        let Some(other) = other else {
-            return match self {
-                Item::Number(_) if self.is_null() => Ordering::Equal,
-                Item::Number(_) => Ordering::Greater,
-                Item::Qualifier(qualifier) => qualifier.cmp(&RELEASE),
-                // All the items count, not only the first one (Maven 3.9, MNG-6964): `1-0.1` is newer than `1`.
-                Item::List(items) => items
-                    .iter()
-                    .map(|item| item.compare_to(None))
-                    .find(|ordering| ordering.is_ne())
-                    .unwrap_or(Ordering::Equal),
-            };
-        };
+    /// Compares with the missing item at the same position of a shorter list.
+    fn compare_to_missing(&self) -> Ordering {
+        match self {
+            Item::Number(_) if self.is_null() => Ordering::Equal,
+            Item::Number(_) => Ordering::Greater,
+            Item::Qualifier(qualifier) => qualifier.cmp(&RELEASE),
+            // All the items count, not only the first one (Maven 3.9, MNG-6964): `1-0.1` is newer than `1`.
+            Item::List(items) => items
+                .iter()
+                .map(Item::compare_to_missing)
+                .find(|ordering| ordering.is_ne())
+                .unwrap_or(Ordering::Equal),
+        }
+    }
+
+    /// Compares with `other`, the item at the same position of the other list.
+    fn compare_to(&self, other: &Item) -> Ordering {
         match (self, other) {
             (Item::Number(left), Item::Number(right)) => left.cmp(right),
             (Item::Qualifier(left), Item::Qualifier(right)) => left.cmp(right),
@@ -83,8 +85,9 @@ impl Item {
 fn compare_lists(left: &[Item], right: &[Item]) -> Ordering {
     for index in 0..left.len().max(right.len()) {
         let ordering = match (left.get(index), right.get(index)) {
-            (Some(left_item), right_item) => left_item.compare_to(right_item),
-            (None, Some(right_item)) => right_item.compare_to(None).reverse(),
+            (Some(left_item), Some(right_item)) => left_item.compare_to(right_item),
+            (Some(left_item), None) => left_item.compare_to_missing(),
+            (None, Some(right_item)) => right_item.compare_to_missing().reverse(),
             (None, None) => unreachable!("the index is below the longer length"),
         };
         if ordering.is_ne() {
@@ -148,9 +151,39 @@ fn item_of(is_digit: bool, text: &str) -> Item {
     }
 }
 
-/// Opens a sub-list: `current` joins `ancestors` and a new empty list receives the next items.
-fn open_sublist(current: &mut Vec<Item>, ancestors: &mut Vec<Vec<Item>>) {
-    ancestors.push(std::mem::take(current));
+/// The nested lists that `parse` fills, from the outermost one to the innermost open one.
+#[derive(Default)]
+struct ListBuilder {
+    /// The innermost open list. It receives the next items.
+    current: Vec<Item>,
+    /// The lists that enclose `current`. Each sub-list joins its parent only when the text ends.
+    ancestors: Vec<Vec<Item>>,
+}
+
+impl ListBuilder {
+    fn push(&mut self, item: Item) {
+        self.current.push(item);
+    }
+
+    fn has_items(&self) -> bool {
+        !self.current.is_empty()
+    }
+
+    /// Opens a sub-list: `current` joins `ancestors` and a new empty list receives the next items.
+    fn open_sublist(&mut self) {
+        self.ancestors.push(std::mem::take(&mut self.current));
+    }
+
+    /// Closes the lists from the innermost one: each is normalized, then joins its parent.
+    fn finish(mut self) -> Vec<Item> {
+        while let Some(mut parent) = self.ancestors.pop() {
+            normalize(&mut self.current);
+            parent.push(Item::List(self.current));
+            self.current = parent;
+        }
+        normalize(&mut self.current);
+        self.current
+    }
 }
 
 /// A parsed Maven version such as `2.15.0`, `9.0.0.M1` or `2.2.11.RELEASE`.
@@ -171,76 +204,72 @@ impl MavenVersion {
             return None;
         }
         let lowered = trimmed.to_ascii_lowercase();
-        // `current` receives the items. Each sub-list joins its parent when the text ends.
-        let mut current: Vec<Item> = Vec::new();
-        let mut ancestors: Vec<Vec<Item>> = Vec::new();
+        let mut lists = ListBuilder::default();
+        // `is_digit` tells the kind of the part that starts at `start`: digits or letters.
         let mut is_digit = false;
         let mut start = 0;
         for (index, byte) in lowered.bytes().enumerate() {
+            let is_part_open = index > start;
             match byte {
                 b'.' | b'-' => {
-                    current.push(if index == start {
-                        Item::ZERO
-                    } else {
+                    lists.push(if is_part_open {
                         item_of(is_digit, &lowered[start..index])
+                    } else {
+                        Item::ZERO
                     });
                     start = index + 1;
                     if byte == b'-' {
-                        open_sublist(&mut current, &mut ancestors);
+                        lists.open_sublist();
                     }
                 }
                 b'0'..=b'9' => {
-                    if !is_digit && index > start {
+                    let is_qualifier_before_digit = !is_digit && is_part_open;
+                    if is_qualifier_before_digit {
                         // `1.0.0.X1` sorts like `1.0.0-X1`: a qualifier before a digit opens a sub-list.
-                        if !current.is_empty() {
-                            open_sublist(&mut current, &mut ancestors);
+                        if lists.has_items() {
+                            lists.open_sublist();
                         }
-                        current.push(Item::Qualifier(qualifier_of(&lowered[start..index], true)));
+                        lists.push(Item::Qualifier(qualifier_of(&lowered[start..index], true)));
                         start = index;
-                        open_sublist(&mut current, &mut ancestors);
+                        lists.open_sublist();
                     }
                     is_digit = true;
                 }
                 _ => {
-                    if is_digit && index > start {
-                        current.push(item_of(true, &lowered[start..index]));
+                    let is_number_before_letter = is_digit && is_part_open;
+                    if is_number_before_letter {
+                        lists.push(Item::Number(number_of(&lowered[start..index])));
                         start = index;
-                        open_sublist(&mut current, &mut ancestors);
+                        lists.open_sublist();
                     }
                     is_digit = false;
                 }
             }
         }
         if start < lowered.len() {
-            if !is_digit && !current.is_empty() {
-                open_sublist(&mut current, &mut ancestors);
+            if !is_digit && lists.has_items() {
+                lists.open_sublist();
             }
-            current.push(item_of(is_digit, &lowered[start..]));
+            lists.push(item_of(is_digit, &lowered[start..]));
         }
-        // Close the lists from the innermost one: each is normalized, then joins its parent.
-        while let Some(mut parent) = ancestors.pop() {
-            normalize(&mut current);
-            parent.push(Item::List(current));
-            current = parent;
-        }
-        normalize(&mut current);
         Some(MavenVersion {
-            items: current,
+            items: lists.finish(),
             text: lowered,
         })
     }
 
     /// Returns `true` when the first qualifier is below the release one, such as `alpha`, `M1` or `SNAPSHOT`.
     pub fn is_prerelease(&self) -> bool {
-        let is_below_release = |item: Option<&Item>| matches!(item, Some(Item::Qualifier(qualifier)) if *qualifier < RELEASE);
-        match self
+        let first_non_number = self
             .items
             .iter()
-            .find(|item| !matches!(item, Item::Number(_)))
-        {
-            Some(Item::List(items)) => is_below_release(items.first()),
-            first => is_below_release(first),
-        }
+            .find(|item| !matches!(item, Item::Number(_)));
+        // A qualifier after a number opens a sub-list, so the qualifier can be the first item of it.
+        let first_qualifier_candidate = match first_non_number {
+            Some(Item::List(sublist)) => sublist.first(),
+            other => other,
+        };
+        matches!(first_qualifier_candidate, Some(Item::Qualifier(qualifier)) if *qualifier < RELEASE)
     }
 
     /// Returns the leading numbers as written, such as `[9, 0, 0]` for `9.0.0.M1`.
