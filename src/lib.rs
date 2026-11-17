@@ -15,7 +15,7 @@ pub mod store;
 pub mod text;
 pub mod update;
 
-use crate::analysis::{Analysis, Budget, Status, analyze};
+use crate::analysis::{Analysis, Budget, Entry, Status, analyze};
 use crate::cache::Cache;
 use crate::cache::persist::{Block, STALE_MAX_AGE_SECS, decode_block, encode_block};
 use crate::http::HostHttp;
@@ -387,12 +387,14 @@ impl DependencyLens {
                 // chunk, what the editor shows is already a published result, so it stays as it is.
                 return previous_pending.is_some().then_some(0);
             }
+            let cache = &self.cache;
             publish_over_old_data(
                 path,
                 text,
                 &analysis,
                 old_data.as_ref(),
                 self.settings.outdated_problems,
+                |entry| has_vulnerability_answer(cache, eco, entry, run_started_at),
             );
             self.save_blocks(&HostStore);
             let pending = analysis.pending;
@@ -455,16 +457,18 @@ fn publish_analysis(path: &str, text: &str, analysis: &Analysis, outdated_proble
 /// Publishes `analysis` like [`publish_analysis`], with `old_data` shown for the entries that still wait.
 ///
 /// An entry that still waits keeps what the old data showed for it until its answer comes.
+/// `has_answer` tells whether OSV already answered for an entry, whose advisories are then kept.
 fn publish_over_old_data(
     path: &str,
     text: &str,
     analysis: &Analysis,
     old_data: Option<&Analysis>,
     outdated_problems: bool,
+    has_answer: impl Fn(&Entry) -> bool,
 ) {
     let shown = old_data
         .filter(|_| analysis.pending > 0)
-        .map(|old| fill_pending_from_old(analysis, old));
+        .map(|old| fill_pending_from_old(analysis, old, has_answer));
     publish_analysis(
         path,
         text,
@@ -473,11 +477,28 @@ fn publish_over_old_data(
     );
 }
 
+/// Whether the cache holds a fresh OSV answer for the checked version of `entry`.
+fn has_vulnerability_answer(cache: &Cache, eco: Ecosystem, entry: &Entry, now: u64) -> bool {
+    entry.checked_version.as_deref().is_some_and(|version| {
+        cache
+            .vulnerabilities(eco, &entry.dependency.name, version, now)
+            .is_some()
+    })
+}
+
 /// Returns `analysis` with each entry that still waits replaced by what `old` showed for it.
+///
+/// An entry waits for OSV, or for its registry answer. When OSV has answered (`has_answer`), its
+/// advisories are the news and stay: only its registry status comes from the old data. Old
+/// advisories would hide a new one, or show one that OSV withdrew.
 ///
 /// The two analyses come from the same dependencies, so their entries line up. If they do not, the
 /// analysis is returned as it is.
-fn fill_pending_from_old(analysis: &Analysis, old: &Analysis) -> Analysis {
+fn fill_pending_from_old(
+    analysis: &Analysis,
+    old: &Analysis,
+    has_answer: impl Fn(&Entry) -> bool,
+) -> Analysis {
     if analysis.entries.len() != old.entries.len() {
         return analysis.clone();
     }
@@ -487,13 +508,18 @@ fn fill_pending_from_old(analysis: &Analysis, old: &Analysis) -> Analysis {
         .zip(&old.entries)
         .map(|(entry, old_entry)| {
             let is_same_dependency = entry.dependency.name == old_entry.dependency.name;
-            if entry.status == Status::Pending
+            let waits_with_old_data = entry.status == Status::Pending
                 && is_same_dependency
-                && old_entry.status != Status::Pending
-            {
-                old_entry.clone()
-            } else {
+                && old_entry.status != Status::Pending;
+            if !waits_with_old_data {
                 entry.clone()
+            } else if has_answer(entry) {
+                Entry {
+                    status: old_entry.status.clone(),
+                    ..entry.clone()
+                }
+            } else {
+                old_entry.clone()
             }
         })
         .collect();
@@ -936,7 +962,7 @@ mod disk_cache_tests {
             pending: 1,
         };
 
-        let shown = fill_pending_from_old(&analysis, &old);
+        let shown = fill_pending_from_old(&analysis, &old, |_| false);
 
         // `a` waits and the old data knows it. `b` is already checked. `c` is unknown to both.
         let statuses: Vec<&Status> = shown.entries.iter().map(|entry| &entry.status).collect();
@@ -960,6 +986,32 @@ mod disk_cache_tests {
         assert!(store.keys().is_empty());
         // The ecosystem is not retried at every chunk either.
         assert!(!plugin.cache.is_dirty(Ecosystem::PyPI));
+    }
+
+    #[test]
+    fn a_waiting_entry_keeps_its_fresh_advisories_and_takes_the_old_status() {
+        let outdated = Status::Outdated {
+            latest: "2.0".to_owned(),
+        };
+        let mut waiting = entry_with("a==1.0\n", Status::Pending);
+        waiting.vulnerabilities = vec![crate::osv::anonymous_deferred()];
+        let analysis = Analysis {
+            entries: vec![waiting.clone()],
+            pending: 1,
+        };
+        let old = Analysis {
+            entries: vec![entry_with("a==1.0\n", outdated.clone())],
+            pending: 0,
+        };
+
+        // OSV has answered for this entry: its advisories are the news, only its registry status waits.
+        let kept = fill_pending_from_old(&analysis, &old, |_| true);
+        assert_eq!(kept.entries[0].status, outdated);
+        assert_eq!(kept.entries[0].vulnerabilities, waiting.vulnerabilities);
+
+        // OSV has not answered: the old entry shows as it was.
+        let replaced = fill_pending_from_old(&analysis, &old, |_| false);
+        assert!(replaced.entries[0].vulnerabilities.is_empty());
     }
 
     #[test]

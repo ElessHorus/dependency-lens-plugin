@@ -564,8 +564,14 @@ fn a_cold_open_without_old_data_publishes_nothing_before_the_first_answer() {
     assert!(decorations_of(&host).is_empty());
 }
 
-#[test]
-fn an_entry_that_still_waits_keeps_its_old_data_between_chunks() {
+/// Opens a two-package requirements file whose old data is two hours old and says "→ 3.0" for both.
+///
+/// The chunk is one registry lookup, so after the first chunk the second package waits for its
+/// registry answer, and the run ends there because that second lookup is cancelled. OSV answers
+/// the two packages in one batch. With `new_advisory_for_second`, it reports one advisory for the
+/// second package that the old data did not have. Returns the text after each version, last
+/// publication.
+fn open_two_pypi_packages_with_old_data(new_advisory_for_second: bool) -> Vec<Option<String>> {
     use std::time::Duration;
     const PYPI_BODY: &str = r#"{"info":{"version":"2.0"},"releases":{"1.0":[{"yanked":false}],"2.0":[{"yanked":false}]}}"#;
     let host = MockHost::install().with_capabilities(&[
@@ -581,7 +587,15 @@ fn an_entry_that_still_waits_keeps_its_old_data_between_chunks() {
     let counter = registry_requests.clone();
     host.on_fetch(move |request| {
         let body = if request.url.ends_with(BATCH_SUFFIX) {
-            json!({ "results": [{ "vulns": [] }, { "vulns": [] }] }).to_string()
+            let second = if new_advisory_for_second {
+                json!({ "vulns": [{ "id": "GHSA-new" }] })
+            } else {
+                json!({ "vulns": [] })
+            };
+            json!({ "results": [{ "vulns": [] }, second] }).to_string()
+        } else if let Some(id) = request.url.strip_prefix(DETAIL_PREFIX) {
+            json!({ "id": id, "summary": "New advisory", "database_specific": { "severity": "HIGH" } })
+                .to_string()
         } else if request.url.starts_with("https://pypi.org/pypi/") {
             counter.set(counter.get() + 1);
             // The second registry lookup is cancelled, so the run ends after its first chunk.
@@ -605,17 +619,35 @@ fn an_entry_that_still_waits_keeps_its_old_data_between_chunks() {
     });
     host::storage::set("cache/PyPI", &block.to_string()).unwrap();
 
-    // A chunk of one registry lookup: the second package waits after the first chunk.
     let mut plugin = DependencyLens::with_limits(Duration::from_secs(300), 1);
     host.add_file("requirements.txt", "requests==1.0.0\nflask==1.0.0\n");
     plugin.handle_events(
         &[Event::FileOpened("/p/requirements.txt".to_owned())],
         &host.invocation(),
     );
+    after_texts_at(&host, "/p/requirements.txt")
+}
 
-    let shown = after_texts_at(&host, "/p/requirements.txt");
+#[test]
+fn an_entry_that_still_waits_keeps_its_old_data_between_chunks() {
+    let shown = open_two_pypi_packages_with_old_data(false);
+
     // The first package has its new answer. The second still shows the old one, not "…".
     assert_eq!(shown, [Some("→ 2.0".to_owned()), Some("→ 3.0".to_owned())]);
+}
+
+#[test]
+fn an_advisory_that_just_arrived_is_not_hidden_by_the_old_data_of_an_entry_that_waits() {
+    let shown = open_two_pypi_packages_with_old_data(true);
+
+    // The second package waits only for its registry answer: OSV has answered, and its news shows.
+    assert_eq!(
+        shown,
+        [
+            Some("→ 2.0".to_owned()),
+            Some("→ 3.0 · ⚠ 1 vulnerability".to_owned())
+        ]
+    );
 }
 
 fn manifest_document() -> Document {
