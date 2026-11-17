@@ -157,6 +157,8 @@ struct Pep508 {
     version: Range<usize>,
     /// Whether the requirement has more than one constraint.
     has_additional_version_constraints: bool,
+    /// Every constraint of the requirement. `None` when a version is a wildcard.
+    requirement: Option<crate::requirement::Requirement>,
 }
 
 /// One `operator version` pair of a requirement.
@@ -203,10 +205,28 @@ fn parse_pep508(input: &str) -> Option<Pep508> {
     let pin = constraints
         .iter()
         .find(|constraint| PIN_OPERATORS.contains(&constraint.operator))?;
+    let pin_version = pin.version.clone();
+    let has_wildcard = constraints
+        .iter()
+        .any(|constraint| input[constraint.version.clone()].contains('*'));
+    let requirement = (!has_wildcard)
+        .then(|| {
+            crate::requirement::Requirement::from_constraints(
+                constraints
+                    .iter()
+                    .map(|constraint| crate::requirement::Constraint {
+                        operator: constraint.operator.to_owned(),
+                        version: input[constraint.version.clone()].to_owned(),
+                    })
+                    .collect(),
+            )
+        })
+        .flatten();
     Some(Pep508 {
         name: name_start..name_end,
-        version: pin.version.clone(),
+        version: pin_version,
         has_additional_version_constraints: constraints.len() > 1,
+        requirement,
     })
 }
 
@@ -288,7 +308,7 @@ fn dependency_from_pep508(
         dev: is_dev,
         optional: is_optional,
         has_additional_version_constraints: requirement.has_additional_version_constraints,
-        requirement: None,
+        requirement: requirement.requirement,
     })
 }
 
@@ -561,7 +581,10 @@ fn build_poetry_dependency(
         dev: is_dev,
         optional: is_optional,
         has_additional_version_constraints: false,
-        requirement: None,
+        requirement: crate::requirement::Requirement::parse(
+            crate::model::Ecosystem::PyPI,
+            version_text,
+        ),
     })
 }
 
@@ -1135,5 +1158,54 @@ internal-dev = { workspace = true }
             );
             assert!(parse(&manifest).is_empty(), "{setting} must hide the file");
         }
+    }
+
+    /// The requirement that `text` gives for PyPI, as a test expectation.
+    fn pypi_requirement(text: &str) -> Option<crate::requirement::Requirement> {
+        crate::requirement::Requirement::parse(crate::model::Ecosystem::PyPI, text)
+    }
+
+    #[test]
+    fn a_pep_508_line_keeps_every_constraint_as_the_requirement() {
+        let dependencies = parse("requests>1.12,<2.10\nflask>=0.12.2,<1  # web\n");
+        assert_eq!(
+            find(&dependencies, "requests").requirement,
+            pypi_requirement(">1.12,<2.10")
+        );
+        assert_eq!(
+            find(&dependencies, "flask").requirement,
+            pypi_requirement(">=0.12.2,<1")
+        );
+    }
+
+    #[test]
+    fn a_wrapped_pin_is_an_exact_requirement() {
+        let dependencies = parse("requests (==2.28.0)\n");
+        let requirement = find(&dependencies, "requests")
+            .requirement
+            .as_ref()
+            .expect("a requirement");
+        assert!(requirement.is_exact_pin());
+    }
+
+    #[test]
+    fn a_wildcard_pin_has_no_requirement() {
+        let dependencies = parse("pkg==1.*\n");
+        assert_eq!(find(&dependencies, "pkg").requirement, None);
+    }
+
+    #[test]
+    fn pyproject_pep_621_and_poetry_dependencies_read_their_requirement() {
+        let dependencies = parse(
+            "[project]\ndependencies = [\"requests>1.12,<2.10\"]\n\n[tool.poetry.dependencies]\nhttpx = \"^0.27\"\nrich = \"*\"\n",
+        );
+        assert_eq!(
+            find(&dependencies, "requests").requirement,
+            pypi_requirement(">1.12,<2.10")
+        );
+        assert_eq!(
+            find(&dependencies, "httpx").requirement,
+            pypi_requirement("^0.27")
+        );
     }
 }
