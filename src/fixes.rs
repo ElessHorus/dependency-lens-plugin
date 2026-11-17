@@ -5,6 +5,7 @@
 //! each range. The rules here pick, for one dependency, the smallest version that fixes every
 //! advisory of its current version.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::model::{Affected, Ecosystem, RangeEvent};
@@ -157,6 +158,20 @@ pub fn plan_fix(
     }
 }
 
+/// Sorts `items` by `compare`, keeping the order of equal items. It never panics.
+///
+/// Maven's version order has cycles (`1.2.3.jbossorg-1 > 1.2.3 > 1.2.3-beta1 > 1.2.3.jbossorg-1`), and
+/// `slice::sort_by` may panic on such an order, which aborts the plugin. A binary insertion keeps
+/// the `n log n` comparisons, and on a cycle it gives an arbitrary order that still ends.
+fn sort_without_panic<T>(items: &mut Vec<T>, compare: impl Fn(&T, &T) -> Ordering) {
+    let mut sorted = Vec::with_capacity(items.len());
+    for item in items.drain(..) {
+        let position = sorted.partition_point(|placed| compare(placed, &item) != Ordering::Greater);
+        sorted.insert(position, item);
+    }
+    *items = sorted;
+}
+
 /// The kind of an OSV range event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EventKind {
@@ -193,7 +208,7 @@ fn parse_range<V: UpdateVersion>(events: &[RangeEvent]) -> Vec<ParsedEvent<'_, V
         })
         .collect();
     // Stable, so events of the same version keep the order of the advisory.
-    parsed.sort_by(|left, right| left.version.cmp(&right.version));
+    sort_without_panic(&mut parsed, |left, right| left.version.cmp(&right.version));
     parsed
 }
 
@@ -384,7 +399,7 @@ fn plan_fix_of<V: UpdateVersion>(
         .filter(|event| event.kind == EventKind::Fixed && event.version > current)
         .map(|event| (&event.version, event.text))
         .collect();
-    candidates.sort_by(|left, right| left.0.cmp(right.0));
+    sort_without_panic(&mut candidates, |left, right| left.0.cmp(right.0));
     let fixed_count_at = |version: &V| {
         let probe = listed.probe(version);
         open_advisories
@@ -1431,5 +1446,44 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn a_cycle_in_the_maven_order_does_not_panic_the_sorts() {
+        // Maven's own order is not total: `1.2.3.jbossorg-1 > 1.2.3 > 1.2.3-beta1 > 1.2.3.jbossorg-1`
+        // holds in a cycle. `sort_by` may panic on a cycle, and a panic aborts the plugin.
+        let fixes = [
+            "1.2.3.jbossorg-1",
+            "1.2.3.jbossorg-2",
+            "1.2.3",
+            "1.2.3-beta1",
+            "1.2.3-rc1",
+            "1.2.3-alpha1",
+            "1.2.4",
+            "1.2.2.1",
+            "1.2.3-m1",
+        ];
+        let mut seed: u64 = 7;
+        for _ in 0..300 {
+            // A deterministic shuffle, so that a failure can be replayed.
+            let advisories: Vec<Vec<Affected>> = (0..40)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let fixed = fixes[(seed >> 33) as usize % fixes.len()];
+                    affected(
+                        "Maven",
+                        "org.example:lib",
+                        &[&[("introduced", "0"), ("fixed", fixed)]],
+                    )
+                })
+                .collect();
+            let refs: Vec<&[Affected]> = advisories.iter().map(Vec::as_slice).collect();
+            // Any answer is fine: the call must return.
+            let _ = plan_fix(Ecosystem::Maven, "org.example:lib", "1.0.0", &refs, |_| {
+                true
+            });
+        }
     }
 }

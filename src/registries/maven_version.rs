@@ -3,6 +3,9 @@
 //! OSV orders the `ECOSYSTEM` ranges of Maven advisories with this rule, so the fix plan must use it.
 //! A version is a nested list of items: numbers and qualifiers. A `-`, and a qualifier that
 //! follows a number, open a sub-list. That is why `1.0-1` is newer than `1.0` and `1.0-alpha` is older.
+//!
+//! The order is not total, as in Maven: `1.2.3.jbossorg-1 > 1.2.3 > 1.2.3-beta1 > 1.2.3.jbossorg-1`
+//! is a cycle. Sort with a function that cannot panic on a cycle, never with `slice::sort_by`.
 
 use std::cmp::Ordering;
 
@@ -382,74 +385,6 @@ mod tests {
             "-1", "1..2", "1--2", "1-", "1.", ".", "-", "é1", "1é", "1-é",
         ] {
             assert!(MavenVersion::parse(text).is_some(), "{text}");
-        }
-    }
-
-    #[test]
-    fn the_order_is_transitive_on_a_pool_of_real_shapes() {
-        // `sort_by` may panic on an order that is not total, so a broken triple must show up here.
-        let pool: Vec<MavenVersion> = [
-            "0",
-            "1",
-            "1.0",
-            "1.0.0",
-            "1.0.1",
-            "1.1",
-            "2",
-            "1-alpha",
-            "1-alpha1",
-            "1-alpha-1",
-            "1-beta",
-            "1-beta2",
-            "1-m1",
-            "1.0.M1",
-            "1.0.0.M1",
-            "1-rc1",
-            "1-cr1",
-            "1-snapshot",
-            "1.0-SNAPSHOT",
-            "1-ga",
-            "1.0.RELEASE",
-            "1-final",
-            "1-sp",
-            "1-sp1",
-            "1.0.SR0",
-            "1.0.SR1",
-            "1-abc",
-            "1-abc1",
-            "1-1",
-            "1-1-snapshot",
-            "1-2",
-            "1.0-1",
-            "1.0.1-1",
-            "2.5.7.SR0",
-            "2.5.7",
-            "2.5.8",
-            "9.0.0.M1",
-            "9.0.0.RELEASE",
-            "alpha",
-            "a1",
-            "-1",
-            "1..2",
-            "1.a",
-            "1.a1",
-            "1.0.0-a-1",
-            "11.a2",
-            "11b",
-            "11",
-            "11m",
-        ]
-        .into_iter()
-        .map(version)
-        .collect();
-        for left in &pool {
-            for middle in &pool {
-                for right in &pool {
-                    if left <= middle && middle <= right {
-                        assert!(left <= right, "{left:?} <= {middle:?} <= {right:?}");
-                    }
-                }
-            }
         }
     }
 }
