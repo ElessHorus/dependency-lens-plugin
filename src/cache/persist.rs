@@ -93,6 +93,19 @@ pub struct AffectedRecord {
     pub versions: Vec<String>,
 }
 
+impl Block {
+    /// Keeps only the registry answers and lists of the packages for which `is_kept` is true.
+    /// Returns `true` when it removed something.
+    ///
+    /// The advisory records stay: they are public OSV data and name no package of the project.
+    pub fn retain_packages(&mut self, is_kept: impl Fn(&str) -> bool) -> bool {
+        let before = self.registry.len() + self.lists.len();
+        self.registry.retain(|name, _| is_kept(name));
+        self.lists.retain(|name, _| is_kept(name));
+        before != self.registry.len() + self.lists.len()
+    }
+}
+
 /// Reads a block from its text. Returns `None` for invalid JSON or another format version.
 pub fn decode_block(text: &str) -> Option<Block> {
     serde_json::from_str::<Block>(text)
@@ -251,6 +264,14 @@ impl Cache {
                 value: advisory.clone(),
                 stored_at: record.at,
             });
+            // A record that the network gave is complete. One that the disk gave holds the entries of
+            // one ecosystem, so it must not stand for the others (see `has_affected_for`).
+            if !self.has_complete_affected(&id) {
+                self.partial_affected
+                    .entry(id.clone())
+                    .or_default()
+                    .insert(ecosystem);
+            }
             // An advisory can name packages of several ecosystems, one block each: merge them.
             match self.affected.entry(id.clone()) {
                 MapEntry::Occupied(mut known) => {
@@ -946,6 +967,47 @@ mod tests {
         assert!(!block.advisories.contains_key("GHSA-old"));
         assert!(block.lists.contains_key("new-list"));
         assert!(block.advisories.contains_key("GHSA-new"));
+    }
+
+    #[test]
+    fn an_advisory_imported_from_one_block_covers_only_that_ecosystem() {
+        let mut source = Cache::new(LONG_TTL_SECS);
+        store_details(&mut source, "GHSA-x", NOW);
+        source.put_vulnerabilities(
+            Ecosystem::PyPI,
+            PACKAGE,
+            VERSION,
+            vec![known("GHSA-x")],
+            NOW,
+        );
+        // A record from the network covers every ecosystem.
+        assert!(source.has_affected_for("GHSA-x", Ecosystem::Npm));
+
+        let mut restored = round_trip(&source, Ecosystem::PyPI);
+
+        assert!(restored.has_affected_for("GHSA-x", Ecosystem::PyPI));
+        assert!(!restored.has_affected_for("GHSA-x", Ecosystem::Npm));
+        // An advisory that the cache never saw has nothing to complete.
+        assert!(restored.has_affected_for("GHSA-unknown", Ecosystem::Npm));
+        // The record of the other ecosystem completes it, and so does a fetch.
+        restored.put_affected("GHSA-x", vec![affected("npm", "left-pad")], NOW);
+        assert!(restored.has_affected_for("GHSA-x", Ecosystem::Npm));
+    }
+
+    #[test]
+    fn retain_packages_drops_the_registry_answers_and_lists_of_unwanted_names() {
+        let mut cache = Cache::new(LONG_TTL_SECS);
+        for name in ["kept", "dropped"] {
+            cache.put_version_info(Ecosystem::PyPI, name, version_info(), NOW);
+            cache.put_vulnerabilities(Ecosystem::PyPI, name, VERSION, Vec::new(), NOW);
+        }
+        let mut block = cache.export_block(Ecosystem::PyPI);
+
+        assert!(block.retain_packages(|name| name != "dropped"));
+        assert!(block.registry.contains_key("kept") && !block.registry.contains_key("dropped"));
+        assert!(block.lists.contains_key("kept") && !block.lists.contains_key("dropped"));
+        // Nothing left to drop: the block says so.
+        assert!(!block.retain_packages(|name| name != "dropped"));
     }
 
     #[test]

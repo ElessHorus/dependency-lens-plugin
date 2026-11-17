@@ -41,6 +41,10 @@ pub struct Cache {
     /// The revision (`modified` time) of each stored advisory record. It outlives the TTL, so that
     /// an expired record whose revision did not change is confirmed without a new download.
     revisions: HashMap<String, String>,
+    /// The ecosystems that the `affected` entries of an advisory cover, for an advisory that came
+    /// from a disk block. A disk block holds only the entries of its own ecosystem. An advisory
+    /// without a line here has the entries of every ecosystem, as a network answer gives them.
+    partial_affected: HashMap<String, HashSet<Ecosystem>>,
     /// Ecosystems whose disk block is out of date: a registry answer or a list was stored since the last save.
     dirty: HashSet<Ecosystem>,
 }
@@ -66,6 +70,7 @@ impl Cache {
             advisories: HashMap::new(),
             affected: HashMap::new(),
             revisions: HashMap::new(),
+            partial_affected: HashMap::new(),
             dirty: HashSet::new(),
         }
     }
@@ -227,6 +232,8 @@ impl Cache {
         if !self.stores_entries() {
             return;
         }
+        // What a network answer gives is complete, whatever a disk block gave before.
+        self.partial_affected.remove(id);
         self.affected.insert(
             id.to_owned(),
             Entry {
@@ -234,6 +241,22 @@ impl Cache {
                 stored_at: now,
             },
         );
+    }
+
+    /// Returns `true` when the cached `affected` entries of the advisory `id` include those of `ecosystem`.
+    ///
+    /// An advisory that came from the disk block of another ecosystem only has the entries of that
+    /// one, so it must be downloaded again for `ecosystem`. An advisory that the cache does not hold
+    /// has nothing to complete, so the answer is `true`.
+    pub fn has_affected_for(&self, id: &str, ecosystem: Ecosystem) -> bool {
+        self.partial_affected
+            .get(id)
+            .is_none_or(|covered| covered.contains(&ecosystem))
+    }
+
+    /// Returns `true` when the cache holds the `affected` entries of the advisory `id` as a network answer gave them.
+    fn has_complete_affected(&self, id: &str) -> bool {
+        self.affected.contains_key(id) && !self.partial_affected.contains_key(id)
     }
 
     /// Stores the revision of the record of the advisory `id`, as a comparable key.

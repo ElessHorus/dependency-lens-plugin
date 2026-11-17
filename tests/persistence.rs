@@ -39,6 +39,7 @@ struct Osv {
     advisories: Rc<Cell<usize>>,
     requests: Rc<Cell<u32>>,
     detail_requests: Rc<Cell<u32>>,
+    batch_requests: Rc<Cell<u32>>,
     is_cancelling: Rc<Cell<bool>>,
 }
 
@@ -48,6 +49,7 @@ impl Osv {
             advisories: Rc::new(Cell::new(advisories)),
             requests: Rc::new(Cell::new(0)),
             detail_requests: Rc::new(Cell::new(0)),
+            batch_requests: Rc::new(Cell::new(0)),
             is_cancelling: Rc::new(Cell::new(false)),
         }
     }
@@ -57,6 +59,7 @@ impl Osv {
         let advisories = self.advisories.clone();
         let requests = self.requests.clone();
         let detail_requests = self.detail_requests.clone();
+        let batch_requests = self.batch_requests.clone();
         let is_cancelling = self.is_cancelling.clone();
         host.on_fetch(move |request| {
             requests.set(requests.get() + 1);
@@ -64,6 +67,7 @@ impl Osv {
                 return Err(Error::Cancelled);
             }
             let body = if request.url.ends_with(BATCH_SUFFIX) {
+                batch_requests.set(batch_requests.get() + 1);
                 let query: Value =
                     serde_json::from_slice(request.body.as_deref().unwrap_or_default())
                         .unwrap_or(Value::Null);
@@ -427,4 +431,161 @@ fn loading_a_block_logs_its_size_and_duration_at_debug_level() {
         "{}",
         lines[0]
     );
+}
+
+const THREE_CRATES: &str = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.0\"\ntokio = \"1.37.0\"\nanyhow = \"1.0.80\"\n";
+
+/// Writes a Cargo block with an empty list for each `(package, version)`, stored at `at`.
+fn seed_cargo_lists(at: u64, packages: &[(&str, &str)]) {
+    let mut lists = serde_json::Map::new();
+    for (package, version) in packages {
+        lists.insert(
+            (*package).to_owned(),
+            json!({ *version: { "at": at, "total": 0, "ids": [] } }),
+        );
+    }
+    let block = json!({ "v": 1, "registry": {}, "lists": lists, "advisories": {} });
+    host::storage::set(CARGO_KEY, &block.to_string()).unwrap();
+}
+
+#[test]
+fn expired_pairs_go_to_osv_in_one_batch() {
+    let osv = Osv::new(0);
+    let host = host_with(&STORAGE_CAPABILITIES, &osv);
+    seed_cargo_lists(
+        now_secs() - 2 * HOUR_SECS,
+        &[
+            ("serde", "1.0.0"),
+            ("tokio", "1.37.0"),
+            ("anyhow", "1.0.80"),
+        ],
+    );
+    let mut plugin = DependencyLens::default();
+    open_manifest(&host, &mut plugin, THREE_CRATES);
+
+    // The old data is on screen, so a slow package cannot blank it: no need to send the pairs in slices.
+    assert_eq!(osv.batch_requests.get(), 1);
+}
+
+#[test]
+fn a_package_added_to_ignore_leaves_the_disk_cache() {
+    let osv = Osv::new(1);
+    let host = host_with(&STORAGE_CAPABILITIES, &osv);
+    let mut plugin = DependencyLens::default();
+    open_manifest(&host, &mut plugin, MANIFEST);
+    assert!(host.storage()[CARGO_KEY].contains("serde"));
+
+    host.set_setting("ignore", r#"["serde"]"#);
+    send_settings_changed(&host, &mut plugin, "ignore");
+
+    assert!(!host.storage()[CARGO_KEY].contains("serde"));
+}
+
+#[test]
+fn an_ignored_package_found_in_an_old_block_is_dropped_on_load() {
+    let osv = Osv::new(1);
+    let host = host_with(&STORAGE_CAPABILITIES, &osv);
+    seed_cargo_block(now_secs());
+    host.set_setting("ignore", r#"["serde"]"#);
+    let mut plugin = DependencyLens::default();
+    plugin.activate(&host.context(PLUGIN_ID)).unwrap();
+    open_manifest(&host, &mut plugin, MANIFEST);
+
+    assert!(!host.storage()[CARGO_KEY].contains("serde"));
+}
+
+const WITH_UNVERSIONED: &str = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.0\"\nwild = \"*\"\n";
+
+#[test]
+fn a_ttl_of_zero_does_not_blank_the_decorations_while_a_refresh_runs() {
+    let osv = Osv::new(1);
+    let host = host_with(&STORAGE_CAPABILITIES, &osv);
+    host.set_setting("cacheTtlSeconds", "0");
+    let mut plugin = DependencyLens::default();
+    plugin.activate(&host.context(PLUGIN_ID)).unwrap();
+    open_manifest(&host, &mut plugin, WITH_UNVERSIONED);
+    let shown = after_texts(&host);
+    assert_eq!(shown, [Some("⚠ 1 vulnerability".to_owned())]);
+
+    // The refresh cannot finish: what was on screen must stay.
+    osv.is_cancelling.set(true);
+    open_manifest(&host, &mut plugin, WITH_UNVERSIONED);
+
+    assert_eq!(after_texts(&host), shown);
+}
+
+#[test]
+fn a_cold_open_without_old_data_publishes_nothing_before_the_first_answer() {
+    let osv = Osv::new(1);
+    let host = host_with(&STORAGE_CAPABILITIES, &osv);
+    osv.is_cancelling.set(true);
+    let mut plugin = DependencyLens::default();
+    open_manifest(&host, &mut plugin, WITH_UNVERSIONED);
+
+    assert!(decorations_of(&host).is_empty());
+}
+
+#[test]
+fn an_entry_that_still_waits_keeps_its_old_data_between_chunks() {
+    use std::time::Duration;
+    const PYPI_BODY: &str = r#"{"info":{"version":"2.0"},"releases":{"1.0":[{"yanked":false}],"2.0":[{"yanked":false}]}}"#;
+    let host = MockHost::install().with_capabilities(&[
+        "events",
+        "project.read",
+        "editor.read",
+        "storage",
+        "net:api.osv.dev",
+        "net:pypi.org",
+    ]);
+    host.set_project_root(Some("/p"));
+    let registry_requests = Rc::new(Cell::new(0));
+    let counter = registry_requests.clone();
+    host.on_fetch(move |request| {
+        let body = if request.url.ends_with(BATCH_SUFFIX) {
+            json!({ "results": [{ "vulns": [] }, { "vulns": [] }] }).to_string()
+        } else if request.url.starts_with("https://pypi.org/pypi/") {
+            counter.set(counter.get() + 1);
+            // The second registry lookup is cancelled, so the run ends after its first chunk.
+            if counter.get() > 1 {
+                return Err(Error::Cancelled);
+            }
+            PYPI_BODY.to_owned()
+        } else {
+            return Err(Error::Failed(format!("unexpected request {}", request.url)));
+        };
+        Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: body.into_bytes(),
+        })
+    });
+    let at = now_secs() - 2 * HOUR_SECS;
+    let old_registry = json!({ "at": at, "latest": "3.0", "all": ["3.0", "2.0", "1.0"] });
+    let old_list = json!({ "1.0.0": { "at": at, "total": 0, "ids": [] } });
+    let block = json!({
+        "v": 1,
+        "registry": { "requests": old_registry, "flask": old_registry },
+        "lists": { "requests": old_list, "flask": old_list },
+        "advisories": {}
+    });
+    host::storage::set("cache/PyPI", &block.to_string()).unwrap();
+
+    // A chunk of one registry lookup: the second package waits after the first chunk.
+    let mut plugin = DependencyLens::with_limits(Duration::from_secs(300), 1);
+    host.add_file("requirements.txt", "requests==1.0.0\nflask==1.0.0\n");
+    plugin.handle_events(
+        &[Event::FileOpened("/p/requirements.txt".to_owned())],
+        &host.invocation(),
+    );
+
+    let shown: Vec<Option<String>> = host
+        .decorations()
+        .get(&(DECORATION_SET.to_owned(), "/p/requirements.txt".to_owned()))
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|decoration| decoration.after)
+        .collect();
+    // The first package has its new answer. The second still shows the old one, not "…".
+    assert_eq!(shown, [Some("→ 2.0".to_owned()), Some("→ 3.0".to_owned())]);
 }

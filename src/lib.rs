@@ -17,7 +17,7 @@ pub mod update;
 
 use crate::analysis::{Analysis, Budget, Status, analyze};
 use crate::cache::Cache;
-use crate::cache::persist::{STALE_MAX_AGE_SECS, decode_block, encode_block};
+use crate::cache::persist::{Block, STALE_MAX_AGE_SECS, decode_block, encode_block};
 use crate::http::HostHttp;
 use crate::model::{Dependency, Ecosystem};
 use crate::osv::DEFAULT_DETAILS_PER_QUERY;
@@ -128,6 +128,17 @@ impl DependencyLens {
                 self.clear_disk(&HostStore);
             }
         }
+        // A package that is ignored from now on must leave the disk too: its block is written again,
+        // and the filter of `save_blocks` leaves the package out.
+        let has_new_ignored_name = settings
+            .ignore
+            .iter()
+            .any(|name| !self.settings.ignore.contains(name));
+        if has_new_ignored_name {
+            for ecosystem in &self.loaded_blocks {
+                self.cache.mark_dirty(*ecosystem);
+            }
+        }
         self.settings = settings;
     }
 
@@ -192,7 +203,11 @@ impl DependencyLens {
             Err(error) => return self.warn_about_store(&format!("cannot read {key}: {error}")),
         };
         match decode_block(&text) {
-            Some(block) => {
+            Some(mut block) => {
+                // A package that was ignored since the block was written leaves it, and the block is written again.
+                if self.drop_ignored(ecosystem, &mut block) {
+                    self.cache.mark_dirty(ecosystem);
+                }
                 let record_count = block.registry.len()
                     + block
                         .lists
@@ -229,12 +244,21 @@ impl DependencyLens {
     fn save_blocks(&mut self, store: &dyn Store) {
         for ecosystem in self.cache.take_dirty() {
             let key = block_key(ecosystem);
-            let text = encode_block(&self.cache.export_block(ecosystem));
-            if let Err(error) = store.set(&key, &text) {
+            let mut block = self.cache.export_block(ecosystem);
+            // An ignored package never reaches the disk, even when it was cached before it was ignored.
+            self.drop_ignored(ecosystem, &mut block);
+            if let Err(error) = store.set(&key, &encode_block(&block)) {
                 self.warn_about_store(&format!("cannot write {key}: {error}"));
                 self.cache.mark_dirty(ecosystem);
             }
         }
+    }
+
+    /// Removes the packages of the `ignore` setting from `block`. Returns `true` when it removed one.
+    fn drop_ignored(&self, ecosystem: Ecosystem, block: &mut Block) -> bool {
+        let ignored = self.settings.ignored_packages(ecosystem);
+        !ignored.is_empty()
+            && block.retain_packages(|name| !ignored.contains(&ecosystem.normalize_package(name)))
     }
 
     /// Deletes the disk block of every ecosystem.
@@ -259,7 +283,10 @@ impl DependencyLens {
     ///
     /// A cold open then shows the last known results at once, before any request. It runs without
     /// a request, so nothing is stored, and the normal pass that follows checks and replaces it.
-    /// It does nothing when the cache already holds fresh data for every dependency.
+    /// It does nothing when the cache already holds fresh data for every dependency, when the cache
+    /// lifetime is zero, or when the old data tells nothing more than the fresh data.
+    ///
+    /// Returns what it published, so that the chunks that follow can keep it for the entries that still wait.
     fn show_old_data_first(
         &mut self,
         eco: Ecosystem,
@@ -267,7 +294,10 @@ impl DependencyLens {
         text: &str,
         deps: &[Dependency],
         now: u64,
-    ) {
+    ) -> Option<Analysis> {
+        if self.settings.cache_ttl_secs == 0 {
+            return None;
+        }
         let run_offline = |cache: &mut Cache, settings: &Settings| {
             analyze(
                 eco,
@@ -279,21 +309,20 @@ impl DependencyLens {
                 &mut Budget::offline(),
             )
         };
-        if run_offline(&mut self.cache, &self.settings).pending == 0 {
-            return;
+        let fresh_pending = run_offline(&mut self.cache, &self.settings).pending;
+        if fresh_pending == 0 {
+            return None;
         }
         let settings = &self.settings;
         let old = self
             .cache
             .with_stale_reads(STALE_MAX_AGE_SECS, |cache| run_offline(cache, settings));
-        // A manifest that nothing is known about keeps its decorations until the first answer.
-        if old
-            .entries
-            .iter()
-            .any(|entry| entry.status != Status::Pending)
-        {
-            publish_analysis(path, text, &old, self.settings.outdated_problems);
+        // A manifest that the old data does not help keeps its decorations until the first answer.
+        if old.pending >= fresh_pending {
+            return None;
         }
+        publish_analysis(path, text, &old, self.settings.outdated_problems);
+        Some(old)
     }
 
     /// Stops tracking a manifest that cannot be read, and clears what the editor still shows for it.
@@ -323,7 +352,7 @@ impl DependencyLens {
         // fresh reading per chunk would expire the answers of the chunk before and repeat its work.
         let run_started_at = now_secs();
         self.load_block(eco, &HostStore);
-        self.show_old_data_first(eco, path, text, deps, run_started_at);
+        let old_data = self.show_old_data_first(eco, path, text, deps, run_started_at);
         let mut previous_pending = None;
         loop {
             // The dependency vector is cloned per chunk; the parse is not repeated.
@@ -332,7 +361,8 @@ impl DependencyLens {
             let mut budget = Budget::new(chunk, Some(Instant::now() + CHUNK_LIMIT))
                 .with_detail_limit(limits.details_per_query);
             // Without a cache a chunk keeps nothing, so one pass does all of them, OSV included.
-            if chunk != usize::MAX {
+            // With old data on screen, a slow package cannot blank the manifest, so the pairs go to OSV in one batch.
+            if chunk != usize::MAX && old_data.is_none() {
                 budget = budget.with_first_osv_slice(OSV_FIRST_SLICE);
             }
             let analysis = analyze(
@@ -350,7 +380,17 @@ impl DependencyLens {
                 // chunk, what the editor shows is already a published result, so it stays as it is.
                 return previous_pending.is_some().then_some(0);
             }
-            publish_analysis(path, text, &analysis, self.settings.outdated_problems);
+            // An entry that still waits keeps what the old data showed for it until its answer comes.
+            let shown = old_data
+                .as_ref()
+                .filter(|_| analysis.pending > 0)
+                .map(|old| fill_pending_from_old(&analysis, old));
+            publish_analysis(
+                path,
+                text,
+                shown.as_ref().unwrap_or(&analysis),
+                self.settings.outdated_problems,
+            );
             self.save_blocks(&HostStore);
             let pending = analysis.pending;
             let unloaded = analysis.unloaded_advisory_count();
@@ -407,6 +447,36 @@ fn publish_analysis(path: &str, text: &str, analysis: &Analysis, outdated_proble
     let editor_decorations = publish::decorations(text, analysis);
     let problems = publish::diagnostics(text, analysis, outdated_problems);
     publish_results(path, &editor_decorations, &problems);
+}
+
+/// Returns `analysis` with each entry that still waits replaced by what `old` showed for it.
+///
+/// The two analyses come from the same dependencies, so their entries line up. If they do not, the
+/// analysis is returned as it is.
+fn fill_pending_from_old(analysis: &Analysis, old: &Analysis) -> Analysis {
+    if analysis.entries.len() != old.entries.len() {
+        return analysis.clone();
+    }
+    let entries = analysis
+        .entries
+        .iter()
+        .zip(&old.entries)
+        .map(|(entry, old_entry)| {
+            let is_same_dependency = entry.dependency.name == old_entry.dependency.name;
+            if entry.status == Status::Pending
+                && is_same_dependency
+                && old_entry.status != Status::Pending
+            {
+                old_entry.clone()
+            } else {
+                entry.clone()
+            }
+        })
+        .collect();
+    Analysis {
+        entries,
+        pending: analysis.pending,
+    }
 }
 
 /// Replaces what the editor shows for `path`; empty lists clear the previous results.
@@ -802,6 +872,46 @@ mod disk_cache_tests {
         plugin.save_blocks(&store);
         assert!(!plugin.cache.is_dirty(Ecosystem::PyPI));
         assert_eq!(store.keys(), ["cache/PyPI"]);
+    }
+
+    /// An entry for the first dependency of `requirements`, with `status`.
+    fn entry_with(requirements: &str, status: Status) -> crate::analysis::Entry {
+        crate::analysis::Entry {
+            dependency: Ecosystem::PyPI.parse(requirements).remove(0),
+            status,
+            vulnerabilities: Vec::new(),
+            checked_version: Some("1.0".to_owned()),
+        }
+    }
+
+    #[test]
+    fn old_data_fills_only_the_entries_that_still_wait() {
+        let outdated = Status::Outdated {
+            latest: "2.0".to_owned(),
+        };
+        let analysis = Analysis {
+            entries: vec![
+                entry_with("a==1.0\n", Status::Pending),
+                entry_with("b==1.0\n", Status::UpToDate),
+                entry_with("c==1.0\n", Status::Pending),
+            ],
+            pending: 2,
+        };
+        let old = Analysis {
+            entries: vec![
+                entry_with("a==1.0\n", outdated.clone()),
+                entry_with("b==1.0\n", outdated.clone()),
+                entry_with("c==1.0\n", Status::Pending),
+            ],
+            pending: 1,
+        };
+
+        let shown = fill_pending_from_old(&analysis, &old);
+
+        // `a` waits and the old data knows it. `b` is already checked. `c` is unknown to both.
+        let statuses: Vec<&Status> = shown.entries.iter().map(|entry| &entry.status).collect();
+        assert_eq!(statuses, [&outdated, &Status::UpToDate, &Status::Pending]);
+        assert_eq!(shown.pending, 2);
     }
 
     #[test]

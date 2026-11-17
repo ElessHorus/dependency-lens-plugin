@@ -391,7 +391,10 @@ fn fetch_missing_details<'a>(
             .iter()
             .enumerate()
             .filter(|(_, reference)| {
-                !cache.confirm_advisory(&reference.id, reference.revision.as_deref(), now)
+                // A record from the disk block of another ecosystem lacks the entries of this one.
+                let is_complete = cache.has_affected_for(&reference.id, query.ecosystem);
+                !(is_complete
+                    && cache.confirm_advisory(&reference.id, reference.revision.as_deref(), now))
             })
             .filter(|(position, reference)| {
                 *position < details_per_query && seen.insert(reference.id.as_str())
@@ -1983,6 +1986,53 @@ mod tests {
             query_batch(&http, &mut cache, &[query("pkg", "1.0.0")], later, None).unwrap();
         assert_eq!(detail_requests(&http).len(), 1);
         assert_eq!(results[0][0].summary, "S");
+    }
+
+    #[test]
+    fn an_advisory_loaded_from_another_ecosystem_block_is_fetched_again() {
+        use crate::cache::persist::{AdvisoryRecord, Block};
+        // The disk block of crates.io holds the advisory with its ranges for crates.io only. An npm
+        // query that names it with the same revision must not take it as complete.
+        let mut block = Block {
+            v: 1,
+            ..Block::default()
+        };
+        block.advisories.insert(
+            "GHSA-0001".to_owned(),
+            AdvisoryRecord {
+                at: NOW,
+                revision: Some(revision_key(REVISION)),
+                severity: AdvisorySeverity::High,
+                summary: "S".to_owned(),
+                affected: Vec::new(),
+            },
+        );
+        let mut cache = Cache::new(TTL_SECS);
+        cache.import_block(Ecosystem::Cargo, block, NOW);
+        let http = FakeHttp::new()
+            .route(
+                "POST",
+                BATCH_URL,
+                200,
+                &batch_body_with_revisions(&[("GHSA-0001", REVISION)]),
+            )
+            .route(
+                "GET",
+                &detail_url("GHSA-0001"),
+                200,
+                &json!({ "id": "GHSA-0001", "summary": "S", "modified": REVISION }).to_string(),
+            );
+        let npm_query = OsvQuery {
+            ecosystem: Ecosystem::Npm,
+            ..query("left-pad", "1.0.0")
+        };
+
+        query_batch(&http, &mut cache, &[npm_query], NOW + 1, None).unwrap();
+
+        assert_eq!(detail_requests(&http).len(), 1);
+        // The record that came from the network covers every ecosystem again.
+        assert!(cache.has_affected_for("GHSA-0001", Ecosystem::Cargo));
+        assert!(cache.has_affected_for("GHSA-0001", Ecosystem::Npm));
     }
 
     #[test]
