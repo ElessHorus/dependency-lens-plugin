@@ -19,6 +19,12 @@ pub const BLOCK_VERSION: u32 = 1;
 /// The oldest record that a block load keeps, in seconds (7 days).
 pub const STALE_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// The largest record that a block keeps, in serialized bytes. A longer one stays out of the block.
+pub const MAX_ENTRY_BYTES: usize = 256 * 1024;
+
+/// The largest block, in serialized bytes. The oldest records leave a block that grows past it.
+pub const MAX_BLOCK_BYTES: usize = 2 * 1024 * 1024;
+
 /// The longest vulnerability list that a block load rebuilds. A real list has a few thousand
 /// advisories at most, so a larger total can only come from a damaged block.
 const MAX_LIST_LEN: usize = 10_000;
@@ -150,12 +156,14 @@ impl Cache {
                     .insert(version.clone(), record);
             }
         }
-        Block {
+        let mut block = Block {
             v: BLOCK_VERSION,
             registry,
             lists,
             advisories,
-        }
+        };
+        apply_limits(&mut block);
+        block
     }
 
     /// Builds the record of the advisory named by `listed`, when its details and ranges are cached.
@@ -280,6 +288,105 @@ impl Cache {
                         value: list,
                         stored_at: record.at,
                     });
+            }
+        }
+    }
+}
+
+/// The serialized size of a record under `key`, with a few bytes for the quotes and separators.
+fn record_size<T: Serialize>(key: &str, record: &T) -> usize {
+    key.len() + serde_json::to_string(record).map_or(usize::MAX / 4, |text| text.len()) + 4
+}
+
+/// A record that can leave a block to make it fit: the oldest go first.
+struct Removable {
+    at: u64,
+    size: usize,
+    place: Place,
+}
+
+/// Where a [`Removable`] sits in the block.
+enum Place {
+    Registry(String),
+    List(String, String),
+}
+
+/// Keeps a block within [`MAX_ENTRY_BYTES`] per record and [`MAX_BLOCK_BYTES`] in all.
+///
+/// A record over the entry limit is dropped. Past the block limit, the registry answers and lists
+/// leave oldest first, and an advisory leaves with the last list that names it.
+/// A list holds at most ten ids, so only the other records can exceed the entry limit.
+fn apply_limits(block: &mut Block) {
+    // Each record is measured once here and its size is kept, so no removal serializes it again.
+    let mut total = 0;
+    let mut removable: Vec<Removable> = Vec::new();
+    block.registry.retain(|name, record| {
+        let size = record_size(name, record);
+        if size > MAX_ENTRY_BYTES {
+            return false;
+        }
+        total += size;
+        removable.push(Removable {
+            at: record.at,
+            size,
+            place: Place::Registry(name.clone()),
+        });
+        true
+    });
+    let mut advisory_sizes: HashMap<String, usize> = HashMap::new();
+    block.advisories.retain(|id, record| {
+        let size = record_size(id, record);
+        if size > MAX_ENTRY_BYTES {
+            return false;
+        }
+        total += size;
+        advisory_sizes.insert(id.clone(), size);
+        true
+    });
+    // How many lists name each advisory: an advisory leaves with its last list.
+    let mut references: HashMap<String, usize> = HashMap::new();
+    for (package, versions) in &block.lists {
+        for (version, record) in versions {
+            let size = record_size(&format!("{package}/{version}"), record);
+            total += size;
+            removable.push(Removable {
+                at: record.at,
+                size,
+                place: Place::List(package.clone(), version.clone()),
+            });
+            for id in &record.ids {
+                *references.entry(id.clone()).or_default() += 1;
+            }
+        }
+    }
+    removable.sort_unstable_by_key(|record| record.at);
+    for record in removable {
+        if total <= MAX_BLOCK_BYTES {
+            break;
+        }
+        total -= record.size;
+        match record.place {
+            Place::Registry(name) => {
+                block.registry.remove(&name);
+            }
+            Place::List(package, version) => {
+                let versions = block.lists.entry(package.clone()).or_default();
+                let Some(removed) = versions.remove(&version) else {
+                    continue;
+                };
+                if versions.is_empty() {
+                    block.lists.remove(&package);
+                }
+                for id in &removed.ids {
+                    let Some(count) = references.get_mut(id) else {
+                        continue;
+                    };
+                    *count -= 1;
+                    if *count == 0 {
+                        block.advisories.remove(id);
+                        total -= advisory_sizes.get(id).copied().unwrap_or(0);
+                    }
+                }
             }
         }
     }
@@ -721,6 +828,124 @@ mod tests {
             .vulnerabilities(Ecosystem::PyPI, PACKAGE, VERSION, NOW)
             .unwrap();
         assert_eq!(list.len(), MAX_LIST_LEN);
+    }
+
+    #[test]
+    fn a_put_marks_the_ecosystem_dirty_and_an_import_does_not() {
+        let mut cache = Cache::new(LONG_TTL_SECS);
+        assert!(!cache.is_dirty(Ecosystem::PyPI));
+
+        cache.put_version_info(Ecosystem::PyPI, PACKAGE, version_info(), NOW);
+        assert!(cache.is_dirty(Ecosystem::PyPI));
+        assert!(!cache.is_dirty(Ecosystem::Npm));
+        assert_eq!(cache.take_dirty(), [Ecosystem::PyPI]);
+        assert!(!cache.is_dirty(Ecosystem::PyPI));
+
+        cache.put_vulnerabilities(
+            Ecosystem::Npm,
+            "left-pad",
+            VERSION,
+            vec![known("GHSA-1")],
+            NOW,
+        );
+        assert!(cache.is_dirty(Ecosystem::Npm));
+        cache.mark_clean(Ecosystem::Npm);
+        assert!(cache.take_dirty().is_empty());
+
+        let mut source = Cache::new(LONG_TTL_SECS);
+        source.put_version_info(Ecosystem::PyPI, PACKAGE, version_info(), NOW);
+        let block = decode_block(&encode_block(&source.export_block(Ecosystem::PyPI))).unwrap();
+        cache.import_block(Ecosystem::PyPI, block, NOW);
+        assert!(!cache.is_dirty(Ecosystem::PyPI));
+
+        // A save that the store rejects marks the ecosystem again, so the next chunk retries it.
+        cache.mark_dirty(Ecosystem::PyPI);
+        assert_eq!(cache.take_dirty(), [Ecosystem::PyPI]);
+    }
+
+    #[test]
+    fn a_failure_does_not_mark_dirty() {
+        use crate::cache::FailureKind;
+        let mut cache = Cache::new(LONG_TTL_SECS);
+        cache.put_failure(
+            FailureKind::Registry,
+            Ecosystem::PyPI,
+            PACKAGE,
+            "boom".to_owned(),
+            NOW,
+        );
+        assert!(!cache.is_dirty(Ecosystem::PyPI));
+    }
+
+    /// A version list of `count` releases: about 12 bytes each once written.
+    fn long_version_list(count: usize) -> VersionInfo {
+        VersionInfo {
+            latest: None,
+            versions: (0..count).map(|number| format!("1.{number}.0")).collect(),
+        }
+    }
+
+    #[test]
+    fn an_entry_over_the_entry_limit_is_not_exported_and_the_others_are() {
+        let mut cache = Cache::new(LONG_TTL_SECS);
+        // About 440 KB: over the 256 KiB entry limit.
+        cache.put_version_info(Ecosystem::PyPI, "huge", long_version_list(40_000), NOW);
+        cache.put_version_info(Ecosystem::PyPI, "small", version_info(), NOW);
+
+        let block = cache.export_block(Ecosystem::PyPI);
+
+        assert!(!block.registry.contains_key("huge"));
+        assert!(block.registry.contains_key("small"));
+    }
+
+    #[test]
+    fn a_block_over_the_block_limit_drops_the_oldest_records_first() {
+        let mut cache = Cache::new(LONG_TTL_SECS);
+        // Each answer is about 240 KB, under the entry limit. Thirty of them are far over 2 MiB.
+        for number in 0..30u64 {
+            cache.put_version_info(
+                Ecosystem::PyPI,
+                &format!("pkg-{number}"),
+                long_version_list(20_000),
+                NOW + number,
+            );
+        }
+        // The oldest list names an advisory that no other list names.
+        store_details(&mut cache, "GHSA-old", NOW - 10);
+        cache.put_vulnerabilities(
+            Ecosystem::PyPI,
+            "old-list",
+            VERSION,
+            vec![known("GHSA-old")],
+            NOW - 10,
+        );
+        store_details(&mut cache, "GHSA-new", NOW + 100);
+        cache.put_vulnerabilities(
+            Ecosystem::PyPI,
+            "new-list",
+            VERSION,
+            vec![known("GHSA-new")],
+            NOW + 100,
+        );
+
+        let block = cache.export_block(Ecosystem::PyPI);
+
+        assert!(encode_block(&block).len() <= MAX_BLOCK_BYTES);
+        let mut kept: Vec<u64> = block
+            .registry
+            .keys()
+            .map(|name| name.strip_prefix("pkg-").unwrap().parse().unwrap())
+            .collect();
+        kept.sort_unstable();
+        assert!(!kept.is_empty() && kept.len() < 30);
+        // Only the newest answers stay: the kept numbers are the last ones.
+        let first_kept = 30 - kept.len() as u64;
+        assert_eq!(kept, (first_kept..30).collect::<Vec<_>>());
+        // The oldest list went first, and its advisory with it. The newest list stays.
+        assert!(!block.lists.contains_key("old-list"));
+        assert!(!block.advisories.contains_key("GHSA-old"));
+        assert!(block.lists.contains_key("new-list"));
+        assert!(block.advisories.contains_key("GHSA-new"));
     }
 
     #[test]

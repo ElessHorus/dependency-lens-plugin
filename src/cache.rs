@@ -1,7 +1,7 @@
 //! In-memory TTL cache for registry versions, OSV results and advisories.
 
 use crate::model::{Affected, Ecosystem, VersionInfo, Vulnerability};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub mod persist;
 
@@ -38,6 +38,8 @@ pub struct Cache {
     /// The revision (`modified` time) of each stored advisory record. It outlives the TTL, so that
     /// an expired record whose revision did not change is confirmed without a new download.
     revisions: HashMap<String, String>,
+    /// Ecosystems whose disk block is out of date: a registry answer or a list was stored since the last save.
+    dirty: HashSet<Ecosystem>,
 }
 
 /// Returns the value of an entry that is still valid at `now`.
@@ -60,12 +62,35 @@ impl Cache {
             advisories: HashMap::new(),
             affected: HashMap::new(),
             revisions: HashMap::new(),
+            dirty: HashSet::new(),
         }
     }
 
     /// Returns `false` when the cache must not store anything.
     fn stores_entries(&self) -> bool {
         self.ttl_secs > 0
+    }
+
+    /// Returns `true` when the disk block of `ecosystem` is out of date.
+    pub fn is_dirty(&self, ecosystem: Ecosystem) -> bool {
+        self.dirty.contains(&ecosystem)
+    }
+
+    /// Returns the ecosystems whose disk block is out of date, in order, and marks them all clean.
+    pub fn take_dirty(&mut self) -> Vec<Ecosystem> {
+        let mut ecosystems: Vec<Ecosystem> = self.dirty.drain().collect();
+        ecosystems.sort_unstable();
+        ecosystems
+    }
+
+    /// Marks the disk block of `ecosystem` as up to date.
+    pub fn mark_clean(&mut self, ecosystem: Ecosystem) {
+        self.dirty.remove(&ecosystem);
+    }
+
+    /// Marks the disk block of `ecosystem` as out of date, for a save that did not succeed.
+    pub fn mark_dirty(&mut self, ecosystem: Ecosystem) {
+        self.dirty.insert(ecosystem);
     }
 
     /// Returns the cached version data for a package, if still valid.
@@ -80,6 +105,7 @@ impl Cache {
         if !self.stores_entries() {
             return;
         }
+        self.dirty.insert(eco);
         self.version_info.entry(eco).or_default().insert(
             package.to_owned(),
             Entry {
@@ -113,6 +139,7 @@ impl Cache {
         if !self.stores_entries() {
             return;
         }
+        self.dirty.insert(eco);
         self.vulnerabilities
             .entry(eco)
             .or_default()
