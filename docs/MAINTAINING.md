@@ -45,7 +45,7 @@ The workflows pin each action to a commit SHA, with the version in a comment. A 
 2. Create your signing key once: `openidea-plugin keygen <publisher>.key`. Keep the file secret and out of Git.
 3. Check that `id` in `plugin.toml` is `<publisher>.dependency-lens`.
 4. In the GitHub repository, add the secret `OPENIDEA_PLUGIN_KEY` with the content of `<publisher>.key`. Add the variable `PUBLISHER` with the value `<publisher>`. The release workflow stops with a clear message when one of them is missing.
-5. Set `version` in `plugin.toml`, in `Cargo.toml` and in `Cargo.lock` to the new version. Push the tag `v<version>`: `git tag v<version>` and then `git push origin v<version>`. The release workflow checks that the tag matches `version` in `plugin.toml` and in `Cargo.toml`. It then packs and signs the plugin, attaches `<publisher>.dependency-lens-<version>.oiplugin` to the GitHub release, and prints its SHA-256 in the job summary.
+5. Set `version` in `plugin.toml`, in `Cargo.toml` and in `Cargo.lock` to the new version. Write its entry in `change-notes` in `plugin.toml`, and name each new permission in it: the first release with the disk cache (Todo C.1) adds `storage`, which the user approves at the update. Push the tag `v<version>`: `git tag v<version>` and then `git push origin v<version>`. The release workflow checks that the tag matches `version` in `plugin.toml` and in `Cargo.toml`. It then packs and signs the plugin, attaches `<publisher>.dependency-lens-<version>.oiplugin` to the GitHub release, and prints its SHA-256 in the job summary.
 6. Open a pull request to `l0ng-ai/openidea-plugins`. It adds two files. First, `publishers/<publisher>.toml`:
 
    ```toml
