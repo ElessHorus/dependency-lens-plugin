@@ -262,7 +262,11 @@ fn diagnostic_of(range: Range, entry: &Entry) -> Option<Diagnostic> {
         "{} {version}: {noun} ({severity_text})",
         entry.dependency.name
     );
-    let mut diagnostic = Diagnostic::new(range, severity, message).code(first.id.clone());
+    let mut diagnostic = Diagnostic::new(range, severity, message);
+    // An entry restored from the disk cache can have no id, so it names nothing.
+    if !first.id.is_empty() {
+        diagnostic = diagnostic.code(first.id.clone());
+    }
     diagnostic.source = Some(DIAGNOSTIC_SOURCE.to_owned());
     Some(diagnostic)
 }
@@ -785,6 +789,25 @@ mod tests {
             problem.message
         );
         assert_eq!(problem.code.as_deref(), Some("GHSA-d0"));
+    }
+
+    #[test]
+    fn a_problem_for_anonymous_deferred_advisories_has_no_code() {
+        // Entries restored from the disk cache keep no id, so the problem has nothing to name.
+        let vulnerabilities = vec![
+            crate::osv::anonymous_deferred(),
+            crate::osv::anonymous_deferred(),
+        ];
+        let analysis = serde_entry(Status::NotChecked, vulnerabilities, Some("1.0.0"));
+        let problem = &diagnostics(SERDE_TEXT, &analysis, true)[0];
+        assert_eq!(problem.code, None);
+        assert!(
+            problem
+                .message
+                .contains("2 known vulnerabilities (details not loaded)"),
+            "{}",
+            problem.message
+        );
     }
 
     #[test]

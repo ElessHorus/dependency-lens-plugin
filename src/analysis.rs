@@ -76,6 +76,8 @@ pub struct Budget {
     /// How many package versions that were never queried may go to OSV in one call, at the least.
     /// The share doubles with the answers that the cache holds. `None` queries all of them.
     first_osv_slice: Option<usize>,
+    /// No request leaves in this run: it only reads what the cache holds.
+    is_offline: bool,
 }
 
 impl Budget {
@@ -87,6 +89,18 @@ impl Budget {
             details_per_query: DEFAULT_DETAILS_PER_QUERY,
             is_cancelled: false,
             first_osv_slice: None,
+            is_offline: false,
+        }
+    }
+
+    /// Creates a budget for a run that sends no request at all, to show what the cache holds.
+    ///
+    /// No registry lookup and no OSV query run, so nothing is stored and no failure is recorded.
+    /// An entry that needs a request stays [`Status::Pending`].
+    pub fn offline() -> Self {
+        Self {
+            is_offline: true,
+            ..Self::new(0, None)
         }
     }
 
@@ -410,8 +424,11 @@ fn query_missing_vulnerabilities(
     now: u64,
     budget: &mut Budget,
 ) -> FreshOsv {
-    let details_per_query = budget.details_per_query();
     let mut fresh = FreshOsv::default();
+    if budget.is_offline {
+        return fresh;
+    }
+    let details_per_query = budget.details_per_query();
     // How many package versions that OSV never answered for may be sent in this call: the slice
     // of the budget, or as many as the cache already answered, so the slice doubles at each call.
     let new_pair_limit = budget.first_osv_slice().map(|slice| {
@@ -2378,5 +2395,145 @@ mod tests {
                 )
                 .is_some()
         );
+    }
+
+    /// A time far from zero, so that entries can be stored in the past.
+    const LATER_SECS: u64 = 30 * 24 * 60 * 60;
+
+    #[test]
+    fn an_offline_analysis_sends_no_request_and_records_no_failure() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new();
+
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            LATER_SECS,
+            "requests==1.0.0\n",
+            &mut Budget::offline(),
+        );
+
+        assert!(http.requests().is_empty());
+        assert_eq!(analysis.entries[0].status, Status::Pending);
+        assert_eq!(analysis.pending, 1);
+        for kind in [FailureKind::Registry, FailureKind::Osv] {
+            for key in ["requests", "requests@1.0.0"] {
+                assert!(
+                    cache
+                        .failure(kind, Ecosystem::PyPI, key, LATER_SECS)
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_offline_analysis_of_a_cargo_manifest_sends_nothing() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new();
+
+        let analysis = analyze(
+            Ecosystem::Cargo,
+            parsers::cargo::parse(MANIFEST),
+            &mut cache,
+            &http,
+            &Settings::default(),
+            NOW,
+            &mut Budget::offline(),
+        );
+
+        assert!(http.requests().is_empty());
+        assert_eq!(analysis.pending, 3);
+        assert!(
+            analysis
+                .entries
+                .iter()
+                .all(|entry| entry.status == Status::Pending)
+        );
+    }
+
+    /// Caches an old registry answer and an old vulnerability list of `requests 1.0.0`.
+    fn cache_with_old_requests(stored_at: u64) -> Cache {
+        let mut cache = Cache::new(TTL_SECS);
+        cache.put_version_info(
+            Ecosystem::PyPI,
+            "requests",
+            VersionInfo {
+                latest: Some("2.0".to_owned()),
+                versions: vec!["2.0".to_owned(), "1.0".to_owned()],
+            },
+            stored_at,
+        );
+        cache.put_vulnerabilities(
+            Ecosystem::PyPI,
+            "requests",
+            "1.0.0",
+            vec![Vulnerability {
+                id: "GHSA-stale".to_owned(),
+                severity: AdvisorySeverity::High,
+                summary: "stale advisory".to_owned(),
+                url: None,
+            }],
+            stored_at,
+        );
+        cache
+    }
+
+    #[test]
+    fn a_stale_offline_analysis_builds_entries_from_old_data() {
+        use crate::cache::persist::STALE_MAX_AGE_SECS;
+        let mut cache = cache_with_old_requests(LATER_SECS - 7200);
+        let http = FakeHttp::new();
+
+        // With the normal lifetime, nothing is fresh: the entry waits.
+        let fresh = analyze_python(
+            &mut cache,
+            &http,
+            LATER_SECS,
+            "requests==1.0.0\n",
+            &mut Budget::offline(),
+        );
+        assert_eq!(fresh.pending, 1);
+
+        let stale = cache.with_stale_reads(STALE_MAX_AGE_SECS, |cache| {
+            analyze_python(
+                cache,
+                &http,
+                LATER_SECS,
+                "requests==1.0.0\n",
+                &mut Budget::offline(),
+            )
+        });
+
+        assert_eq!(stale.pending, 0);
+        let requests = &stale.entries[0];
+        assert_eq!(
+            requests.status,
+            Status::Outdated {
+                latest: "2.0".to_owned()
+            }
+        );
+        assert_eq!(requests.vulnerabilities[0].id, "GHSA-stale");
+        assert!(http.requests().is_empty());
+    }
+
+    #[test]
+    fn a_stale_offline_analysis_ignores_data_older_than_the_maximum_age() {
+        use crate::cache::persist::STALE_MAX_AGE_SECS;
+        let mut cache = cache_with_old_requests(LATER_SECS - STALE_MAX_AGE_SECS - 1);
+        let http = FakeHttp::new();
+
+        let stale = cache.with_stale_reads(STALE_MAX_AGE_SECS, |cache| {
+            analyze_python(
+                cache,
+                &http,
+                LATER_SECS,
+                "requests==1.0.0\n",
+                &mut Budget::offline(),
+            )
+        });
+
+        assert_eq!(stale.pending, 1);
+        assert_eq!(stale.entries[0].status, Status::Pending);
     }
 }

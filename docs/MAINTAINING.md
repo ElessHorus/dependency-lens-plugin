@@ -11,7 +11,13 @@ Run these checks in the real IDE, after building and linking the plugin (see the
 3. In a multi-project window, open a manifest of a project that is not the main project. Check that its decorations and problems appear.
 4. Open a manifest saved with a UTF-8 byte order mark. Check that the decoration columns are correct.
 5. Open a manifest with an old package that has many advisories, such as a `Gemfile` with `nokogiri 1.10.0`. Check that the first open is fast, that the hover lists 10 advisories and a line such as `N more not loaded`, and that the command "Dependency Lens: Load all vulnerabilities" loads the others.
-5. Turn one ecosystem off in the settings. Check that no request is sent for its manifests.
+6. Turn one ecosystem off in the settings. Check that no request is sent for its manifests.
+7. Check the disk cache, the way a user meets it:
+   - The permissions dialog of the plugin lists `storage`.
+   - Open a manifest of 10 old PyPI packages (about 11 s when cold, before the disk cache) and wait for the last decoration. Note the time.
+   - Choose Reload in Settings › Plugins, or wait five minutes for the IDE to unload the plugin. Open the manifest again. The decorations must show at once from the disk, and the new answers replace them when the check ends. Find the line `cache: loaded PyPI (<n> records, <b> bytes) in <t> ms` in the plugin log (debug level) and note `<t>`.
+   - Set `cacheTtlSeconds` to `0` and open it again, to compare with no cache.
+   - Run "Dependency Lens: Clear cache". The next cold open is slow again.
 
 ## Updating the pinned actions
 
@@ -39,7 +45,7 @@ The workflows pin each action to a commit SHA, with the version in a comment. A 
 2. Create your signing key once: `openidea-plugin keygen <publisher>.key`. Keep the file secret and out of Git.
 3. Check that `id` in `plugin.toml` is `<publisher>.dependency-lens`.
 4. In the GitHub repository, add the secret `OPENIDEA_PLUGIN_KEY` with the content of `<publisher>.key`. Add the variable `PUBLISHER` with the value `<publisher>`. The release workflow stops with a clear message when one of them is missing.
-5. Set `version` in `plugin.toml`, in `Cargo.toml` and in `Cargo.lock` to the new version. Push the tag `v<version>`: `git tag v<version>` and then `git push origin v<version>`. The release workflow checks that the tag matches `version` in `plugin.toml` and in `Cargo.toml`. It then packs and signs the plugin, attaches `<publisher>.dependency-lens-<version>.oiplugin` to the GitHub release, and prints its SHA-256 in the job summary.
+5. Set `version` in `plugin.toml`, in `Cargo.toml` and in `Cargo.lock` to the new version. Write its entry in `change-notes` in `plugin.toml`, and name each new permission in it: the first release with the disk cache (Todo C.1) adds `storage`, which the user approves at the update. Push the tag `v<version>`: `git tag v<version>` and then `git push origin v<version>`. The release workflow checks that the tag matches `version` in `plugin.toml` and in `Cargo.toml`. It then packs and signs the plugin, attaches `<publisher>.dependency-lens-<version>.oiplugin` to the GitHub release, and prints its SHA-256 in the job summary.
 6. Open a pull request to `l0ng-ai/openidea-plugins`. It adds two files. First, `publishers/<publisher>.toml`:
 
    ```toml

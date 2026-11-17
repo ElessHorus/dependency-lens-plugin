@@ -1,7 +1,9 @@
 //! In-memory TTL cache for registry versions, OSV results and advisories.
 
 use crate::model::{Affected, Ecosystem, VersionInfo, Vulnerability};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+pub mod persist;
 
 /// Lifetime of a cached failure, in seconds. Independent of the cache TTL.
 const FAILURE_TTL_SECS: u64 = 60;
@@ -26,7 +28,10 @@ type VulnerabilityIndex = HashMap<String, HashMap<String, Entry<Vec<Vulnerabilit
 
 /// In-memory cache with a time-to-live per entry.
 pub struct Cache {
+    /// Lifetime of a stored entry: it decides what a write keeps and what a read still accepts.
     ttl_secs: u64,
+    /// Oldest age that a read accepts. It equals `ttl_secs`, except inside [`Cache::with_stale_reads`].
+    read_ttl_secs: u64,
     version_info: HashMap<Ecosystem, HashMap<String, Entry<VersionInfo>>>,
     vulnerabilities: HashMap<Ecosystem, VulnerabilityIndex>,
     failures: HashMap<(FailureKind, Ecosystem), HashMap<String, Entry<String>>>,
@@ -36,6 +41,12 @@ pub struct Cache {
     /// The revision (`modified` time) of each stored advisory record. It outlives the TTL, so that
     /// an expired record whose revision did not change is confirmed without a new download.
     revisions: HashMap<String, String>,
+    /// The ecosystems that the `affected` entries of an advisory cover, for an advisory that came
+    /// from a disk block. A disk block holds only the entries of its own ecosystem. An advisory
+    /// without a line here has the entries of every ecosystem, as a network answer gives them.
+    partial_affected: HashMap<String, HashSet<Ecosystem>>,
+    /// Ecosystems whose disk block is out of date: a registry answer or a list was stored since the last save.
+    dirty: HashSet<Ecosystem>,
 }
 
 /// Returns the value of an entry that is still valid at `now`.
@@ -52,12 +63,15 @@ impl Cache {
     pub fn new(ttl_secs: u64) -> Self {
         Self {
             ttl_secs,
+            read_ttl_secs: ttl_secs,
             version_info: HashMap::new(),
             vulnerabilities: HashMap::new(),
             failures: HashMap::new(),
             advisories: HashMap::new(),
             affected: HashMap::new(),
             revisions: HashMap::new(),
+            partial_affected: HashMap::new(),
+            dirty: HashSet::new(),
         }
     }
 
@@ -66,11 +80,54 @@ impl Cache {
         self.ttl_secs > 0
     }
 
+    /// Runs `run` with reads that accept entries up to `max_age_secs` old, whatever the lifetime.
+    ///
+    /// A first pass over old data shows something at once while the real lookups are still to come.
+    /// Writes and [`Cache::confirm_advisory`] keep the normal lifetime. The normal read limit
+    /// returns when `run` ends.
+    pub fn with_stale_reads<R>(
+        &mut self,
+        max_age_secs: u64,
+        run: impl FnOnce(&mut Cache) -> R,
+    ) -> R {
+        let normal_limit = std::mem::replace(&mut self.read_ttl_secs, max_age_secs);
+        let result = run(self);
+        self.read_ttl_secs = normal_limit;
+        result
+    }
+
+    /// Empties the cache: every entry, every revision and every failure. The lifetime stays.
+    pub fn clear(&mut self) {
+        *self = Self::new(self.ttl_secs);
+    }
+
+    /// Returns `true` when the disk block of `ecosystem` is out of date.
+    pub fn is_dirty(&self, ecosystem: Ecosystem) -> bool {
+        self.dirty.contains(&ecosystem)
+    }
+
+    /// Returns the ecosystems whose disk block is out of date, in order, and marks them all clean.
+    pub fn take_dirty(&mut self) -> Vec<Ecosystem> {
+        let mut ecosystems: Vec<Ecosystem> = self.dirty.drain().collect();
+        ecosystems.sort_unstable();
+        ecosystems
+    }
+
+    /// Marks the disk block of `ecosystem` as up to date.
+    pub fn mark_clean(&mut self, ecosystem: Ecosystem) {
+        self.dirty.remove(&ecosystem);
+    }
+
+    /// Marks the disk block of `ecosystem` as out of date, for a save that did not succeed.
+    pub fn mark_dirty(&mut self, ecosystem: Ecosystem) {
+        self.dirty.insert(ecosystem);
+    }
+
     /// Returns the cached version data for a package, if still valid.
     pub fn version_info(&self, eco: Ecosystem, package: &str, now: u64) -> Option<&VersionInfo> {
         // Nested maps let a `&str` key the lookup, so no `String` is built.
         let entry = self.version_info.get(&eco)?.get(package);
-        fresh_value(entry, now, self.ttl_secs)
+        fresh_value(entry, now, self.read_ttl_secs)
     }
 
     /// Stores version data for a package, replacing any previous value.
@@ -78,6 +135,7 @@ impl Cache {
         if !self.stores_entries() {
             return;
         }
+        self.dirty.insert(eco);
         self.version_info.entry(eco).or_default().insert(
             package.to_owned(),
             Entry {
@@ -96,7 +154,7 @@ impl Cache {
         now: u64,
     ) -> Option<&[Vulnerability]> {
         let entry = self.vulnerabilities.get(&eco)?.get(package)?.get(version);
-        fresh_value(entry, now, self.ttl_secs).map(Vec::as_slice)
+        fresh_value(entry, now, self.read_ttl_secs).map(Vec::as_slice)
     }
 
     /// Stores the vulnerabilities of one package version, replacing any previous value.
@@ -111,6 +169,7 @@ impl Cache {
         if !self.stores_entries() {
             return;
         }
+        self.dirty.insert(eco);
         self.vulnerabilities
             .entry(eco)
             .or_default()
@@ -160,12 +219,12 @@ impl Cache {
 
     /// Returns a cached advisory by its identifier, if still valid.
     pub fn advisory(&self, id: &str, now: u64) -> Option<&Vulnerability> {
-        fresh_value(self.advisories.get(id), now, self.ttl_secs)
+        fresh_value(self.advisories.get(id), now, self.read_ttl_secs)
     }
 
     /// Returns the cached affected ranges of an advisory, if still valid.
     pub fn affected(&self, id: &str, now: u64) -> Option<&[Affected]> {
-        fresh_value(self.affected.get(id), now, self.ttl_secs).map(Vec::as_slice)
+        fresh_value(self.affected.get(id), now, self.read_ttl_secs).map(Vec::as_slice)
     }
 
     /// Stores the affected ranges of the advisory `id`, replacing any previous value.
@@ -173,6 +232,8 @@ impl Cache {
         if !self.stores_entries() {
             return;
         }
+        // What a network answer gives is complete, whatever a disk block gave before.
+        self.partial_affected.remove(id);
         self.affected.insert(
             id.to_owned(),
             Entry {
@@ -180,6 +241,22 @@ impl Cache {
                 stored_at: now,
             },
         );
+    }
+
+    /// Returns `true` when the cached `affected` entries of the advisory `id` include those of `ecosystem`.
+    ///
+    /// An advisory that came from the disk block of another ecosystem only has the entries of that
+    /// one, so it must be downloaded again for `ecosystem`. An advisory that the cache does not hold
+    /// has nothing to complete, so the answer is `true`.
+    pub fn has_affected_for(&self, id: &str, ecosystem: Ecosystem) -> bool {
+        self.partial_affected
+            .get(id)
+            .is_none_or(|covered| covered.contains(&ecosystem))
+    }
+
+    /// Returns `true` when the cache holds the `affected` entries of the advisory `id` as a network answer gave them.
+    fn has_complete_affected(&self, id: &str) -> bool {
+        self.affected.contains_key(id) && !self.partial_affected.contains_key(id)
     }
 
     /// Stores the revision of the record of the advisory `id`, as a comparable key.
@@ -469,5 +546,135 @@ mod tests {
         cache.put_affected("GHSA-1", Vec::new(), START_SECS);
         cache.put_revision("GHSA-1", "r1");
         assert!(!cache.confirm_advisory("GHSA-1", Some("r1"), START_SECS));
+    }
+
+    /// A time far from zero, so that entries can be stored in the past.
+    const LATER_SECS: u64 = 30 * 24 * 60 * 60;
+
+    #[test]
+    fn stale_reads_show_data_older_than_the_ttl() {
+        let mut cache = Cache::new(TTL_SECS);
+        cache.put_version_info(
+            Ecosystem::PyPI,
+            "requests",
+            sample_info(),
+            LATER_SECS - 7200,
+        );
+        assert!(
+            cache
+                .version_info(Ecosystem::PyPI, "requests", LATER_SECS)
+                .is_none()
+        );
+
+        let shown = cache.with_stale_reads(persist::STALE_MAX_AGE_SECS, |cache| {
+            cache
+                .version_info(Ecosystem::PyPI, "requests", LATER_SECS)
+                .cloned()
+        });
+
+        assert_eq!(shown, Some(sample_info()));
+        // The normal limit returns afterwards.
+        assert!(
+            cache
+                .version_info(Ecosystem::PyPI, "requests", LATER_SECS)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stale_reads_cover_lists_advisories_and_affected_ranges() {
+        let mut cache = Cache::new(TTL_SECS);
+        let stored_at = LATER_SECS - 7200;
+        cache.put_vulnerabilities(
+            Ecosystem::PyPI,
+            "requests",
+            "1.0.0",
+            vec![sample_vulnerability("GHSA-1")],
+            stored_at,
+        );
+        cache.put_advisory(sample_vulnerability("GHSA-1"), stored_at);
+        cache.put_affected("GHSA-1", Vec::new(), stored_at);
+
+        cache.with_stale_reads(persist::STALE_MAX_AGE_SECS, |cache| {
+            assert!(
+                cache
+                    .vulnerabilities(Ecosystem::PyPI, "requests", "1.0.0", LATER_SECS)
+                    .is_some()
+            );
+            assert!(cache.advisory("GHSA-1", LATER_SECS).is_some());
+            assert!(cache.affected("GHSA-1", LATER_SECS).is_some());
+        });
+        assert!(cache.advisory("GHSA-1", LATER_SECS).is_none());
+    }
+
+    #[test]
+    fn stale_reads_do_not_show_data_older_than_the_maximum_age() {
+        let mut cache = Cache::new(TTL_SECS);
+        let eight_days = 8 * 24 * 60 * 60;
+        cache.put_version_info(
+            Ecosystem::PyPI,
+            "requests",
+            sample_info(),
+            LATER_SECS - eight_days,
+        );
+
+        let shown = cache.with_stale_reads(persist::STALE_MAX_AGE_SECS, |cache| {
+            cache
+                .version_info(Ecosystem::PyPI, "requests", LATER_SECS)
+                .is_some()
+        });
+
+        assert!(!shown);
+    }
+
+    #[test]
+    fn clear_empties_every_table_and_keeps_the_lifetime() {
+        let mut cache = Cache::new(TTL_SECS);
+        cache.put_version_info(Ecosystem::PyPI, "requests", sample_info(), START_SECS);
+        cache.put_vulnerabilities(Ecosystem::PyPI, "requests", "1.0.0", Vec::new(), START_SECS);
+        cache.put_advisory(sample_vulnerability("GHSA-1"), START_SECS);
+        cache.put_affected("GHSA-1", Vec::new(), START_SECS);
+        cache.put_revision("GHSA-1", "r1");
+        cache.put_failure(
+            FailureKind::Osv,
+            Ecosystem::PyPI,
+            "requests@1.0.0",
+            "boom".to_owned(),
+            START_SECS,
+        );
+
+        cache.clear();
+
+        assert!(
+            cache
+                .version_info(Ecosystem::PyPI, "requests", START_SECS)
+                .is_none()
+        );
+        assert!(
+            cache
+                .vulnerabilities(Ecosystem::PyPI, "requests", "1.0.0", START_SECS)
+                .is_none()
+        );
+        assert!(cache.advisory("GHSA-1", START_SECS).is_none());
+        assert!(cache.affected("GHSA-1", START_SECS).is_none());
+        assert!(!cache.confirm_advisory("GHSA-1", Some("r1"), START_SECS));
+        assert!(
+            cache
+                .failure(
+                    FailureKind::Osv,
+                    Ecosystem::PyPI,
+                    "requests@1.0.0",
+                    START_SECS
+                )
+                .is_none()
+        );
+        assert!(!cache.is_dirty(Ecosystem::PyPI));
+        // The lifetime is kept: a new entry is still stored.
+        cache.put_version_info(Ecosystem::PyPI, "requests", sample_info(), START_SECS);
+        assert!(
+            cache
+                .version_info(Ecosystem::PyPI, "requests", START_SECS)
+                .is_some()
+        );
     }
 }

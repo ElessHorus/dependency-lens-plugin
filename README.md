@@ -105,6 +105,17 @@ The plugin does not send a package that the manifest takes from a source other t
 
 The plugin reads only the text of the manifest. A private source that a tool sets outside the manifest, such as a pip configuration file or an environment variable, is not seen.
 
+## Cache on disk
+
+The IDE unloads an idle plugin after about five minutes. So that the next open does not start cold, the plugin keeps its cache on disk, in the storage that the IDE gives to each plugin. This needs the `storage` permission, which you approve at install.
+
+- **What is stored.** For each ecosystem, one block holds the registry answer of each public package (the latest release and the list of releases) and, for each declared version, the number of advisories, the ids of the first 10, and the details of the ones that are loaded (severity, summary, affected ranges and OSV revision). Failed lookups are not stored. The details that "Load all vulnerabilities" loads stay in memory for the session. After a restart the manifest shows 10 advisories again with the exact count, and the command loads the others.
+- **What is never stored.** A private or local package, a package in `ignore`, and a package of an ecosystem that is turned off never reach the cache. A package that you add to `ignore` later leaves the disk the next time its block is written. What was cached before you turned an ecosystem off stays on the disk until you run "Dependency Lens: Clear cache" or the 7 days pass. The plugin stores no file content and no project path.
+- **How it is used.** The plugin reads the block of an ecosystem the first time it opens a manifest of that ecosystem. Answers younger than `cacheTtlSeconds` are used as they are. Older answers (up to 7 days) are shown at once, and the plugin checks them right after and shows the new result. Records older than 7 days are dropped.
+- **Size.** A block keeps at most 2 MiB. The oldest records go first, and one record over 256 KiB is not stored.
+- **Clear it.** Run "Dependency Lens: Clear cache", or set `cacheTtlSeconds` to `0`: this also turns the cache off.
+- **Debug log.** The plugin logs `cache: loaded <ecosystem> (<n> records, <b> bytes) in <t> ms` at debug level each time it reads a block.
+
 ## Settings
 
 | Key | Type | Default | Meaning |
@@ -114,7 +125,7 @@ The plugin reads only the text of the manifest. A private source that a tool set
 | `minimumSeverity` | `low`, `medium`, `high` or `critical` | `low` | Hide advisories below this severity. |
 | `ignore` | array of strings | `[]` | Package names that are skipped. |
 | `ecosystems.<id>.enabled` | boolean | `true` | Analyze the manifests of one ecosystem. The ids are `cargo`, `npm`, `pypi`, `go`, `packagist`, `pub`, `nuget`, `rubygems` and `maven`. |
-| `cacheTtlSeconds` | integer | `3600` | Lifetime of cached answers. `0` turns the cache off, and the quick fix then never appears, because it reads the cache. Values above one week (`604800`) are read as one week. |
+| `cacheTtlSeconds` | integer | `3600` | Lifetime of cached answers. `0` turns the cache off, in memory and on disk, and the quick fix then never appears, because it reads the cache. Values above one week (`604800`) are read as one week. |
 
 ### Ignoring a package
 
@@ -127,8 +138,8 @@ Add the package name to `ignore`, for example `["serde", "left-pad"]`. The name 
 - The plugin checks the version declared in the manifest, not a lockfile.
 - For a requirement with a range (`^1.2`, `>=2.0`, `||`), the plugin checks the lower bound of the first alternative. A newer release is then shown as outdated against that bound.
 - The first lookup of a large manifest takes seconds. The lookups run one after another. The status bar shows the progress, and you can cancel the task. Each chunk of 20 lookups shows its results before the next chunk starts. After a five-minute soft cap, the entries that still show `…` finish on the next open, save or "Dependency Lens: Refresh" of their manifest.
-- Answers are cached in memory for `cacheTtlSeconds` (one hour by default). OSV gives a revision (the `modified` time) with each advisory. After the lifetime, an advisory whose revision did not change stays valid without a new download, and one whose revision changed is downloaded again. The cache is lost when the IDE unloads the plugin. A failed lookup is retried after 60 seconds.
-- The IDE unloads an idle plugin after about five minutes, and the in-memory cache is then empty. The "→ x" decorations stay on screen, but the update quick fix is unavailable until the next save or "Dependency Lens: Refresh".
+- Answers are cached in memory for `cacheTtlSeconds` (one hour by default). OSV gives a revision (the `modified` time) with each advisory. After the lifetime, an advisory whose revision did not change stays valid without a new download, and one whose revision changed is downloaded again. The cache is also kept on disk (see Cache on disk). A failed lookup is retried after 60 seconds.
+- The IDE unloads an idle plugin after about five minutes. The next open reads the cache again from the disk and shows it at once. The quick fix reads only answers younger than `cacheTtlSeconds`, so for older ones it appears after the check that follows the open.
 - "Dependency Lens: Refresh" reads the file again, but it answers from the cache while the entries are younger than `cacheTtlSeconds`.
 - The IDE cancels a running analysis when a newer open or save of the same kind arrives. The cancelled request is not a failure: the plugin shows nothing new for it, and the newer call asks again. If the newer call is for another file, the first manifest keeps what it showed until its next open or save.
 - The update quick fix writes the exact latest version. A compatible-release requirement such as `~=2.28` (Python) or `~> 7.0` (Ruby) becomes narrower after the fix (`~=2.31.0`).

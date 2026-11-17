@@ -1,6 +1,7 @@
 //! Shared data model for manifest parsing, registry lookups and advisories.
 
 use crate::parsers;
+use serde::{Deserialize, Serialize};
 
 /// Suffixes of the MSBuild project files that name NuGet packages (C#, F#, Visual Basic).
 const NUGET_PROJECT_SUFFIXES: [&str; 3] = [".csproj", ".fsproj", ".vbproj"];
@@ -202,7 +203,8 @@ pub struct VersionInfo {
 }
 
 /// How severe a security advisory is. Variants are ordered from least to most severe.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AdvisorySeverity {
     /// Minor impact.
     Low,
@@ -215,7 +217,8 @@ pub enum AdvisorySeverity {
 }
 
 /// One boundary of a version range that an advisory affects.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RangeEvent {
     /// The first affected version. `0` means every version from the start.
     Introduced(String),
