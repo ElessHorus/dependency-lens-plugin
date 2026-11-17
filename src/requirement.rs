@@ -1,6 +1,7 @@
 //! What a version requirement allows: constraints, alternatives and the lowest allowed version.
 
 use crate::model::Ecosystem;
+use crate::osv::declared_version_for_osv;
 use crate::registries::dotted::{DottedVersion, PubVersion, is_dev_branch, segment};
 use crate::registries::gem_version::GemVersion;
 use crate::registries::maven_version::MavenVersion;
@@ -150,6 +151,40 @@ fn parse_nuget_range(text: &str) -> Option<Requirement> {
         }
     };
     Requirement::from_constraints(constraints)
+}
+
+/// The version to send to OSV for one dependency, or `None` when the requirement is not audited.
+///
+/// `declared_version` is the version text of the manifest and `versions` the registry list, newest
+/// first. A requirement with a range gives the lowest version that it allows. The text of the
+/// lower bound is the answer when the requirement is an exact pin, when the list is missing, and
+/// when no listed version fits, so that no dependency is audited in silence.
+pub fn checked_version_of(
+    eco: Ecosystem,
+    declared_version: &str,
+    requirement: Option<&Requirement>,
+    versions: Option<&[String]>,
+) -> Option<String> {
+    let bound_text = declared_version_for_osv(declared_version)?;
+    let Some(requirement) = requirement.filter(|requirement| !requirement.is_exact_pin()) else {
+        return Some(bound_text);
+    };
+    Some(
+        versions
+            .and_then(|list| requirement.lowest_allowed(eco, list))
+            .unwrap_or(bound_text),
+    )
+}
+
+/// Whether the checked version of a dependency needs the registry list.
+pub fn needs_list(
+    eco: Ecosystem,
+    declared_version: &str,
+    requirement: Option<&Requirement>,
+) -> bool {
+    eco.offers_updates()
+        && requirement.is_some_and(|requirement| !requirement.is_exact_pin())
+        && declared_version_for_osv(declared_version).is_some()
 }
 
 /// Operators that a word of the requirement text may start with.
@@ -612,5 +647,66 @@ mod tests {
             interval.lowest_allowed(Ecosystem::NuGet, &versions(&["2.0.0", "1.9.0", "1.0.0"])),
             Some("1.0.0".to_owned())
         );
+    }
+
+    #[test]
+    fn the_requests_range_checks_the_lowest_allowed_version() {
+        let allowed = requirement(&[&[(">", "1.12"), ("<", "2.10")]]);
+        let list = versions(&REQUESTS);
+        assert_eq!(
+            checked_version_of(Ecosystem::PyPI, "1.12", Some(&allowed), Some(&list)),
+            Some("2.0.0".to_owned())
+        );
+        assert!(needs_list(Ecosystem::PyPI, "1.12", Some(&allowed)));
+    }
+
+    #[test]
+    fn without_a_list_or_an_allowed_version_the_bound_text_is_checked() {
+        let allowed = requirement(&[&[(">", "1.12"), ("<", "2.10")]]);
+        assert_eq!(
+            checked_version_of(Ecosystem::PyPI, "1.12", Some(&allowed), None),
+            Some("1.12".to_owned())
+        );
+        let none_fits = requirement(&[&[(">", "2.0.0"), ("<", "2.0.1")]]);
+        assert_eq!(
+            checked_version_of(
+                Ecosystem::PyPI,
+                "2.0.0",
+                Some(&none_fits),
+                Some(&versions(&REQUESTS))
+            ),
+            Some("2.0.0".to_owned())
+        );
+        assert_eq!(
+            checked_version_of(Ecosystem::Cargo, "1.12", None, None),
+            Some("1.12".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_exact_pin_keeps_its_text_and_needs_no_list() {
+        let pin = requirement(&[&[("==", "2.0.0")]]);
+        assert_eq!(
+            checked_version_of(
+                Ecosystem::PyPI,
+                "2.0.0",
+                Some(&pin),
+                Some(&versions(&["3.0.0"]))
+            ),
+            Some("2.0.0".to_owned())
+        );
+        assert!(!needs_list(Ecosystem::PyPI, "2.0.0", Some(&pin)));
+        assert!(!needs_list(Ecosystem::Cargo, "1.0", None));
+    }
+
+    #[test]
+    fn a_requirement_that_is_not_audited_stays_unaudited() {
+        let allowed = requirement(&[&[(">=", "1.2")]]);
+        let list = versions(&["1.2.5"]);
+        assert_eq!(
+            checked_version_of(Ecosystem::Packagist, "1.2.*", Some(&allowed), Some(&list)),
+            None
+        );
+        assert!(!needs_list(Ecosystem::Packagist, "1.2.*", Some(&allowed)));
     }
 }
