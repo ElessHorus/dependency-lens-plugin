@@ -1,7 +1,7 @@
 //! What a version requirement allows: constraints, alternatives and the lowest allowed version.
 
 use crate::model::Ecosystem;
-use crate::registries::dotted::{DottedVersion, PubVersion, segment};
+use crate::registries::dotted::{DottedVersion, PubVersion, is_dev_branch, segment};
 use crate::registries::gem_version::GemVersion;
 use crate::registries::maven_version::MavenVersion;
 use crate::registries::pep440::Pep440;
@@ -35,6 +35,19 @@ impl Requirement {
     /// Builds a requirement of one alternative. Returns `None` without any constraint.
     pub fn from_constraints(constraints: Vec<Constraint>) -> Option<Self> {
         Self::new(vec![constraints])
+    }
+
+    /// Reads the requirement text of a manifest.
+    ///
+    /// Supports PyPI (Poetry text), Packagist and Pub. Returns `None` for any other ecosystem and
+    /// for text that names no single readable range: wildcards, hyphen ranges, branches, `any`.
+    pub fn parse(eco: Ecosystem, text: &str) -> Option<Self> {
+        match eco {
+            Ecosystem::PyPI | Ecosystem::Packagist | Ecosystem::Pub => {
+                parse_operator_text(eco, text)
+            }
+            _ => None,
+        }
     }
 
     /// Whether the requirement names one version: one alternative with one `==` or `===`.
@@ -91,6 +104,138 @@ impl Requirement {
             })
             .cloned()
     }
+}
+
+/// Operators that a word of the requirement text may start with.
+const TEXT_OPERATORS: [&str; 13] = [
+    "", "=", "==", "===", "!=", ">", ">=", "<", "<=", "~=", "~>", "^", "~",
+];
+
+/// Reads text in the shared grammar of Poetry, Composer and Pub: alternatives split by `|` or `||`,
+/// constraints split by `,` or spaces, and an operator that may stand apart from its version.
+fn parse_operator_text(eco: Ecosystem, text: &str) -> Option<Requirement> {
+    if is_dev_branch(text.trim()) {
+        return None;
+    }
+    let alternatives = text
+        .split('|')
+        .map(str::trim)
+        .filter(|alternative| !alternative.is_empty())
+        .map(|alternative| parse_alternative(eco, alternative))
+        .collect::<Option<Vec<_>>>()?;
+    Requirement::new(alternatives)
+}
+
+/// Reads the constraints of one alternative. Returns `None` when a word is not a constraint.
+fn parse_alternative(eco: Ecosystem, alternative: &str) -> Option<Vec<Constraint>> {
+    let mut words = alternative
+        .split(|character: char| character == ',' || character.is_whitespace())
+        .filter(|word| !word.is_empty());
+    let mut constraints = Vec::new();
+    while let Some(word) = words.next() {
+        let is_operator_only = word.bytes().all(|byte| b"=!<>~^".contains(&byte));
+        // An operator that stands apart (`>= 1.0`) takes the next word as its version.
+        let joined;
+        let word = if is_operator_only {
+            joined = format!("{word}{}", words.next()?);
+            joined.as_str()
+        } else {
+            word
+        };
+        constraints.extend(parse_word(eco, word)?);
+    }
+    Some(constraints)
+}
+
+/// Reads one word such as `^1.2.3` into the constraints that it stands for.
+fn parse_word(eco: Ecosystem, word: &str) -> Option<Vec<Constraint>> {
+    // A Composer stability flag (`@dev`) follows the version and is cut here.
+    let word = word
+        .split_once('@')
+        .map_or(word, |(version_part, _)| version_part);
+    let operator_len = word
+        .bytes()
+        .take_while(|byte| b"=!<>~^".contains(byte))
+        .count();
+    let (operator, version) = word.split_at(operator_len);
+    if !TEXT_OPERATORS.contains(&operator)
+        || !version.starts_with(|character: char| character.is_ascii_digit())
+        || version.contains('*')
+        || version
+            .split('.')
+            .any(|part| part.eq_ignore_ascii_case("x"))
+    {
+        return None;
+    }
+    let constraint = |operator: &str, version: &str| Constraint {
+        operator: operator.to_owned(),
+        version: version.to_owned(),
+    };
+    Some(match (operator, eco) {
+        ("" | "=" | "==", _) => vec![constraint("==", version)],
+        ("^", _) => {
+            let segments = numeric_prefix(version);
+            // The first non-zero segment is the one that may not change (`^0.2.3` stops at `0.3`).
+            let kept = segments
+                .iter()
+                .position(|&part| part != 0)
+                .map_or(segments.len(), |index| index + 1);
+            vec![
+                constraint(">=", version),
+                constraint("<", &upper_bound(&segments, kept)?),
+            ]
+        }
+        ("~", Ecosystem::PyPI) => {
+            // Poetry keeps the major and minor segments: `~1.2.3` and `~1.2` stop at `1.3`, `~1` at `2`.
+            let segments = numeric_prefix(version);
+            let kept = segments.len().min(2);
+            vec![
+                constraint(">=", version),
+                constraint("<", &upper_bound(&segments, kept)?),
+            ]
+        }
+        // Composer reads `~1.2` as the compatible release `~> 1.2`.
+        ("~", Ecosystem::Packagist) => vec![constraint("~>", version)],
+        ("~", _) => return None,
+        (other, _) => vec![constraint(other, version)],
+    })
+}
+
+/// The leading numeric segments of a version text: `1.2.3rc1` gives `[1, 2, 3]`.
+fn numeric_prefix(version: &str) -> Vec<u64> {
+    version
+        .split('.')
+        .map_while(|part| {
+            let digits_len = part.bytes().take_while(u8::is_ascii_digit).count();
+            let digits = part.get(..digits_len).filter(|digits| !digits.is_empty())?;
+            // A part with a text tail ends the prefix after its own digits.
+            digits
+                .parse()
+                .ok()
+                .map(|number| (number, digits_len == part.len()))
+        })
+        .scan(false, |has_ended, (number, is_whole)| {
+            if *has_ended {
+                return None;
+            }
+            *has_ended = !is_whole;
+            Some(number)
+        })
+        .collect()
+}
+
+/// The text of the first version that a caret or tilde excludes: the first `kept` segments, with the last raised by one.
+fn upper_bound(segments: &[u64], kept: usize) -> Option<String> {
+    let kept = kept.min(segments.len());
+    let (last, head) = segments[..kept].split_last()?;
+    let raised = last.checked_add(1)?;
+    Some(
+        head.iter()
+            .map(u64::to_string)
+            .chain(std::iter::once(raised.to_string()))
+            .collect::<Vec<_>>()
+            .join("."),
+    )
 }
 
 /// Returns `true` when `target` satisfies every constraint. A constraint that is not a version
@@ -257,5 +402,130 @@ mod tests {
         let compatible = requirement(&[&[("~>", "2.2")]]);
         assert!(compatible.allows(Ecosystem::RubyGems, "2.9"));
         assert!(!compatible.allows(Ecosystem::RubyGems, "3.0"));
+    }
+
+    #[test]
+    fn pypi_text_reads_poetry_and_pep_440_forms() {
+        let cases: [(&str, Option<Requirement>); 10] = [
+            (
+                ">=2.0,<3.0",
+                Some(requirement(&[&[(">=", "2.0"), ("<", "3.0")]])),
+            ),
+            (
+                "^1.2.3",
+                Some(requirement(&[&[(">=", "1.2.3"), ("<", "2")]])),
+            ),
+            (
+                "^0.2.3",
+                Some(requirement(&[&[(">=", "0.2.3"), ("<", "0.3")]])),
+            ),
+            (
+                "^0.0.3",
+                Some(requirement(&[&[(">=", "0.0.3"), ("<", "0.0.4")]])),
+            ),
+            ("~1.2", Some(requirement(&[&[(">=", "1.2"), ("<", "1.3")]]))),
+            ("~1", Some(requirement(&[&[(">=", "1"), ("<", "2")]]))),
+            (
+                "^1.0|^2.0",
+                Some(requirement(&[
+                    &[(">=", "1.0"), ("<", "2")],
+                    &[(">=", "2.0"), ("<", "3")],
+                ])),
+            ),
+            ("1.2.3", Some(requirement(&[&[("==", "1.2.3")]]))),
+            ("*", None),
+            ("1.*", None),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(
+                Requirement::parse(Ecosystem::PyPI, text),
+                expected,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_text_reads_carets_tildes_and_alternatives() {
+        let cases: [(&str, Option<Requirement>); 9] = [
+            ("^1.2", Some(requirement(&[&[(">=", "1.2"), ("<", "2")]]))),
+            ("~1.2", Some(requirement(&[&[("~>", "1.2")]]))),
+            (
+                ">=1.0 <2.0",
+                Some(requirement(&[&[(">=", "1.0"), ("<", "2.0")]])),
+            ),
+            (
+                ">= 1.0, < 2.0",
+                Some(requirement(&[&[(">=", "1.0"), ("<", "2.0")]])),
+            ),
+            (
+                "^1.0 || ^2.0",
+                Some(requirement(&[
+                    &[(">=", "1.0"), ("<", "2")],
+                    &[(">=", "2.0"), ("<", "3")],
+                ])),
+            ),
+            (
+                "^1.0@dev",
+                Some(requirement(&[&[(">=", "1.0"), ("<", "2")]])),
+            ),
+            ("1.0 - 2.0", None),
+            ("dev-main", None),
+            ("1.2.*", None),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(
+                Requirement::parse(Ecosystem::Packagist, text),
+                expected,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn pub_text_reads_carets_and_space_separated_ranges() {
+        let cases: [(&str, Option<Requirement>); 5] = [
+            (
+                "^1.2.3",
+                Some(requirement(&[&[(">=", "1.2.3"), ("<", "2")]])),
+            ),
+            (
+                ">=1.0.0 <2.0.0",
+                Some(requirement(&[&[(">=", "1.0.0"), ("<", "2.0.0")]])),
+            ),
+            ("1.2.3", Some(requirement(&[&[("==", "1.2.3")]]))),
+            ("any", None),
+            ("~1.2", None),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(Requirement::parse(Ecosystem::Pub, text), expected, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_parsed_range_gives_its_lowest_allowed_version() {
+        let cases = [
+            (
+                Ecosystem::Packagist,
+                "^1.2",
+                &["2.0.0", "1.9.0", "1.2.1", "1.1.0"][..],
+                "1.2.1",
+            ),
+            (Ecosystem::Pub, "^0.0.3", &["0.0.4", "0.0.3"][..], "0.0.3"),
+            (
+                Ecosystem::PyPI,
+                "^1.5",
+                &["2.0.0", "1.9.0", "1.4.0"][..],
+                "1.9.0",
+            ),
+        ];
+        for (eco, text, list, expected) in cases {
+            let parsed = Requirement::parse(eco, text).expect("a readable requirement");
+            assert_eq!(
+                parsed.lowest_allowed(eco, &versions(list)),
+                Some(expected.to_owned()),
+                "{text}"
+            );
+        }
     }
 }
