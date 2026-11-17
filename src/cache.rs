@@ -28,7 +28,10 @@ type VulnerabilityIndex = HashMap<String, HashMap<String, Entry<Vec<Vulnerabilit
 
 /// In-memory cache with a time-to-live per entry.
 pub struct Cache {
+    /// Lifetime of a stored entry: it decides what a write keeps and what a read still accepts.
     ttl_secs: u64,
+    /// Oldest age that a read accepts. It equals `ttl_secs`, except inside [`Cache::with_stale_reads`].
+    read_ttl_secs: u64,
     version_info: HashMap<Ecosystem, HashMap<String, Entry<VersionInfo>>>,
     vulnerabilities: HashMap<Ecosystem, VulnerabilityIndex>,
     failures: HashMap<(FailureKind, Ecosystem), HashMap<String, Entry<String>>>,
@@ -56,6 +59,7 @@ impl Cache {
     pub fn new(ttl_secs: u64) -> Self {
         Self {
             ttl_secs,
+            read_ttl_secs: ttl_secs,
             version_info: HashMap::new(),
             vulnerabilities: HashMap::new(),
             failures: HashMap::new(),
@@ -69,6 +73,22 @@ impl Cache {
     /// Returns `false` when the cache must not store anything.
     fn stores_entries(&self) -> bool {
         self.ttl_secs > 0
+    }
+
+    /// Runs `run` with reads that accept entries up to `max_age_secs` old, whatever the lifetime.
+    ///
+    /// A first pass over old data shows something at once while the real lookups are still to come.
+    /// Writes and [`Cache::confirm_advisory`] keep the normal lifetime. The normal read limit
+    /// returns when `run` ends.
+    pub fn with_stale_reads<R>(
+        &mut self,
+        max_age_secs: u64,
+        run: impl FnOnce(&mut Cache) -> R,
+    ) -> R {
+        let normal_limit = std::mem::replace(&mut self.read_ttl_secs, max_age_secs);
+        let result = run(self);
+        self.read_ttl_secs = normal_limit;
+        result
     }
 
     /// Returns `true` when the disk block of `ecosystem` is out of date.
@@ -97,7 +117,7 @@ impl Cache {
     pub fn version_info(&self, eco: Ecosystem, package: &str, now: u64) -> Option<&VersionInfo> {
         // Nested maps let a `&str` key the lookup, so no `String` is built.
         let entry = self.version_info.get(&eco)?.get(package);
-        fresh_value(entry, now, self.ttl_secs)
+        fresh_value(entry, now, self.read_ttl_secs)
     }
 
     /// Stores version data for a package, replacing any previous value.
@@ -124,7 +144,7 @@ impl Cache {
         now: u64,
     ) -> Option<&[Vulnerability]> {
         let entry = self.vulnerabilities.get(&eco)?.get(package)?.get(version);
-        fresh_value(entry, now, self.ttl_secs).map(Vec::as_slice)
+        fresh_value(entry, now, self.read_ttl_secs).map(Vec::as_slice)
     }
 
     /// Stores the vulnerabilities of one package version, replacing any previous value.
@@ -189,12 +209,12 @@ impl Cache {
 
     /// Returns a cached advisory by its identifier, if still valid.
     pub fn advisory(&self, id: &str, now: u64) -> Option<&Vulnerability> {
-        fresh_value(self.advisories.get(id), now, self.ttl_secs)
+        fresh_value(self.advisories.get(id), now, self.read_ttl_secs)
     }
 
     /// Returns the cached affected ranges of an advisory, if still valid.
     pub fn affected(&self, id: &str, now: u64) -> Option<&[Affected]> {
-        fresh_value(self.affected.get(id), now, self.ttl_secs).map(Vec::as_slice)
+        fresh_value(self.affected.get(id), now, self.read_ttl_secs).map(Vec::as_slice)
     }
 
     /// Stores the affected ranges of the advisory `id`, replacing any previous value.
@@ -498,5 +518,84 @@ mod tests {
         cache.put_affected("GHSA-1", Vec::new(), START_SECS);
         cache.put_revision("GHSA-1", "r1");
         assert!(!cache.confirm_advisory("GHSA-1", Some("r1"), START_SECS));
+    }
+
+    /// A time far from zero, so that entries can be stored in the past.
+    const LATER_SECS: u64 = 30 * 24 * 60 * 60;
+
+    #[test]
+    fn stale_reads_show_data_older_than_the_ttl() {
+        let mut cache = Cache::new(TTL_SECS);
+        cache.put_version_info(
+            Ecosystem::PyPI,
+            "requests",
+            sample_info(),
+            LATER_SECS - 7200,
+        );
+        assert!(
+            cache
+                .version_info(Ecosystem::PyPI, "requests", LATER_SECS)
+                .is_none()
+        );
+
+        let shown = cache.with_stale_reads(persist::STALE_MAX_AGE_SECS, |cache| {
+            cache
+                .version_info(Ecosystem::PyPI, "requests", LATER_SECS)
+                .cloned()
+        });
+
+        assert_eq!(shown, Some(sample_info()));
+        // The normal limit returns afterwards.
+        assert!(
+            cache
+                .version_info(Ecosystem::PyPI, "requests", LATER_SECS)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stale_reads_cover_lists_advisories_and_affected_ranges() {
+        let mut cache = Cache::new(TTL_SECS);
+        let stored_at = LATER_SECS - 7200;
+        cache.put_vulnerabilities(
+            Ecosystem::PyPI,
+            "requests",
+            "1.0.0",
+            vec![sample_vulnerability("GHSA-1")],
+            stored_at,
+        );
+        cache.put_advisory(sample_vulnerability("GHSA-1"), stored_at);
+        cache.put_affected("GHSA-1", Vec::new(), stored_at);
+
+        cache.with_stale_reads(persist::STALE_MAX_AGE_SECS, |cache| {
+            assert!(
+                cache
+                    .vulnerabilities(Ecosystem::PyPI, "requests", "1.0.0", LATER_SECS)
+                    .is_some()
+            );
+            assert!(cache.advisory("GHSA-1", LATER_SECS).is_some());
+            assert!(cache.affected("GHSA-1", LATER_SECS).is_some());
+        });
+        assert!(cache.advisory("GHSA-1", LATER_SECS).is_none());
+    }
+
+    #[test]
+    fn stale_reads_do_not_show_data_older_than_the_maximum_age() {
+        let mut cache = Cache::new(TTL_SECS);
+        let eight_days = 8 * 24 * 60 * 60;
+        cache.put_version_info(
+            Ecosystem::PyPI,
+            "requests",
+            sample_info(),
+            LATER_SECS - eight_days,
+        );
+
+        let shown = cache.with_stale_reads(persist::STALE_MAX_AGE_SECS, |cache| {
+            cache
+                .version_info(Ecosystem::PyPI, "requests", LATER_SECS)
+                .is_some()
+        });
+
+        assert!(!shown);
     }
 }
