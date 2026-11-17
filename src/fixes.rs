@@ -5,11 +5,13 @@
 //! each range. The rules here pick, for one dependency, the smallest version that fixes every
 //! advisory of its current version.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::model::{Affected, Ecosystem, RangeEvent};
 use crate::registries::dotted::{DottedVersion, PubVersion, segment};
 use crate::registries::gem_version::GemVersion;
+use crate::registries::maven_version::MavenVersion;
 use crate::registries::pep440::Pep440;
 use crate::update::{UpdateVersion, split_operator};
 
@@ -68,6 +70,9 @@ pub fn fixed_version(
         Ecosystem::Pub => {
             fixed_version_of::<PubVersion>(eco, package, current, affected).map(|(_, text)| text)
         }
+        Ecosystem::Maven => {
+            fixed_version_of::<MavenVersion>(eco, package, current, affected).map(|(_, text)| text)
+        }
         _ => {
             fixed_version_of::<DottedVersion>(eco, package, current, affected).map(|(_, text)| text)
         }
@@ -92,8 +97,9 @@ fn entries_of<'a>(
 ) -> impl Iterator<Item = &'a Affected> {
     let wanted_package = eco.normalize_package(package);
     affected.iter().filter(move |entry| {
+        // OSV writes `*` for an advisory that covers every package of an ecosystem.
         entry.ecosystem.eq_ignore_ascii_case(eco.osv_name())
-            && eco.normalize_package(&entry.name) == wanted_package
+            && (entry.name == "*" || eco.normalize_package(&entry.name) == wanted_package)
     })
 }
 
@@ -147,8 +153,23 @@ pub fn plan_fix(
         Ecosystem::PyPI => plan_fix_of::<Pep440>(eco, package, current, advisories, allows),
         Ecosystem::RubyGems => plan_fix_of::<GemVersion>(eco, package, current, advisories, allows),
         Ecosystem::Pub => plan_fix_of::<PubVersion>(eco, package, current, advisories, allows),
+        Ecosystem::Maven => plan_fix_of::<MavenVersion>(eco, package, current, advisories, allows),
         _ => plan_fix_of::<DottedVersion>(eco, package, current, advisories, allows),
     }
+}
+
+/// Sorts `items` by `compare`, keeping the order of equal items. It never panics.
+///
+/// Maven's version order has cycles (`1.2.3.jbossorg-1 > 1.2.3 > 1.2.3-beta1 > 1.2.3.jbossorg-1`), and
+/// `slice::sort_by` may panic on such an order, which aborts the plugin. A binary insertion keeps
+/// the `n log n` comparisons, and on a cycle it gives an arbitrary order that still ends.
+fn sort_without_panic<T>(items: &mut Vec<T>, compare: impl Fn(&T, &T) -> Ordering) {
+    let mut sorted = Vec::with_capacity(items.len());
+    for item in items.drain(..) {
+        let position = sorted.partition_point(|placed| compare(placed, &item) != Ordering::Greater);
+        sorted.insert(position, item);
+    }
+    *items = sorted;
 }
 
 /// The kind of an OSV range event.
@@ -187,7 +208,7 @@ fn parse_range<V: UpdateVersion>(events: &[RangeEvent]) -> Vec<ParsedEvent<'_, V
         })
         .collect();
     // Stable, so events of the same version keep the order of the advisory.
-    parsed.sort_by(|left, right| left.version.cmp(&right.version));
+    sort_without_panic(&mut parsed, |left, right| left.version.cmp(&right.version));
     parsed
 }
 
@@ -378,7 +399,7 @@ fn plan_fix_of<V: UpdateVersion>(
         .filter(|event| event.kind == EventKind::Fixed && event.version > current)
         .map(|event| (&event.version, event.text))
         .collect();
-    candidates.sort_by(|left, right| left.0.cmp(right.0));
+    sort_without_panic(&mut candidates, |left, right| left.0.cmp(right.0));
     let fixed_count_at = |version: &V| {
         let probe = listed.probe(version);
         open_advisories
@@ -492,6 +513,7 @@ pub fn satisfies_all(eco: Ecosystem, target: &str, constraints: &[Constraint]) -
         Ecosystem::PyPI => satisfies_all_of::<Pep440>(target, constraints),
         Ecosystem::RubyGems => satisfies_all_of::<GemVersion>(target, constraints),
         Ecosystem::Pub => satisfies_all_of::<PubVersion>(target, constraints),
+        Ecosystem::Maven => satisfies_all_of::<MavenVersion>(target, constraints),
         _ => satisfies_all_of::<DottedVersion>(target, constraints),
     }
 }
@@ -536,6 +558,7 @@ pub fn render_fix(eco: Ecosystem, declared: &str, target: &str) -> Option<String
         Ecosystem::PyPI => render_fix_of::<Pep440>(declared, target),
         Ecosystem::RubyGems => render_fix_of::<GemVersion>(declared, target),
         Ecosystem::Pub => render_fix_of::<PubVersion>(declared, target),
+        Ecosystem::Maven => render_fix_of::<MavenVersion>(declared, target),
         _ => render_fix_of::<DottedVersion>(declared, target),
     }
 }
@@ -1278,5 +1301,189 @@ mod tests {
             fixed_version(Ecosystem::Pub, "demo", "0.4.0+2", &pub_package),
             None
         );
+    }
+
+    #[test]
+    fn a_maven_range_with_a_milestone_start_is_read() {
+        // The `introduced` is a milestone: an unreadable one would hide the whole interval.
+        let advisory = affected(
+            "Maven",
+            "org.example:lib",
+            &[&[("introduced", "9.0.0.M1"), ("fixed", "9.0.0.RELEASE")]],
+        );
+        let plan = plan_fix(
+            Ecosystem::Maven,
+            "org.example:lib",
+            "9.0.0.M2",
+            &[&advisory],
+            |_| true,
+        )
+        .expect("a fix");
+        assert_eq!(plan.target, "9.0.0.RELEASE");
+        assert_eq!((plan.fixed_count, plan.total_count), (1, 1));
+    }
+
+    #[test]
+    fn a_maven_release_suffix_is_ordered_as_maven_does() {
+        let advisory = affected(
+            "Maven",
+            "org.example:lib",
+            &[&[("introduced", "2.2.0.RELEASE"), ("fixed", "2.2.12.RELEASE")]],
+        );
+        assert_eq!(
+            fixed_version(
+                Ecosystem::Maven,
+                "org.example:lib",
+                "2.2.11.RELEASE",
+                &advisory
+            )
+            .as_deref(),
+            Some("2.2.12.RELEASE")
+        );
+        assert_eq!(
+            fixed_version(
+                Ecosystem::Maven,
+                "org.example:lib",
+                "2.2.12.RELEASE",
+                &advisory
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_service_release_is_above_its_base_version() {
+        let advisory = affected(
+            "Maven",
+            "org.example:lib",
+            &[&[("introduced", "0"), ("fixed", "2.5.7.SR1")]],
+        );
+        for current in ["2.5.7", "2.5.7.SR0"] {
+            assert_eq!(
+                fixed_version(Ecosystem::Maven, "org.example:lib", current, &advisory).as_deref(),
+                Some("2.5.7.SR1"),
+                "{current}"
+            );
+        }
+    }
+
+    #[test]
+    fn maven_satisfies_all_and_render_fix_use_maven_order() {
+        let below_next_minor = [Constraint {
+            operator: "<".to_owned(),
+            version: "2.3".to_owned(),
+        }];
+        assert!(satisfies_all(
+            Ecosystem::Maven,
+            "2.2.12.RELEASE",
+            &below_next_minor
+        ));
+        assert!(!satisfies_all(
+            Ecosystem::Maven,
+            "2.3.0.M1.1",
+            &[Constraint {
+                operator: "<".to_owned(),
+                version: "2.3.0.M1".to_owned(),
+            }]
+        ));
+        assert_eq!(
+            render_fix(Ecosystem::Maven, "2.2.11.RELEASE", "2.2.12.RELEASE").as_deref(),
+            Some("2.2.12.RELEASE")
+        );
+        // A milestone is older than its release, so it is no fix for the release.
+        assert_eq!(
+            render_fix(Ecosystem::Maven, "9.0.0.RELEASE", "9.0.0.M1"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_wildcard_entry_applies_to_every_package_of_its_ecosystem() {
+        let wildcard = affected(
+            "crates.io",
+            "*",
+            &[&[("introduced", "0"), ("fixed", "1.2.0")]],
+        );
+        for package in ["review_demo", "other_crate"] {
+            let plan = plan_fix(Ecosystem::Cargo, package, "1.0.0", &[&wildcard], |_| true)
+                .expect("a fix");
+            assert_eq!(plan.target, "1.2.0", "{package}");
+        }
+    }
+
+    #[test]
+    fn a_wildcard_entry_of_another_ecosystem_does_not_apply() {
+        for ecosystem in ["npm", "Maven"] {
+            let wildcard = affected(
+                ecosystem,
+                "*",
+                &[&[("introduced", "0"), ("fixed", "1.2.0")]],
+            );
+            assert_eq!(
+                plan_fix(
+                    Ecosystem::Cargo,
+                    "review_demo",
+                    "1.0.0",
+                    &[&wildcard],
+                    |_| true
+                ),
+                None,
+                "{ecosystem}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_named_entry_still_needs_its_own_name() {
+        let other = affected(
+            "crates.io",
+            "other",
+            &[&[("introduced", "0"), ("fixed", "1.2.0")]],
+        );
+        assert_eq!(
+            plan_fix(Ecosystem::Cargo, "review_demo", "1.0.0", &[&other], |_| {
+                true
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn a_cycle_in_the_maven_order_does_not_panic_the_sorts() {
+        // Maven's own order is not total: `1.2.3.jbossorg-1 > 1.2.3 > 1.2.3-beta1 > 1.2.3.jbossorg-1`
+        // holds in a cycle. `sort_by` may panic on a cycle, and a panic aborts the plugin.
+        let fixes = [
+            "1.2.3.jbossorg-1",
+            "1.2.3.jbossorg-2",
+            "1.2.3",
+            "1.2.3-beta1",
+            "1.2.3-rc1",
+            "1.2.3-alpha1",
+            "1.2.4",
+            "1.2.2.1",
+            "1.2.3-m1",
+        ];
+        let mut seed: u64 = 7;
+        for _ in 0..300 {
+            // A deterministic shuffle, so that a failure can be replayed.
+            let advisories: Vec<Vec<Affected>> = (0..40)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let fixed = fixes[(seed >> 33) as usize % fixes.len()];
+                    affected(
+                        "Maven",
+                        "org.example:lib",
+                        &[&[("introduced", "0"), ("fixed", fixed)]],
+                    )
+                })
+                .collect();
+            let refs: Vec<&[Affected]> = advisories.iter().map(Vec::as_slice).collect();
+            // Any answer is fine: the call must return.
+            let _ = plan_fix(Ecosystem::Maven, "org.example:lib", "1.0.0", &refs, |_| {
+                true
+            });
+        }
     }
 }

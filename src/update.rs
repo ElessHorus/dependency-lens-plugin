@@ -4,6 +4,7 @@ use crate::model::{Dependency, Ecosystem};
 use crate::osv::declared_version_for_osv;
 use crate::registries::dotted::{DottedVersion, PubVersion, is_dev_branch, segment};
 use crate::registries::gem_version::GemVersion;
+use crate::registries::maven_version::MavenVersion;
 use crate::registries::pep440::Pep440;
 use std::borrow::Cow;
 
@@ -79,6 +80,20 @@ impl UpdateVersion for PubVersion {
 impl UpdateVersion for GemVersion {
     fn parse_version(text: &str) -> Option<Self> {
         GemVersion::parse(text)
+    }
+
+    fn is_prerelease_version(&self) -> bool {
+        self.is_prerelease()
+    }
+
+    fn release_segments(&self) -> Cow<'_, [u64]> {
+        Cow::Owned(self.release())
+    }
+}
+
+impl UpdateVersion for MavenVersion {
+    fn parse_version(text: &str) -> Option<Self> {
+        MavenVersion::parse(text)
     }
 
     fn is_prerelease_version(&self) -> bool {
