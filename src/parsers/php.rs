@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use super::json_spans::{JsonSection, parse_sections};
 use crate::model::Dependency;
+use crate::requirement::Requirement;
 
 /// URLs that name the public Packagist repository.
 const PUBLIC_REPOSITORY_URLS: [&str; 2] = ["https://repo.packagist.org", "https://packagist.org"];
@@ -82,7 +83,12 @@ pub fn parse(text: &str) -> Vec<Dependency> {
     if has_private_repository(text) {
         return Vec::new();
     }
-    parse_sections(text, &SECTIONS, |name, _version| !name.contains('/'))
+    let mut dependencies = parse_sections(text, &SECTIONS, |name, _version| !name.contains('/'));
+    for dependency in &mut dependencies {
+        dependency.requirement =
+            Requirement::parse(crate::model::Ecosystem::Packagist, &dependency.version);
+    }
+    dependencies
 }
 
 #[cfg(test)]
@@ -214,5 +220,28 @@ mod tests {
     #[test]
     fn invalid_manifest_returns_empty() {
         assert!(parse("{\"require\": {").is_empty());
+    }
+
+    #[test]
+    fn composer_versions_read_their_requirement() {
+        let dependencies = parse(
+            r#"{"require": {"a/alt": "^1.2 || ^2.0", "b/wild": "1.2.*", "c/branch": "dev-main"}}"#,
+        );
+        let requirement_of = |name: &str| {
+            dependencies
+                .iter()
+                .find(|dependency| dependency.name == name)
+                .map(|dependency| dependency.requirement.clone())
+        };
+        assert_eq!(
+            requirement_of("a/alt"),
+            Some(crate::requirement::Requirement::parse(
+                crate::model::Ecosystem::Packagist,
+                "^1.2 || ^2.0"
+            ))
+        );
+        assert!(requirement_of("a/alt").flatten().is_some());
+        assert_eq!(requirement_of("b/wild"), Some(None));
+        assert_eq!(requirement_of("c/branch"), Some(None));
     }
 }
