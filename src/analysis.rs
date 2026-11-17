@@ -1662,6 +1662,7 @@ mod tests {
             dev: false,
             optional: false,
             has_additional_version_constraints: false,
+            requirement: None,
         }
     }
 

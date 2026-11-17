@@ -237,6 +237,7 @@ fn build_dependency<'a>(item: PendingItem<'a>) -> Option<(Dependency, Option<&'a
         dev: item.kind == ItemKind::GlobalPackageReference || item.is_private_assets_all,
         optional: false,
         has_additional_version_constraints: property_name.is_some(),
+        requirement: None,
     };
     Some((dependency, property_name))
 }

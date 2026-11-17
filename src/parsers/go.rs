@@ -166,6 +166,7 @@ fn parse_entry(code: &str, comment: &str, from: usize, line_number: u32) -> Opti
         dev: false,
         optional: comment.trim_start().starts_with("indirect"),
         has_additional_version_constraints: false,
+        requirement: None,
     })
 }
 

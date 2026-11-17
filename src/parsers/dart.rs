@@ -271,6 +271,7 @@ fn finish_entry(entry: Option<PendingEntry<'_>>, dependencies: &mut Vec<Dependen
         dev: entry.dev,
         optional: false,
         has_additional_version_constraints: false,
+        requirement: None,
     });
 }
 

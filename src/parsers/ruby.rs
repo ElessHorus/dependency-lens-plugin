@@ -568,6 +568,7 @@ fn parse_gem(
         dev: in_dev_block || is_group_dev,
         optional: false,
         has_additional_version_constraints: requirement_count > 1,
+        requirement: None,
     })
 }
 

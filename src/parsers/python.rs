@@ -288,6 +288,7 @@ fn dependency_from_pep508(
         dev: is_dev,
         optional: is_optional,
         has_additional_version_constraints: requirement.has_additional_version_constraints,
+        requirement: None,
     })
 }
 
@@ -560,6 +561,7 @@ fn build_poetry_dependency(
         dev: is_dev,
         optional: is_optional,
         has_additional_version_constraints: false,
+        requirement: None,
     })
 }
 

@@ -156,6 +156,7 @@ fn build_dependency(
         dev: is_dev,
         optional,
         has_additional_version_constraints: false,
+        requirement: None,
     })
 }
 

@@ -614,6 +614,7 @@ mod tests {
             dev: false,
             optional: false,
             has_additional_version_constraints: false,
+            requirement: None,
         };
         assert_eq!(
             render_update(Ecosystem::Pub, &dependency, "0.4.0+9").as_deref(),
@@ -644,6 +645,7 @@ mod tests {
                 dev: false,
                 optional: false,
                 has_additional_version_constraints: false,
+                requirement: None,
             };
             assert_eq!(
                 render_update(Ecosystem::Pub, &dependency, latest).as_deref(),
