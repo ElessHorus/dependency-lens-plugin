@@ -29,6 +29,9 @@ pub const MAX_BLOCK_BYTES: usize = 2 * 1024 * 1024;
 /// advisories at most, so a larger total can only come from a damaged block.
 const MAX_LIST_LEN: usize = 10_000;
 
+/// The most vulnerability-list entries that one block load builds, whatever its lists claim.
+pub const MAX_IMPORTED_ENTRIES: usize = 100_000;
+
 /// The cache of one ecosystem, as written to the disk.
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct Block {
@@ -234,7 +237,7 @@ impl Cache {
                         latest: record.latest,
                         versions: record.all,
                     },
-                    stored_at: record.at,
+                    stored_at: record.at.min(now),
                 });
         }
         // Advisories first, so that the lists can name their records.
@@ -260,9 +263,11 @@ impl Cache {
                     versions: entry.versions,
                 })
                 .collect();
+            // A record dated after `now` (a clock that ran ahead) is dated `now`, so it is checked again in time.
+            let stored_at = record.at.min(now);
             self.advisories.entry(id.clone()).or_insert(Entry {
                 value: advisory.clone(),
-                stored_at: record.at,
+                stored_at,
             });
             // A record that the network gave is complete. One that the disk gave holds the entries of
             // one ecosystem, so it must not stand for the others (see `has_affected_for`).
@@ -284,7 +289,7 @@ impl Cache {
                 MapEntry::Vacant(slot) => {
                     slot.insert(Entry {
                         value: affected,
-                        stored_at: record.at,
+                        stored_at,
                     });
                 }
             }
@@ -293,12 +298,16 @@ impl Cache {
             }
             loaded.insert(id, advisory);
         }
+        let mut budget = MAX_IMPORTED_ENTRIES;
         for (package, versions) in block.lists {
             for (version, record) in versions {
                 if !is_recent(record.at) {
                     continue;
                 }
-                let list = rebuild_list(&record, &loaded);
+                // A list that is too long for the limits is not loaded, so the next lookup builds it again.
+                let Some(list) = rebuild_list(&record, &loaded, &mut budget) else {
+                    continue;
+                };
                 self.vulnerabilities
                     .entry(ecosystem)
                     .or_default()
@@ -307,7 +316,7 @@ impl Cache {
                     .entry(version)
                     .or_insert(Entry {
                         value: list,
-                        stored_at: record.at,
+                        stored_at: record.at.min(now),
                     });
             }
         }
@@ -316,7 +325,25 @@ impl Cache {
 
 /// The serialized size of a record under `key`, with a few bytes for the quotes and separators.
 fn record_size<T: Serialize>(key: &str, record: &T) -> usize {
-    key.len() + serde_json::to_string(record).map_or(usize::MAX / 4, |text| text.len()) + 4
+    // The record is counted as it is written, without building its text.
+    let mut counter = ByteCounter(0);
+    let written =
+        serde_json::to_writer(&mut counter, record).map_or(usize::MAX / 4, |()| counter.0);
+    key.len() + written + 4
+}
+
+/// A writer that keeps only the number of bytes it was given.
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A record that can leave a block to make it fit: the oldest go first.
@@ -415,24 +442,31 @@ fn apply_limits(block: &mut Block) {
 
 /// Rebuilds a vulnerability list: the advisory of each stored id when its record is `loaded`, else
 /// a deferred entry that keeps the id, then anonymous deferred entries up to the stored total.
+///
+/// Returns `None` when the list is over [`MAX_LIST_LEN`] or over what is left of `budget`, the
+/// entries that the rest of the block load may still build. A cut list would show too few
+/// advisories, so it is left out.
 fn rebuild_list(
     record: &ListRecord,
     loaded: &HashMap<String, Vulnerability>,
-) -> Vec<Vulnerability> {
-    let total = record.total.min(MAX_LIST_LEN);
-    let named = record
-        .ids
-        .iter()
-        .take(total)
-        .map(|id| match loaded.get(id) {
-            Some(advisory) => advisory.clone(),
-            None if is_valid_advisory_id(id) => deferred(id),
-            None => anonymous_deferred(),
-        });
-    let anonymous_count = total.saturating_sub(record.ids.len());
-    named
-        .chain(std::iter::repeat_with(anonymous_deferred).take(anonymous_count))
-        .collect()
+    budget: &mut usize,
+) -> Option<Vec<Vulnerability>> {
+    let total = record.total.max(record.ids.len());
+    if total > MAX_LIST_LEN || total > *budget {
+        return None;
+    }
+    *budget -= total;
+    let named = record.ids.iter().map(|id| match loaded.get(id) {
+        Some(advisory) => advisory.clone(),
+        None if is_valid_advisory_id(id) => deferred(id),
+        None => anonymous_deferred(),
+    });
+    let anonymous_count = total - record.ids.len();
+    Some(
+        named
+            .chain(std::iter::repeat_with(anonymous_deferred).take(anonymous_count))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -837,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn a_huge_total_does_not_build_a_huge_list() {
+    fn a_list_with_a_huge_total_is_not_imported() {
         let text = format!(
             r#"{{"v":1,"lists":{{"requests":{{"1.0.0":{{"at":{NOW},"total":{},"ids":[]}}}}}}}}"#,
             usize::MAX
@@ -845,10 +879,12 @@ mod tests {
         let mut cache = Cache::new(LONG_TTL_SECS);
         cache.import_block(Ecosystem::PyPI, decode_block(&text).unwrap(), NOW);
 
-        let list = cache
-            .vulnerabilities(Ecosystem::PyPI, PACKAGE, VERSION, NOW)
-            .unwrap();
-        assert_eq!(list.len(), MAX_LIST_LEN);
+        // A cut list would show too few advisories, so it is left out and built again by the next lookup.
+        assert!(
+            cache
+                .vulnerabilities(Ecosystem::PyPI, PACKAGE, VERSION, NOW)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1008,6 +1044,82 @@ mod tests {
         assert!(block.lists.contains_key("kept") && !block.lists.contains_key("dropped"));
         // Nothing left to drop: the block says so.
         assert!(!block.retain_packages(|name| name != "dropped"));
+    }
+
+    #[test]
+    fn a_record_dated_after_now_is_dated_now_once_loaded() {
+        // A clock that ran ahead must not keep a record fresh for longer than one lifetime.
+        let mut cache = Cache::new(LONG_TTL_SECS);
+        cache.put_version_info(Ecosystem::PyPI, PACKAGE, version_info(), NOW + 100_000);
+        cache.put_vulnerabilities(Ecosystem::PyPI, PACKAGE, VERSION, Vec::new(), NOW + 100_000);
+        let block = decode_block(&encode_block(&cache.export_block(Ecosystem::PyPI))).unwrap();
+
+        let mut restored = Cache::new(3600);
+        restored.import_block(Ecosystem::PyPI, block, NOW);
+
+        assert!(
+            restored
+                .version_info(Ecosystem::PyPI, PACKAGE, NOW)
+                .is_some()
+        );
+        assert!(
+            restored
+                .version_info(Ecosystem::PyPI, PACKAGE, NOW + 7200)
+                .is_none()
+        );
+        assert!(
+            restored
+                .vulnerabilities(Ecosystem::PyPI, PACKAGE, VERSION, NOW + 7200)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_block_cannot_build_more_entries_than_the_import_budget() {
+        let mut block = Block {
+            v: BLOCK_VERSION,
+            ..Block::default()
+        };
+        for number in 0..50 {
+            block
+                .lists
+                .entry(format!("pkg-{number}"))
+                .or_default()
+                .insert(
+                    VERSION.to_owned(),
+                    ListRecord {
+                        at: NOW,
+                        total: MAX_LIST_LEN,
+                        ids: Vec::new(),
+                    },
+                );
+        }
+        let mut cache = Cache::new(LONG_TTL_SECS);
+
+        cache.import_block(Ecosystem::PyPI, block, NOW);
+
+        let built: usize = (0..50)
+            .filter_map(|number| {
+                cache.vulnerabilities(Ecosystem::PyPI, &format!("pkg-{number}"), VERSION, NOW)
+            })
+            .map(<[_]>::len)
+            .sum();
+        assert!(built <= MAX_IMPORTED_ENTRIES, "{built}");
+        assert!(built > 0);
+    }
+
+    #[test]
+    fn record_size_counts_the_key_the_record_and_a_few_separators() {
+        let record = RegistryRecord {
+            at: NOW,
+            latest: Some("2.0.0".to_owned()),
+            all: vec!["2.0.0".to_owned(), "1.0.0".to_owned()],
+        };
+        let written = serde_json::to_string(&record).unwrap();
+        assert_eq!(
+            record_size("requests", &record),
+            "requests".len() + written.len() + 4
+        );
     }
 
     #[test]

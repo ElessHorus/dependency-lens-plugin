@@ -3,7 +3,10 @@
 use dependency_lens::DependencyLens;
 use dependency_lens::publish::DECORATION_SET;
 use openidea_plugin::mock::MockHost;
-use openidea_plugin::{Decoration, Error, Event, HttpResponse, LogLevel, Plugin, host};
+use openidea_plugin::providers::{CodeAction, Document, Providers};
+use openidea_plugin::{
+    Decoration, Error, Event, HttpResponse, LogLevel, Plugin, Position, Range, host,
+};
 use serde_json::{Value, json};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -90,8 +93,16 @@ impl Osv {
                 json!({ "results": results }).to_string()
             } else if let Some(id) = request.url.strip_prefix(DETAIL_PREFIX) {
                 detail_requests.set(detail_requests.get() + 1);
-                json!({ "id": id, "summary": "Test advisory", "database_specific": { "severity": "HIGH" } })
-                    .to_string()
+                json!({
+                    "id": id,
+                    "summary": "Test advisory",
+                    "database_specific": { "severity": "HIGH" },
+                    "affected": [{
+                        "package": { "name": "serde", "ecosystem": "crates.io" },
+                        "ranges": [{ "type": "SEMVER", "events": [{ "introduced": "0" }, { "fixed": "1.0.5" }] }]
+                    }]
+                })
+                .to_string()
             } else {
                 return Err(Error::Failed(format!("unexpected request {}", request.url)));
             };
@@ -473,12 +484,17 @@ fn a_package_added_to_ignore_leaves_the_disk_cache() {
     let host = host_with(&STORAGE_CAPABILITIES, &osv);
     let mut plugin = DependencyLens::default();
     open_manifest(&host, &mut plugin, MANIFEST);
-    assert!(host.storage()[CARGO_KEY].contains("serde"));
+    let package_lists = |host: &MockHost| -> Value {
+        let block: Value = serde_json::from_str(&host.storage()[CARGO_KEY]).unwrap();
+        block["lists"].clone()
+    };
+    assert!(package_lists(&host).get("serde").is_some());
 
     host.set_setting("ignore", r#"["serde"]"#);
     send_settings_changed(&host, &mut plugin, "ignore");
 
-    assert!(!host.storage()[CARGO_KEY].contains("serde"));
+    // The advisory records are public OSV data and may still name serde. The project's list may not.
+    assert!(package_lists(&host).get("serde").is_none());
 }
 
 #[test]
@@ -588,4 +604,60 @@ fn an_entry_that_still_waits_keeps_its_old_data_between_chunks() {
         .collect();
     // The first package has its new answer. The second still shows the old one, not "…".
     assert_eq!(shown, [Some("→ 2.0".to_owned()), Some("→ 3.0".to_owned())]);
+}
+
+fn manifest_document() -> Document {
+    Document {
+        path: MANIFEST_PATH.to_owned(),
+        language: "toml".to_owned(),
+        version: 1,
+        text: MANIFEST.to_owned(),
+    }
+}
+
+#[test]
+fn the_quick_fix_is_offered_after_an_unload_without_a_new_open() {
+    let osv = Osv::new(1);
+    let host = host_with(&STORAGE_CAPABILITIES, &osv);
+    open_manifest(&host, &mut DependencyLens::default(), MANIFEST);
+    let requests_before = osv.requests.get();
+
+    // The IDE unloaded the plugin: the decorations are still on screen, and the user asks for the fix.
+    let mut plugin = DependencyLens::default();
+    let actions = Providers::code_actions(
+        &mut plugin,
+        &manifest_document(),
+        Range::new(Position::new(5, 10), Position::new(5, 10)),
+    );
+
+    assert_eq!(actions.len(), 1);
+    assert_eq!(
+        actions[0].title,
+        "Fix 1 vulnerability: update serde to 1.0.5"
+    );
+    assert_eq!(osv.requests.get(), requests_before);
+}
+
+#[test]
+fn picking_the_load_action_after_an_unload_keeps_the_stored_details() {
+    let osv = Osv::new(25);
+    let host = host_with(&STORAGE_CAPABILITIES, &osv);
+    open_manifest(&host, &mut DependencyLens::default(), MANIFEST);
+    assert_eq!(osv.detail_requests.get(), 10);
+
+    let mut plugin = DependencyLens::default();
+    let load = CodeAction {
+        title: "Load 15 more vulnerabilities of serde".to_owned(),
+        kind: Some("quickfix".to_owned()),
+        preferred: false,
+        edits: Vec::new(),
+        data: Some(format!(
+            "{}serde",
+            dependency_lens::actions::LOAD_ACTION_PREFIX
+        )),
+    };
+    Providers::resolve_code_action(&mut plugin, &manifest_document(), load).unwrap();
+
+    // Only the fifteen that the disk does not hold are downloaded.
+    assert_eq!(osv.detail_requests.get(), 25);
 }

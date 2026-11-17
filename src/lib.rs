@@ -84,6 +84,9 @@ pub struct DependencyLens {
     chunk: usize,
     /// Ecosystems whose disk block this cache has already read. A block is read once, on first use.
     loaded_blocks: HashSet<Ecosystem>,
+    /// Ecosystems whose disk block could not be read. The disk may still hold it, so this run does
+    /// not write over it with what the memory alone knows.
+    unreadable_blocks: HashSet<Ecosystem>,
     /// Whether a failure of the disk store was logged. One warning is enough: the store is optional.
     has_warned_about_store: bool,
 }
@@ -98,6 +101,7 @@ impl Default for DependencyLens {
             time_box: TIME_BOX,
             chunk: REGISTRY_CHUNK,
             loaded_blocks: HashSet::new(),
+            unreadable_blocks: HashSet::new(),
             has_warned_about_store: false,
         }
     }
@@ -122,7 +126,7 @@ impl DependencyLens {
         if settings.cache_ttl_secs != self.settings.cache_ttl_secs {
             self.cache = Cache::new(settings.cache_ttl_secs);
             // The new cache is empty: its blocks load again from the disk when they are used.
-            self.loaded_blocks.clear();
+            self.forget_loaded_blocks();
             if settings.cache_ttl_secs == 0 {
                 // A lifetime of zero turns the disk cache off, so what it holds goes.
                 self.clear_disk(&HostStore);
@@ -200,7 +204,10 @@ impl DependencyLens {
         let text = match store.get(&key) {
             Ok(Some(text)) => text,
             Ok(None) => return,
-            Err(error) => return self.warn_about_store(&format!("cannot read {key}: {error}")),
+            Err(error) => {
+                self.unreadable_blocks.insert(ecosystem);
+                return self.warn_about_store(&format!("cannot read {key}: {error}"));
+            }
         };
         match decode_block(&text) {
             Some(mut block) => {
@@ -243,6 +250,9 @@ impl DependencyLens {
     /// A write that fails is logged, and the ecosystem stays out of date so that the next chunk tries again.
     fn save_blocks(&mut self, store: &dyn Store) {
         for ecosystem in self.cache.take_dirty() {
+            if self.unreadable_blocks.contains(&ecosystem) {
+                continue;
+            }
             let key = block_key(ecosystem);
             let mut block = self.cache.export_block(ecosystem);
             // An ignored package never reaches the disk, even when it was cached before it was ignored.
@@ -259,6 +269,12 @@ impl DependencyLens {
         let ignored = self.settings.ignored_packages(ecosystem);
         !ignored.is_empty()
             && block.retain_packages(|name| !ignored.contains(&ecosystem.normalize_package(name)))
+    }
+
+    /// Forgets which blocks were read, so that the next use of an ecosystem reads its block again.
+    fn forget_loaded_blocks(&mut self) {
+        self.loaded_blocks.clear();
+        self.unreadable_blocks.clear();
     }
 
     /// Deletes the disk block of every ecosystem.
@@ -618,7 +634,7 @@ impl Plugin for DependencyLens {
             }
             "clear-cache" => {
                 self.cache.clear();
-                self.loaded_blocks.clear();
+                self.forget_loaded_blocks();
                 self.clear_disk(&HostStore);
                 // What the manifests show comes from the cache, so they are analyzed again.
                 let deadline = deadline_after(self.time_box);
@@ -707,6 +723,8 @@ impl DependencyLens {
         if !self.settings.vulnerabilities {
             return;
         }
+        // After an unload the cache is empty: read what the disk holds before the details are loaded.
+        self.load_block(eco, &HostStore);
         let deps: Vec<Dependency> = eco
             .parse(&doc.text)
             .into_iter()
@@ -757,6 +775,10 @@ impl Providers for DependencyLens {
     }
 
     fn code_actions(&mut self, doc: &Document, selection: Range) -> Vec<CodeAction> {
+        // After an unload the decorations stay on screen but the cache is empty: read the disk first.
+        if let Some(eco) = Ecosystem::detect(&doc.path) {
+            self.load_block(eco, &HostStore);
+        }
         actions::code_actions(
             &self.cache,
             &self.settings,
@@ -912,6 +934,24 @@ mod disk_cache_tests {
         let statuses: Vec<&Status> = shown.entries.iter().map(|entry| &entry.status).collect();
         assert_eq!(statuses, [&outdated, &Status::UpToDate, &Status::Pending]);
         assert_eq!(shown.pending, 2);
+    }
+
+    #[test]
+    fn a_block_that_could_not_be_read_is_not_written_over() {
+        let _host = MockHost::install();
+        let mut plugin = DependencyLens::default();
+        let store = MemoryStore::failing_reads();
+
+        plugin.load_block(Ecosystem::PyPI, &store);
+        plugin
+            .cache
+            .put_version_info(Ecosystem::PyPI, "requests", VersionInfo::default(), 1);
+        plugin.save_blocks(&store);
+
+        // The disk may still hold a block that was not read: memory alone must not replace it.
+        assert!(store.keys().is_empty());
+        // The ecosystem is not retried at every chunk either.
+        assert!(!plugin.cache.is_dirty(Ecosystem::PyPI));
     }
 
     #[test]

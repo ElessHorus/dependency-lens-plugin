@@ -43,6 +43,7 @@ pub fn block_key(ecosystem: Ecosystem) -> String {
 pub struct MemoryStore {
     entries: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
     is_failing: bool,
+    is_failing_reads: bool,
 }
 
 #[cfg(test)]
@@ -56,6 +57,14 @@ impl MemoryStore {
     pub fn failing() -> Self {
         Self {
             is_failing: true,
+            ..Self::new()
+        }
+    }
+
+    /// Creates a store that reads nothing: `get` returns `Err("store unavailable")`, writes work.
+    pub fn failing_reads() -> Self {
+        Self {
+            is_failing_reads: true,
             ..Self::new()
         }
     }
@@ -78,6 +87,9 @@ impl MemoryStore {
 impl Store for MemoryStore {
     fn get(&self, key: &str) -> Result<Option<String>, String> {
         self.check()?;
+        if self.is_failing_reads {
+            return Err("store unavailable".to_owned());
+        }
         Ok(self.entries.borrow().get(key).cloned())
     }
 
