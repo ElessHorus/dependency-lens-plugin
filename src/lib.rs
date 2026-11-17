@@ -184,6 +184,7 @@ impl DependencyLens {
         if self.settings.cache_ttl_secs == 0 || !self.loaded_blocks.insert(ecosystem) {
             return;
         }
+        let started_at = Instant::now();
         let key = block_key(ecosystem);
         let text = match store.get(&key) {
             Ok(Some(text)) => text,
@@ -191,7 +192,26 @@ impl DependencyLens {
             Err(error) => return self.warn_about_store(&format!("cannot read {key}: {error}")),
         };
         match decode_block(&text) {
-            Some(block) => self.cache.import_block(ecosystem, block, now_secs()),
+            Some(block) => {
+                let record_count = block.registry.len()
+                    + block
+                        .lists
+                        .values()
+                        .map(|versions| versions.len())
+                        .sum::<usize>()
+                    + block.advisories.len();
+                self.cache.import_block(ecosystem, block, now_secs());
+                // The cost of the disk path, for the cold-start check of docs/MAINTAINING.md.
+                host::log(
+                    LogLevel::Debug,
+                    &format!(
+                        "cache: loaded {} ({record_count} records, {} bytes) in {} ms",
+                        ecosystem.osv_name(),
+                        text.len(),
+                        started_at.elapsed().as_millis()
+                    ),
+                );
+            }
             None => {
                 self.warn_about_store(&format!(
                     "{key} is not a readable cache block, so it is dropped"

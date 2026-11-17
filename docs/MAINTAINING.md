@@ -11,7 +11,13 @@ Run these checks in the real IDE, after building and linking the plugin (see the
 3. In a multi-project window, open a manifest of a project that is not the main project. Check that its decorations and problems appear.
 4. Open a manifest saved with a UTF-8 byte order mark. Check that the decoration columns are correct.
 5. Open a manifest with an old package that has many advisories, such as a `Gemfile` with `nokogiri 1.10.0`. Check that the first open is fast, that the hover lists 10 advisories and a line such as `N more not loaded`, and that the command "Dependency Lens: Load all vulnerabilities" loads the others.
-5. Turn one ecosystem off in the settings. Check that no request is sent for its manifests.
+6. Turn one ecosystem off in the settings. Check that no request is sent for its manifests.
+7. Check the disk cache, the way a user meets it:
+   - The permissions dialog of the plugin lists `storage`.
+   - Open a manifest of 10 old PyPI packages (about 11 s when cold, before the disk cache) and wait for the last decoration. Note the time.
+   - Choose Reload in Settings › Plugins, or wait five minutes for the IDE to unload the plugin. Open the manifest again. The decorations must show at once from the disk, and the new answers replace them when the check ends. Find the line `cache: loaded PyPI (<n> records, <b> bytes) in <t> ms` in the plugin log (debug level) and note `<t>`.
+   - Set `cacheTtlSeconds` to `0` and open it again, to compare with no cache.
+   - Run "Dependency Lens: Clear cache". The next cold open is slow again.
 
 ## Updating the pinned actions
 

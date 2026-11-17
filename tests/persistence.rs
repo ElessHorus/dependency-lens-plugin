@@ -3,7 +3,7 @@
 use dependency_lens::DependencyLens;
 use dependency_lens::publish::DECORATION_SET;
 use openidea_plugin::mock::MockHost;
-use openidea_plugin::{Decoration, Error, Event, HttpResponse, Plugin, host};
+use openidea_plugin::{Decoration, Error, Event, HttpResponse, LogLevel, Plugin, host};
 use serde_json::{Value, json};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -404,4 +404,27 @@ fn plugin_toml_declares_the_storage_capability_and_the_clear_cache_command() {
     assert!(required.contains("\"storage\""), "{required}");
     assert!(manifest.contains("id = \"clear-cache\""));
     assert!(manifest.contains("title = \"Dependency Lens: Clear cache\""));
+}
+
+#[test]
+fn loading_a_block_logs_its_size_and_duration_at_debug_level() {
+    let osv = Osv::new(1);
+    let host = host_with(&STORAGE_CAPABILITIES, &osv);
+    seed_cargo_block(now_secs());
+    let mut plugin = DependencyLens::default();
+    open_manifest(&host, &mut plugin, MANIFEST);
+
+    let lines: Vec<String> = host
+        .logs()
+        .into_iter()
+        .filter(|(level, _)| matches!(level, LogLevel::Debug))
+        .map(|(_, text)| text)
+        .filter(|text| text.starts_with("cache: loaded crates.io"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains("2 records") && lines[0].ends_with(" ms"),
+        "{}",
+        lines[0]
+    );
 }
