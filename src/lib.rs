@@ -123,6 +123,10 @@ impl DependencyLens {
             self.cache = Cache::new(settings.cache_ttl_secs);
             // The new cache is empty: its blocks load again from the disk when they are used.
             self.loaded_blocks.clear();
+            if settings.cache_ttl_secs == 0 {
+                // A lifetime of zero turns the disk cache off, so what it holds goes.
+                self.clear_disk(&HostStore);
+            }
         }
         self.settings = settings;
     }
@@ -209,6 +213,16 @@ impl DependencyLens {
             if let Err(error) = store.set(&key, &text) {
                 self.warn_about_store(&format!("cannot write {key}: {error}"));
                 self.cache.mark_dirty(ecosystem);
+            }
+        }
+    }
+
+    /// Deletes the disk block of every ecosystem.
+    fn clear_disk(&mut self, store: &dyn Store) {
+        for ecosystem in Ecosystem::ALL {
+            let key = block_key(ecosystem);
+            if let Err(error) = store.delete(&key) {
+                self.warn_about_store(&format!("cannot delete {key}: {error}"));
             }
         }
     }
@@ -512,6 +526,15 @@ impl Plugin for DependencyLens {
                 };
                 Ok(Some(message))
             }
+            "clear-cache" => {
+                self.cache.clear();
+                self.loaded_blocks.clear();
+                self.clear_disk(&HostStore);
+                // What the manifests show comes from the cache, so they are analyzed again.
+                let deadline = deadline_after(self.time_box);
+                self.refresh_shown_manifests(ctx, deadline, &HashSet::new());
+                Ok(Some("Dependency Lens: cache cleared".to_owned()))
+            }
             _ => Err(Error::NotFound(format!("command {id}"))),
         }
     }
@@ -558,20 +581,30 @@ impl Plugin for DependencyLens {
         // A new setting changes what the shown manifests display. The cache answers most of it
         // without a request, and a disabled ecosystem clears its results.
         if settings_changed {
-            let shown_paths: Vec<String> = self
-                .published_paths
-                .iter()
-                .filter(|path| !refreshed.contains(path.as_str()))
-                .cloned()
-                .collect();
-            for path in &shown_paths {
-                self.refresh(path, Some(ctx), RunLimits::standard(deadline));
-            }
+            self.refresh_shown_manifests(ctx, deadline, &refreshed);
         }
     }
 }
 
 impl DependencyLens {
+    /// Analyzes again every manifest that shows results, except the ones in `already_refreshed`.
+    fn refresh_shown_manifests(
+        &mut self,
+        ctx: &Invocation,
+        deadline: Instant,
+        already_refreshed: &HashSet<&str>,
+    ) {
+        let shown_paths: Vec<String> = self
+            .published_paths
+            .iter()
+            .filter(|path| !already_refreshed.contains(path.as_str()))
+            .cloned()
+            .collect();
+        for path in &shown_paths {
+            self.refresh(path, Some(ctx), RunLimits::standard(deadline));
+        }
+    }
+
     /// Loads the deferred advisories of the dependency `name` of the manifest `doc`, then shows them.
     ///
     /// A first run, limited to that dependency, puts every detail in the cache. It makes no registry
@@ -749,6 +782,25 @@ mod disk_cache_tests {
         plugin.save_blocks(&store);
         assert!(!plugin.cache.is_dirty(Ecosystem::PyPI));
         assert_eq!(store.keys(), ["cache/PyPI"]);
+    }
+
+    #[test]
+    fn a_cache_lifetime_of_zero_reads_no_block() {
+        let _host = MockHost::install();
+        let mut plugin = DependencyLens::default();
+        plugin.settings.cache_ttl_secs = 0;
+        let store = MemoryStore::new();
+        store
+            .set(
+                "cache/PyPI",
+                r#"{"v":1,"registry":{},"lists":{},"advisories":{}}"#,
+            )
+            .unwrap();
+
+        plugin.load_block(Ecosystem::PyPI, &store);
+
+        // The block was not even read: it is not marked as loaded.
+        assert!(plugin.loaded_blocks.is_empty());
     }
 
     #[test]

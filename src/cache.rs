@@ -91,6 +91,11 @@ impl Cache {
         result
     }
 
+    /// Empties the cache: every entry, every revision and every failure. The lifetime stays.
+    pub fn clear(&mut self) {
+        *self = Self::new(self.ttl_secs);
+    }
+
     /// Returns `true` when the disk block of `ecosystem` is out of date.
     pub fn is_dirty(&self, ecosystem: Ecosystem) -> bool {
         self.dirty.contains(&ecosystem)
@@ -597,5 +602,56 @@ mod tests {
         });
 
         assert!(!shown);
+    }
+
+    #[test]
+    fn clear_empties_every_table_and_keeps_the_lifetime() {
+        let mut cache = Cache::new(TTL_SECS);
+        cache.put_version_info(Ecosystem::PyPI, "requests", sample_info(), START_SECS);
+        cache.put_vulnerabilities(Ecosystem::PyPI, "requests", "1.0.0", Vec::new(), START_SECS);
+        cache.put_advisory(sample_vulnerability("GHSA-1"), START_SECS);
+        cache.put_affected("GHSA-1", Vec::new(), START_SECS);
+        cache.put_revision("GHSA-1", "r1");
+        cache.put_failure(
+            FailureKind::Osv,
+            Ecosystem::PyPI,
+            "requests@1.0.0",
+            "boom".to_owned(),
+            START_SECS,
+        );
+
+        cache.clear();
+
+        assert!(
+            cache
+                .version_info(Ecosystem::PyPI, "requests", START_SECS)
+                .is_none()
+        );
+        assert!(
+            cache
+                .vulnerabilities(Ecosystem::PyPI, "requests", "1.0.0", START_SECS)
+                .is_none()
+        );
+        assert!(cache.advisory("GHSA-1", START_SECS).is_none());
+        assert!(cache.affected("GHSA-1", START_SECS).is_none());
+        assert!(!cache.confirm_advisory("GHSA-1", Some("r1"), START_SECS));
+        assert!(
+            cache
+                .failure(
+                    FailureKind::Osv,
+                    Ecosystem::PyPI,
+                    "requests@1.0.0",
+                    START_SECS
+                )
+                .is_none()
+        );
+        assert!(!cache.is_dirty(Ecosystem::PyPI));
+        // The lifetime is kept: a new entry is still stored.
+        cache.put_version_info(Ecosystem::PyPI, "requests", sample_info(), START_SECS);
+        assert!(
+            cache
+                .version_info(Ecosystem::PyPI, "requests", START_SECS)
+                .is_some()
+        );
     }
 }

@@ -22,7 +22,7 @@ activation = [
 
 # What the code may do. The user approves these when installing.
 [capabilities]
-required = ["events", "project.read", "editor.read", "net:api.osv.dev", "net:pypi.org", "net:repo.packagist.org", "net:pub.dev", "net:api.nuget.org", "net:rubygems.org"]
+required = ["events", "project.read", "editor.read", "storage", "net:api.osv.dev", "net:pypi.org", "net:repo.packagist.org", "net:pub.dev", "net:api.nuget.org", "net:rubygems.org"]
 
 [[contributes.commands]]
 id = "refresh"
@@ -32,6 +32,11 @@ category = "Dependency Lens"
 [[contributes.commands]]
 id = "load-vulnerabilities"
 title = "Dependency Lens: Load all vulnerabilities"
+category = "Dependency Lens"
+
+[[contributes.commands]]
+id = "clear-cache"
+title = "Dependency Lens: Clear cache"
 category = "Dependency Lens"
 
 [[contributes.providers]]

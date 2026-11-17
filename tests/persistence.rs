@@ -316,3 +316,92 @@ fn load_all_still_works_after_a_restore_from_disk() {
     assert_eq!(list["ids"].as_array().unwrap().len(), 10);
     assert_eq!(block["advisories"].as_object().unwrap().len(), 10);
 }
+
+/// Sends one `settings-changed` event for `key`.
+fn send_settings_changed(host: &MockHost, plugin: &mut DependencyLens, key: &str) {
+    plugin.handle_events(
+        &[Event::Other {
+            kind: "settings-changed".to_owned(),
+            data: format!(r#"["{key}"]"#),
+        }],
+        &host.invocation(),
+    );
+}
+
+fn stored_cache_keys(host: &MockHost) -> Vec<String> {
+    host.storage()
+        .into_keys()
+        .filter(|key| key.starts_with("cache/"))
+        .collect()
+}
+
+#[test]
+fn a_ttl_of_zero_writes_nothing_and_reads_nothing() {
+    let osv = Osv::new(2);
+    let host = host_with(&STORAGE_CAPABILITIES, &osv);
+    host.set_setting("cacheTtlSeconds", "0");
+    let mut plugin = DependencyLens::default();
+    plugin.activate(&host.context(PLUGIN_ID)).unwrap();
+    // A fresh block, written after the activation: with a lifetime of zero it is neither read nor replaced.
+    seed_cargo_block(now_secs());
+    let seeded = host.storage()[CARGO_KEY].clone();
+    open_manifest(&host, &mut plugin, MANIFEST);
+
+    assert_eq!(after_texts(&host), [Some("⚠ 2 vulnerabilities".to_owned())]);
+    assert_eq!(host.storage()[CARGO_KEY], seeded);
+}
+
+#[test]
+fn changing_the_ttl_to_zero_deletes_the_blocks_and_back_to_a_positive_value_reads_the_disk_again() {
+    let osv = Osv::new(2);
+    let host = host_with(&STORAGE_CAPABILITIES, &osv);
+    let mut plugin = DependencyLens::default();
+    open_manifest(&host, &mut plugin, MANIFEST);
+    assert_eq!(stored_cache_keys(&host), [CARGO_KEY]);
+
+    host.set_setting("cacheTtlSeconds", "0");
+    send_settings_changed(&host, &mut plugin, "cacheTtlSeconds");
+    assert!(stored_cache_keys(&host).is_empty());
+
+    // A fresh block appears on the disk. The new lifetime must read it, not the old memory.
+    seed_cargo_block(now_secs());
+    let requests_before = osv.requests.get();
+    host.set_setting("cacheTtlSeconds", "3600");
+    send_settings_changed(&host, &mut plugin, "cacheTtlSeconds");
+
+    assert_eq!(osv.requests.get(), requests_before);
+    assert_eq!(after_texts(&host), [Some("⚠ 1 vulnerability".to_owned())]);
+}
+
+#[test]
+fn the_clear_cache_command_empties_memory_and_disk_and_refreshes() {
+    let osv = Osv::new(1);
+    let host = host_with(&STORAGE_CAPABILITIES, &osv);
+    let mut plugin = DependencyLens::default();
+    open_manifest(&host, &mut plugin, MANIFEST);
+    host::storage::set("cache/PyPI", "STALE-BLOCK").unwrap();
+    let requests_before = osv.requests.get();
+    assert!(requests_before > 0);
+
+    let answer = plugin
+        .run_command("clear-cache", &host.invocation(), None)
+        .unwrap();
+
+    assert_eq!(answer, Some("Dependency Lens: cache cleared".to_owned()));
+    // Every block was deleted. The shown manifest was analyzed again, so its block is new.
+    assert_eq!(stored_cache_keys(&host), [CARGO_KEY]);
+    assert!(osv.requests.get() > requests_before);
+    assert_eq!(after_texts(&host), [Some("⚠ 1 vulnerability".to_owned())]);
+}
+
+#[test]
+fn plugin_toml_declares_the_storage_capability_and_the_clear_cache_command() {
+    let manifest = include_str!("../plugin.toml");
+    let required = manifest
+        .lines()
+        .find(|line| line.starts_with("required"))
+        .unwrap();
+    assert!(required.contains("\"storage\""), "{required}");
+    assert!(manifest.contains("id = \"clear-cache\""));
+    assert!(manifest.contains("title = \"Dependency Lens: Clear cache\""));
+}
