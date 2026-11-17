@@ -15,12 +15,14 @@ pub mod store;
 pub mod text;
 pub mod update;
 
-use crate::analysis::{Analysis, Budget, analyze};
+use crate::analysis::{Analysis, Budget, Status, analyze};
 use crate::cache::Cache;
+use crate::cache::persist::{STALE_MAX_AGE_SECS, decode_block, encode_block};
 use crate::http::HostHttp;
 use crate::model::{Dependency, Ecosystem};
 use crate::osv::DEFAULT_DETAILS_PER_QUERY;
 use crate::settings::Settings;
+use crate::store::{HostStore, Store, block_key};
 use openidea_plugin::host::Task;
 use openidea_plugin::providers::{CodeAction, Document, Providers};
 use openidea_plugin::{
@@ -80,6 +82,10 @@ pub struct DependencyLens {
     published_paths: HashSet<String>,
     time_box: Duration,
     chunk: usize,
+    /// Ecosystems whose disk block this cache has already read. A block is read once, on first use.
+    loaded_blocks: HashSet<Ecosystem>,
+    /// Whether a failure of the disk store was logged. One warning is enough: the store is optional.
+    has_warned_about_store: bool,
 }
 
 impl Default for DependencyLens {
@@ -91,6 +97,8 @@ impl Default for DependencyLens {
             published_paths: HashSet::new(),
             time_box: TIME_BOX,
             chunk: REGISTRY_CHUNK,
+            loaded_blocks: HashSet::new(),
+            has_warned_about_store: false,
         }
     }
 }
@@ -113,6 +121,8 @@ impl DependencyLens {
         let settings = Settings::from_host();
         if settings.cache_ttl_secs != self.settings.cache_ttl_secs {
             self.cache = Cache::new(settings.cache_ttl_secs);
+            // The new cache is empty: its blocks load again from the disk when they are used.
+            self.loaded_blocks.clear();
         }
         self.settings = settings;
     }
@@ -161,6 +171,97 @@ impl DependencyLens {
         self.publish_chunks(eco, path, &text, &deps, &task, limits)
     }
 
+    /// Reads the disk block of `ecosystem` into the cache, once, the first time the ecosystem is used.
+    ///
+    /// Nothing is read when the cache lifetime is zero. A store error or a block that cannot be
+    /// read is logged, and the analysis goes on as if the disk were empty. A block that cannot be
+    /// read is deleted, so the next save replaces it.
+    fn load_block(&mut self, ecosystem: Ecosystem, store: &dyn Store) {
+        if self.settings.cache_ttl_secs == 0 || !self.loaded_blocks.insert(ecosystem) {
+            return;
+        }
+        let key = block_key(ecosystem);
+        let text = match store.get(&key) {
+            Ok(Some(text)) => text,
+            Ok(None) => return,
+            Err(error) => return self.warn_about_store(&format!("cannot read {key}: {error}")),
+        };
+        match decode_block(&text) {
+            Some(block) => self.cache.import_block(ecosystem, block, now_secs()),
+            None => {
+                self.warn_about_store(&format!(
+                    "{key} is not a readable cache block, so it is dropped"
+                ));
+                if let Err(error) = store.delete(&key) {
+                    self.warn_about_store(&format!("cannot delete {key}: {error}"));
+                }
+            }
+        }
+    }
+
+    /// Writes the disk block of every ecosystem whose cache changed since the last save.
+    ///
+    /// A write that fails is logged, and the ecosystem stays out of date so that the next chunk tries again.
+    fn save_blocks(&mut self, store: &dyn Store) {
+        for ecosystem in self.cache.take_dirty() {
+            let key = block_key(ecosystem);
+            let text = encode_block(&self.cache.export_block(ecosystem));
+            if let Err(error) = store.set(&key, &text) {
+                self.warn_about_store(&format!("cannot write {key}: {error}"));
+                self.cache.mark_dirty(ecosystem);
+            }
+        }
+    }
+
+    /// Logs a failure of the disk store, the first time only.
+    fn warn_about_store(&mut self, message: &str) {
+        if !self.has_warned_about_store {
+            self.has_warned_about_store = true;
+            host::log(LogLevel::Warn, &format!("disk cache: {message}"));
+        }
+    }
+
+    /// Publishes what the cache holds for `deps`, even when it is older than its lifetime.
+    ///
+    /// A cold open then shows the last known results at once, before any request. It runs without
+    /// a request, so nothing is stored, and the normal pass that follows checks and replaces it.
+    /// It does nothing when the cache already holds fresh data for every dependency.
+    fn show_old_data_first(
+        &mut self,
+        eco: Ecosystem,
+        path: &str,
+        text: &str,
+        deps: &[Dependency],
+        now: u64,
+    ) {
+        let run_offline = |cache: &mut Cache, settings: &Settings| {
+            analyze(
+                eco,
+                deps.to_vec(),
+                cache,
+                &HostHttp,
+                settings,
+                now,
+                &mut Budget::offline(),
+            )
+        };
+        if run_offline(&mut self.cache, &self.settings).pending == 0 {
+            return;
+        }
+        let settings = &self.settings;
+        let old = self
+            .cache
+            .with_stale_reads(STALE_MAX_AGE_SECS, |cache| run_offline(cache, settings));
+        // A manifest that nothing is known about keeps its decorations until the first answer.
+        if old
+            .entries
+            .iter()
+            .any(|entry| entry.status != Status::Pending)
+        {
+            publish_analysis(path, text, &old, self.settings.outdated_problems);
+        }
+    }
+
     /// Stops tracking a manifest that cannot be read, and clears what the editor still shows for it.
     fn forget_shown(&mut self, path: &str) {
         if self.published_paths.remove(path) {
@@ -187,6 +288,8 @@ impl DependencyLens {
         // One clock reading serves the whole run. With a cache lifetime shorter than a chunk, a
         // fresh reading per chunk would expire the answers of the chunk before and repeat its work.
         let run_started_at = now_secs();
+        self.load_block(eco, &HostStore);
+        self.show_old_data_first(eco, path, text, deps, run_started_at);
         let mut previous_pending = None;
         loop {
             // The dependency vector is cloned per chunk; the parse is not repeated.
@@ -214,6 +317,7 @@ impl DependencyLens {
                 return previous_pending.is_some().then_some(0);
             }
             publish_analysis(path, text, &analysis, self.settings.outdated_problems);
+            self.save_blocks(&HostStore);
             let pending = analysis.pending;
             let unloaded = analysis.unloaded_advisory_count();
             // Pending entries are the only ones without a status, so the done count is a subtraction, not a scan.
@@ -620,6 +724,50 @@ mod loop_tests {
     fn deadline_after_saturates_instead_of_overflowing() {
         let before = Instant::now();
         assert!(deadline_after(Duration::MAX) > before);
+    }
+}
+
+#[cfg(test)]
+mod disk_cache_tests {
+    use super::*;
+    use crate::model::VersionInfo;
+    use crate::store::MemoryStore;
+    use openidea_plugin::mock::MockHost;
+
+    #[test]
+    fn a_failed_save_keeps_the_ecosystem_dirty_for_the_next_chunk() {
+        let _host = MockHost::install();
+        let mut plugin = DependencyLens::default();
+        plugin
+            .cache
+            .put_version_info(Ecosystem::PyPI, "requests", VersionInfo::default(), 1);
+
+        plugin.save_blocks(&MemoryStore::failing());
+        assert!(plugin.cache.is_dirty(Ecosystem::PyPI));
+
+        let store = MemoryStore::new();
+        plugin.save_blocks(&store);
+        assert!(!plugin.cache.is_dirty(Ecosystem::PyPI));
+        assert_eq!(store.keys(), ["cache/PyPI"]);
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_read_counts_as_loaded_and_warns_once() {
+        let host = MockHost::install();
+        let mut plugin = DependencyLens::default();
+        let store = MemoryStore::failing();
+
+        plugin.load_block(Ecosystem::PyPI, &store);
+        plugin.load_block(Ecosystem::PyPI, &store);
+        plugin.load_block(Ecosystem::Cargo, &store);
+
+        assert!(plugin.loaded_blocks.contains(&Ecosystem::PyPI));
+        let warnings = host
+            .logs()
+            .into_iter()
+            .filter(|(level, _)| matches!(level, LogLevel::Warn))
+            .count();
+        assert_eq!(warnings, 1);
     }
 }
 
