@@ -2,10 +2,11 @@
 //! vulnerabilities, or to the latest registry release.
 
 use crate::cache::Cache;
-use crate::fixes::{line_constraints, plan_fix, render_fix, satisfies_all};
+use crate::fixes::{line_constraints, plan_fix, render_fix};
 use crate::is_manifest_in;
 use crate::model::{Affected, Dependency, Ecosystem};
 use crate::osv::{declared_version_for_osv, is_deferred, is_placeholder};
+use crate::requirement::satisfies_all;
 use crate::settings::Settings;
 use crate::text::to_range;
 use crate::update::{UpdateKind, is_outdated, render_update, update_kind};
