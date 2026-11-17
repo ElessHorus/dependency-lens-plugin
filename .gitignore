@@ -4,3 +4,4 @@ target/
 dist/
 *.key
 *.oiplugin
+graphify-out/
