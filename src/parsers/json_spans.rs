@@ -84,6 +84,7 @@ fn read_entry(
         dev: section.dev,
         optional: section.optional,
         has_additional_version_constraints: false,
+        requirement: None,
     })
 }
 

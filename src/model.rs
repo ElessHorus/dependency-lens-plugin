@@ -1,6 +1,7 @@
 //! Shared data model for manifest parsing, registry lookups and advisories.
 
 use crate::parsers;
+use crate::requirement::Requirement;
 use serde::{Deserialize, Serialize};
 
 /// Suffixes of the MSBuild project files that name NuGet packages (C#, F#, Visual Basic).
@@ -191,6 +192,9 @@ pub struct Dependency {
     pub optional: bool,
     /// Whether the source holds version constraints beyond `version`.
     pub has_additional_version_constraints: bool,
+    /// What the declared requirement allows. `None` when the ecosystem has no registry list
+    /// (Cargo, npm, Go, Maven) or when the text is not readable (wildcards, placeholders).
+    pub requirement: Option<Requirement>,
 }
 
 /// Version data fetched from a registry.

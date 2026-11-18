@@ -9,10 +9,11 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::model::{Affected, Ecosystem, RangeEvent};
-use crate::registries::dotted::{DottedVersion, PubVersion, segment};
+use crate::registries::dotted::{DottedVersion, PubVersion};
 use crate::registries::gem_version::GemVersion;
 use crate::registries::maven_version::MavenVersion;
 use crate::registries::pep440::Pep440;
+use crate::requirement::Constraint;
 use crate::update::{UpdateVersion, split_operator};
 
 /// Operators that a requirement may start with and that keep the target version allowed.
@@ -32,13 +33,6 @@ pub struct FixPlan {
     pub fixed_count: usize,
     /// The advisories of the current version, with or without a known fix.
     pub total_count: usize,
-}
-
-/// One constraint of a requirement line, such as `<` and `1` in `flask>=0.12.2,<1`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Constraint {
-    pub operator: String,
-    pub version: String,
 }
 
 /// The constraints that a requirement line holds.
@@ -506,49 +500,6 @@ fn requirement_segment(eco: Ecosystem, line: &str, pin_start: usize) -> (&str, u
     (&code[start..end], start)
 }
 
-/// Returns `true` when `target` satisfies every constraint. A constraint that is not a version
-/// cannot be checked, so it refuses the target.
-pub fn satisfies_all(eco: Ecosystem, target: &str, constraints: &[Constraint]) -> bool {
-    match eco {
-        Ecosystem::PyPI => satisfies_all_of::<Pep440>(target, constraints),
-        Ecosystem::RubyGems => satisfies_all_of::<GemVersion>(target, constraints),
-        Ecosystem::Pub => satisfies_all_of::<PubVersion>(target, constraints),
-        Ecosystem::Maven => satisfies_all_of::<MavenVersion>(target, constraints),
-        _ => satisfies_all_of::<DottedVersion>(target, constraints),
-    }
-}
-
-fn satisfies_all_of<V: UpdateVersion>(target: &str, constraints: &[Constraint]) -> bool {
-    let Some(target) = V::parse_version(target) else {
-        return false;
-    };
-    constraints.iter().all(|constraint| {
-        let Some(bound) = V::parse_version(&constraint.version) else {
-            return false;
-        };
-        match constraint.operator.as_str() {
-            "<" => target < bound,
-            "<=" => target <= bound,
-            ">" => target > bound,
-            ">=" => target >= bound,
-            "==" | "===" => target == bound,
-            "!=" => target != bound,
-            // Compatible release: at least the bound, and the same release without its last segment.
-            "~=" | "~>" => {
-                let (bound_segments, target_segments) =
-                    (bound.release_segments(), target.release_segments());
-                // `~> 2.2` keeps the major version, and so does `~> 2`: at least one segment is kept.
-                let kept = bound_segments.len().saturating_sub(1).max(1);
-                target >= bound
-                    && (0..kept).all(|index| {
-                        segment(&target_segments, index) == segment(&bound_segments, index)
-                    })
-            }
-            _ => false,
-        }
-    })
-}
-
 /// The requirement text that moves `declared` to `target`, or `None` when the form cannot be rewritten.
 ///
 /// The operator and the `v` of a Go version stay, and the full target is written. Ranges, wildcards,
@@ -590,6 +541,7 @@ fn render_fix_of<V: UpdateVersion>(declared: &str, target: &str) -> Option<Strin
 mod tests {
     use super::*;
     use crate::model::{Affected, Ecosystem, RangeEvent};
+    use crate::requirement::satisfies_all;
 
     fn range(events: &[(&str, &str)]) -> Vec<RangeEvent> {
         events

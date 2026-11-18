@@ -518,6 +518,7 @@ fn parse_gem(
     // Each constraint is a `,` followed by a quoted requirement. The first token
     // that breaks this pattern ends the list. It starts the options.
     let mut requirement_count = 0;
+    let mut constraints = Vec::new();
     let mut pin = None;
     let mut index = cursor + 1;
     while punct_at(first_line, index, b',') {
@@ -531,6 +532,15 @@ fn parse_gem(
             break;
         };
         requirement_count += 1;
+        constraints.push(crate::requirement::Constraint {
+            // A bare version and `=` both mean an exact version.
+            operator: match requirement.operator {
+                "" | "=" => "==",
+                other => other,
+            }
+            .to_owned(),
+            version: requirement.version.to_owned(),
+        });
         if pin.is_none() && PIN_OPERATORS.contains(&requirement.operator) {
             pin = Some(Pin {
                 version: requirement.version,
@@ -568,6 +578,7 @@ fn parse_gem(
         dev: in_dev_block || is_group_dev,
         optional: false,
         has_additional_version_constraints: requirement_count > 1,
+        requirement: crate::requirement::Requirement::from_constraints(constraints),
     })
 }
 
@@ -1350,5 +1361,47 @@ gem 'plain', '1.0', 'require' => false
     fn a_plain_http_rubygems_source_is_public() {
         let manifest = "source 'http://rubygems.org'\ngem 'rails', '1.0'\n";
         assert_eq!(summary(&parse(manifest)), [("rails", "1.0", false, false)]);
+    }
+
+    /// The requirement that a list of `(operator, version)` pairs gives, as a test expectation.
+    fn gem_requirement(pairs: &[(&str, &str)]) -> Option<crate::requirement::Requirement> {
+        crate::requirement::Requirement::from_constraints(
+            pairs
+                .iter()
+                .map(|(operator, version)| crate::requirement::Constraint {
+                    operator: (*operator).to_owned(),
+                    version: (*version).to_owned(),
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn every_requirement_string_of_a_gem_is_kept() {
+        let dependencies = parse(
+            "gem 'rails', '>= 7.0', '< 8'\ngem 'rack', '~> 2.2'\ngem 'a', '1.0'\ngem 'b', '= 2.0'\n",
+        );
+        assert_eq!(
+            dependencies[0].requirement,
+            gem_requirement(&[(">=", "7.0"), ("<", "8")])
+        );
+        assert_eq!(
+            dependencies[1].requirement,
+            gem_requirement(&[("~>", "2.2")])
+        );
+        assert_eq!(
+            dependencies[2].requirement,
+            gem_requirement(&[("==", "1.0")])
+        );
+        assert_eq!(
+            dependencies[3].requirement,
+            gem_requirement(&[("==", "2.0")])
+        );
+        assert!(
+            dependencies[2]
+                .requirement
+                .as_ref()
+                .is_some_and(|requirement| requirement.is_exact_pin())
+        );
     }
 }

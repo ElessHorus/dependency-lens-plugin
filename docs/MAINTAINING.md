@@ -18,6 +18,7 @@ Run these checks in the real IDE, after building and linking the plugin (see the
    - Choose Reload in Settings › Plugins, or wait five minutes for the IDE to unload the plugin. Open the manifest again. The decorations must show at once from the disk, and the new answers replace them when the check ends. Find the line `cache: loaded PyPI (<n> records, <b> bytes) in <t> ms` in the plugin log (debug level) and note `<t>`.
    - Set `cacheTtlSeconds` to `0` and open it again, to compare with no cache.
    - Run "Dependency Lens: Clear cache". The next cold open is slow again.
+8. Check the lowest allowed version. Open a `requirements.txt` that holds `requests>1.12,<2.10`. After the check, the hover must show `Checked version: 2.0.0` and the line `Lowest version that the requirement allows (the manifest writes 1.12).` (the line appears when the version has advisories). `1.12` does not exist on PyPI, so the check must not use it.
 
 ## Updating the pinned actions
 

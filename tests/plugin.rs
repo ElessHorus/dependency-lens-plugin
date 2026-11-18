@@ -1581,3 +1581,71 @@ fn scheduled_event_is_ignored() {
     assert!(host.tasks().is_empty());
     assert!(host.decorations().is_empty());
 }
+
+/// The 1.x line of `requests` ends at 1.2.3, and the 2.x line starts at 2.0.0.
+const REQUESTS_RANGE_BODY: &str = r#"{"info":{"version":"2.34.2"},"releases":{"1.2.3":[{"yanked":false}],"2.0.0":[{"yanked":false}],"2.9.2":[{"yanked":false}],"2.34.2":[{"yanked":false}]}}"#;
+
+#[test]
+fn a_range_checks_the_lowest_version_that_exists_and_shows_it_in_the_hover() {
+    let queried_versions = Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let recorded_versions = queried_versions.clone();
+    let host = MockHost::install().with_capabilities(&[
+        "events",
+        "project.read",
+        "editor.read",
+        "net:api.osv.dev",
+        "net:pypi.org",
+    ]);
+    host.set_project_root(Some("/p"));
+    host.on_fetch(move |request| {
+        if request.url.starts_with("https://pypi.org/pypi/") {
+            return Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: REQUESTS_RANGE_BODY.as_bytes().to_vec(),
+            });
+        }
+        if request.url.ends_with(OSV_BATCH_SUFFIX) {
+            let query_body: Value =
+                serde_json::from_slice(request.body.as_deref().unwrap_or_default())
+                    .unwrap_or(Value::Null);
+            let queries = query_body["queries"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            for query in &queries {
+                recorded_versions
+                    .borrow_mut()
+                    .push(query["version"].as_str().unwrap_or_default().to_owned());
+            }
+            // Every queried version has the advisory, so the hover lists it.
+            let results: Vec<Value> = queries
+                .iter()
+                .map(|_| json!({ "vulns": [{ "id": HIGH_ID }] }))
+                .collect();
+            return Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: json!({ "results": results }).to_string().into_bytes(),
+            });
+        }
+        answer_osv(request)
+    });
+    host.add_file("requirements.txt", "requests>1.12,<2.10\n");
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(REQUIREMENTS_PATH.to_owned())],
+        &host.invocation(),
+    );
+
+    assert_eq!(*queried_versions.borrow(), ["2.0.0"]);
+    let hover = decorations_of(&host, REQUIREMENTS_PATH)[0]
+        .hover
+        .clone()
+        .expect("a hover");
+    assert!(hover.contains("Checked version: 2.0.0"), "{hover}");
+    assert!(
+        hover.contains("Lowest version that the requirement allows (the manifest writes 1.12)."),
+        "{hover}"
+    );
+}

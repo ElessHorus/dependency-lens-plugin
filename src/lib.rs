@@ -10,6 +10,7 @@ pub mod osv;
 pub mod parsers;
 pub mod publish;
 pub mod registries;
+pub mod requirement;
 pub mod settings;
 pub mod store;
 pub mod text;

@@ -271,6 +271,10 @@ fn finish_entry(entry: Option<PendingEntry<'_>>, dependencies: &mut Vec<Dependen
         dev: entry.dev,
         optional: false,
         has_additional_version_constraints: false,
+        requirement: crate::requirement::Requirement::parse(
+            crate::model::Ecosystem::Pub,
+            version.text,
+        ),
     });
 }
 
@@ -454,5 +458,24 @@ dependencies:
                 ("upper_case", "^2.0.0", false)
             ]
         );
+    }
+
+    #[test]
+    fn pub_versions_read_their_requirement() {
+        let dependencies = parse("dependencies:\n  http: ^1.2.3\n  path: any\n");
+        let http = dependencies
+            .iter()
+            .find(|dependency| dependency.name == "http")
+            .expect("http");
+        assert_eq!(
+            http.requirement,
+            crate::requirement::Requirement::parse(crate::model::Ecosystem::Pub, "^1.2.3")
+        );
+        assert!(http.requirement.is_some());
+        let path = dependencies
+            .iter()
+            .find(|dependency| dependency.name == "path")
+            .expect("path");
+        assert_eq!(path.requirement, None);
     }
 }

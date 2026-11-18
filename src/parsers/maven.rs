@@ -239,6 +239,7 @@ fn build_dependency(pending: PendingDependency<'_>) -> Option<(Dependency, Optio
         dev: pending.scope.is_some_and(|scope| scope.text == "test"),
         optional: pending.optional.is_some_and(|flag| flag.text == "true"),
         has_additional_version_constraints: version.text.contains("${"),
+        requirement: None,
     };
     Some((dependency, placeholder_property(version.text)))
 }

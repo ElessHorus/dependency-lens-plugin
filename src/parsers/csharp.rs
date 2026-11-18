@@ -237,6 +237,10 @@ fn build_dependency<'a>(item: PendingItem<'a>) -> Option<(Dependency, Option<&'a
         dev: item.kind == ItemKind::GlobalPackageReference || item.is_private_assets_all,
         optional: false,
         has_additional_version_constraints: property_name.is_some(),
+        requirement: crate::requirement::Requirement::parse(
+            crate::model::Ecosystem::NuGet,
+            version.text,
+        ),
     };
     Some((dependency, property_name))
 }
@@ -407,6 +411,8 @@ pub fn parse(text: &str) -> Vec<Dependency> {
         }
         if let Some(dependency) = dependencies.get_mut(dependency_index) {
             dependency.version = (*value).to_owned();
+            dependency.requirement =
+                crate::requirement::Requirement::parse(crate::model::Ecosystem::NuGet, value);
         }
     }
     dependencies
@@ -611,5 +617,33 @@ mod tests {
         let text = "<Project><ItemGroup><PackageReference Include=\"A\" Version=\"$(V)\" />\
                     </ItemGroup><PropertyGroup><V>$(W)</V><W>3.0</W></PropertyGroup></Project>";
         assert_eq!(summary(&parse(text)), [("A", "$(V)", false, true)]);
+    }
+
+    #[test]
+    fn nuget_versions_read_their_requirement() {
+        let dependencies = parse(
+            r#"<Project><PropertyGroup><V>2.0</V></PropertyGroup><ItemGroup>
+<PackageReference Include="A" Version="1.0" />
+<PackageReference Include="B" Version="[1.0,2.0)" />
+<PackageReference Include="C" Version="1.*" />
+<PackageReference Include="D" Version="$(V)" />
+</ItemGroup></Project>"#,
+        );
+        let requirement_of = |name: &str| {
+            dependencies
+                .iter()
+                .find(|dependency| dependency.name == name)
+                .and_then(|dependency| dependency.requirement.clone())
+        };
+        let nuget = |text: &str| {
+            crate::requirement::Requirement::parse(crate::model::Ecosystem::NuGet, text)
+        };
+        assert_eq!(requirement_of("A"), nuget("1.0"));
+        assert_eq!(requirement_of("B"), nuget("[1.0,2.0)"));
+        assert!(requirement_of("B").is_some());
+        assert_eq!(requirement_of("C"), None);
+        // A property placeholder is read from the resolved value.
+        assert_eq!(requirement_of("D"), nuget("2.0"));
+        assert!(requirement_of("D").is_some());
     }
 }
