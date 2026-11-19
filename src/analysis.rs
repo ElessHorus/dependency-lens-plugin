@@ -51,6 +51,9 @@ pub struct Analysis {
     pub entries: Vec<Entry>,
     /// Number of entries whose check is still running.
     pub pending: usize,
+    /// Number of entries whose checked version still waits for a registry list. They are pending
+    /// too. A chunk that resolves one lowers this count, so the chunk loop knows it made progress.
+    pub lists_waiting: usize,
 }
 
 impl Analysis {
@@ -180,6 +183,7 @@ pub fn analyze(
         return Analysis {
             entries: Vec::new(),
             pending: 0,
+            lists_waiting: 0,
         };
     }
     // The ignore list is normalised once per call, so each dependency name is the only per-item work.
@@ -199,6 +203,10 @@ pub fn analyze(
             .map(|dependency| checked_with_list(eco, dependency, None))
             .collect()
     };
+    let lists_waiting = resolved_versions
+        .iter()
+        .filter(|resolved| matches!(resolved, CheckedVersion::WaitingForList))
+        .count();
     // An entry that waits for its list sends nothing to OSV yet.
     let checked_versions: Vec<Option<String>> = resolved_versions
         .iter()
@@ -242,7 +250,11 @@ pub fn analyze(
         } else {
             0
         };
-    Analysis { entries, pending }
+    Analysis {
+        entries,
+        pending,
+        lists_waiting,
+    }
 }
 
 /// Whether the cache holds an OSV answer or an OSV failure for one version of `dependency`.
@@ -1160,6 +1172,7 @@ mod tests {
             Analysis {
                 entries: Vec::new(),
                 pending: 0,
+                lists_waiting: 0,
             }
         );
         assert!(http.requests().is_empty());
@@ -2844,6 +2857,23 @@ mod tests {
         assert!(budget.is_cancelled());
         assert_eq!(entry(&analysis, "aaa").status, Status::Pending);
         assert_eq!(entry(&analysis, "aaa").checked_version, None);
+    }
+
+    #[test]
+    fn a_chunk_with_one_lookup_reports_the_lists_still_waiting() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", PYPI_PREFIX, 200, RANGE_BODY);
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            "aaa>1.12,<2.10\nbbb==2.0.0\nccc>1.12,<2.10\n",
+            &mut Budget::new(1, None).with_first_osv_slice(1),
+        );
+        assert_eq!(analysis.lists_waiting, 1);
+        assert_eq!(analysis.pending, 2);
     }
 
     #[test]

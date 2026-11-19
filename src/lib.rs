@@ -375,7 +375,7 @@ impl DependencyLens {
         let run_started_at = now_secs();
         self.load_block(eco, &HostStore);
         let old_data = self.show_old_data_first(eco, path, text, deps, run_started_at);
-        let mut previous_pending = None;
+        let mut previous_progress = None;
         loop {
             // The dependency vector is cloned per chunk; the parse is not repeated.
             // Each chunk gets its own deadline. The first registry lookup of a chunk runs unless the deadline has passed,
@@ -400,15 +400,16 @@ impl DependencyLens {
                 // A newer call supersedes this one and refreshes the manifest. Publishing the
                 // unfinished analysis would replace good results with `…` or `?`. After the first
                 // chunk, what the editor shows is already a published result, so it stays as it is.
-                return previous_pending.is_some().then_some(0);
+                return previous_progress.is_some().then_some(0);
             }
             let pending = analysis.pending;
+            let progress = Progress::of(&analysis);
             let cancelled = task.is_cancelled();
             // Whether the loop ends here is known before the publication: the last one must not
             // present old data as current for an entry that this run never re-checked.
             let is_last_chunk = !should_continue(
-                pending,
-                previous_pending,
+                progress,
+                previous_progress,
                 cancelled,
                 Instant::now(),
                 limits.deadline,
@@ -434,7 +435,7 @@ impl DependencyLens {
             if is_last_chunk {
                 return Some(analysis.unloaded_advisory_count());
             }
-            previous_pending = Some(pending);
+            previous_progress = Some(progress);
         }
     }
 }
@@ -447,21 +448,43 @@ fn deadline_after(time_box: Duration) -> Instant {
         .unwrap_or(now)
 }
 
-/// Whether the chunk loop runs one more chunk after a chunk that left `pending` entries.
-///
-/// `previous_pending` is the pending count of the chunk before, or `None` after the first chunk.
-/// A chunk that does not lower the pending count stops the loop, because the next chunk would repeat it.
-fn should_continue(
+/// What one chunk of the loop achieved, to tell whether the next chunk can do more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Progress {
+    /// Entries whose check is still running.
     pending: usize,
-    previous_pending: Option<usize>,
+    /// Entries whose checked version still waits for a registry list.
+    lists_waiting: usize,
+}
+
+impl Progress {
+    fn of(analysis: &Analysis) -> Self {
+        Self {
+            pending: analysis.pending,
+            lists_waiting: analysis.lists_waiting,
+        }
+    }
+}
+
+/// Whether the chunk loop runs one more chunk after a chunk that left `progress.pending` entries.
+///
+/// `previous` is the progress of the chunk before, or `None` after the first chunk. A chunk that
+/// lowers neither counter stops the loop, because the next chunk would repeat it. A chunk that
+/// only resolves a registry list leaves the pending count as it was, but the next chunk can then
+/// send the OSV query of that range, so it counts as progress too.
+fn should_continue(
+    progress: Progress,
+    previous: Option<Progress>,
     cancelled: bool,
     now: Instant,
     deadline: Instant,
 ) -> bool {
-    pending > 0
+    progress.pending > 0
         && !cancelled
         && now < deadline
-        && previous_pending.is_none_or(|previous| pending < previous)
+        && previous.is_none_or(|previous| {
+            progress.pending < previous.pending || progress.lists_waiting < previous.lists_waiting
+        })
 }
 
 /// Publishes the decorations and problems of one analysis of the manifest `text` at `path`.
@@ -543,6 +566,7 @@ fn fill_pending_from_old(
     Analysis {
         entries,
         pending: analysis.pending,
+        lists_waiting: analysis.lists_waiting,
     }
 }
 
@@ -851,13 +875,27 @@ mod loop_tests {
         now + Duration::from_secs(60)
     }
 
+    /// Progress of a chunk that waits for no registry list.
+    fn progress(pending: usize) -> Progress {
+        Progress {
+            pending,
+            lists_waiting: 0,
+        }
+    }
+
     #[test]
     fn continues_while_pending_and_progressing_before_the_deadline() {
         let now = Instant::now();
-        assert!(should_continue(280, None, false, now, open_deadline(now)));
         assert!(should_continue(
-            260,
-            Some(280),
+            progress(280),
+            None,
+            false,
+            now,
+            open_deadline(now)
+        ));
+        assert!(should_continue(
+            progress(260),
+            Some(progress(280)),
             false,
             now,
             open_deadline(now)
@@ -868,21 +906,27 @@ mod loop_tests {
     fn stops_when_nothing_is_pending() {
         let now = Instant::now();
         assert!(!should_continue(
-            0,
-            Some(20),
+            progress(0),
+            Some(progress(20)),
             false,
             now,
             open_deadline(now)
         ));
-        assert!(!should_continue(0, None, false, now, open_deadline(now)));
+        assert!(!should_continue(
+            progress(0),
+            None,
+            false,
+            now,
+            open_deadline(now)
+        ));
     }
 
     #[test]
     fn stops_when_cancelled() {
         let now = Instant::now();
         assert!(!should_continue(
-            260,
-            Some(280),
+            progress(260),
+            Some(progress(280)),
             true,
             now,
             open_deadline(now)
@@ -892,22 +936,49 @@ mod loop_tests {
     #[test]
     fn stops_at_or_after_the_deadline() {
         let now = Instant::now();
-        assert!(!should_continue(260, Some(280), false, now, now));
+        assert!(!should_continue(
+            progress(260),
+            Some(progress(280)),
+            false,
+            now,
+            now
+        ));
     }
 
     #[test]
-    fn stops_when_the_pending_count_does_not_decrease() {
+    fn stops_when_neither_counter_decreases() {
         let now = Instant::now();
-        assert!(!should_continue(
-            280,
-            Some(280),
-            false,
-            now,
-            open_deadline(now)
-        ));
-        assert!(!should_continue(
-            281,
-            Some(280),
+        let waiting = |pending, lists_waiting| Progress {
+            pending,
+            lists_waiting,
+        };
+        for (current, previous) in [
+            (waiting(280, 0), waiting(280, 0)),
+            (waiting(281, 0), waiting(280, 0)),
+            (waiting(2, 1), waiting(2, 1)),
+            (waiting(2, 2), waiting(2, 1)),
+        ] {
+            assert!(
+                !should_continue(current, Some(previous), false, now, open_deadline(now)),
+                "{current:?} after {previous:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn continues_when_a_list_resolved_and_the_pending_count_did_not_fall() {
+        let now = Instant::now();
+        let current = Progress {
+            pending: 2,
+            lists_waiting: 0,
+        };
+        let previous = Progress {
+            pending: 2,
+            lists_waiting: 1,
+        };
+        assert!(should_continue(
+            current,
+            Some(previous),
             false,
             now,
             open_deadline(now)
@@ -967,6 +1038,7 @@ mod disk_cache_tests {
                 entry_with("c==1.0\n", Status::Pending),
             ],
             pending: 2,
+            lists_waiting: 0,
         };
         let old = Analysis {
             entries: vec![
@@ -975,6 +1047,7 @@ mod disk_cache_tests {
                 entry_with("c==1.0\n", Status::Pending),
             ],
             pending: 1,
+            lists_waiting: 0,
         };
 
         let shown = fill_pending_from_old(&analysis, &old, |_| false);
@@ -1013,10 +1086,12 @@ mod disk_cache_tests {
         let analysis = Analysis {
             entries: vec![waiting.clone()],
             pending: 1,
+            lists_waiting: 0,
         };
         let old = Analysis {
             entries: vec![entry_with("a==1.0\n", outdated.clone())],
             pending: 0,
+            lists_waiting: 0,
         };
 
         // OSV has answered for this entry: its advisories are the news, only its registry status waits.
