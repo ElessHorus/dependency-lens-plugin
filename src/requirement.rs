@@ -132,6 +132,10 @@ fn parse_nuget_range(text: &str) -> Option<Requirement> {
             .then(|| Requirement::from_constraints(vec![constraint(">=", text)]))
             .flatten();
     }
+    // An interval that is still being typed has no closing bracket: its last character would be cut.
+    if !matches!(closing, ']' | ')') {
+        return None;
+    }
     // Both brackets are ASCII, so the slice falls on character boundaries.
     let inner = text.get(1..text.len().checked_sub(1)?)?;
     let constraints = match inner.split_once(',') {
@@ -670,7 +674,7 @@ mod tests {
 
     #[test]
     fn nuget_text_reads_minimums_and_intervals() {
-        let cases: [(&str, Option<Requirement>); 9] = [
+        let cases: [(&str, Option<Requirement>); 13] = [
             ("1.0", Some(requirement(&[&[(">=", "1.0")]]))),
             ("[1.0]", Some(requirement(&[&[("==", "1.0")]]))),
             (
@@ -680,6 +684,11 @@ mod tests {
             ("(1.0,)", Some(requirement(&[&[(">", "1.0")]]))),
             ("(,2.0]", Some(requirement(&[&[("<=", "2.0")]]))),
             ("(,)", None),
+            // An interval that is still being typed has no closing bracket.
+            ("[1.0,2.0", None),
+            ("[1.0,2.0x", None),
+            ("(1.0,2.0", None),
+            ("[1.0", None),
             ("1.*", None),
             ("$(Ver)", None),
             ("", None),
