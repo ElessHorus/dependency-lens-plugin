@@ -136,9 +136,9 @@ fn is_tilde_dotted_byte(byte: u8) -> bool {
     is_dotted_byte(byte) || byte == b'~'
 }
 
-/// Lowercase letters, digits and `-._~`: the class of npm name parts.
+/// Letters, digits and `-._~`: the class of npm name parts. Old packages have uppercase letters.
 fn is_npm_byte(byte: u8) -> bool {
-    byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
 }
 
 /// True when `segment` is a non-empty path segment, is not `.` or `..`, and passes `is_allowed`.
@@ -543,6 +543,12 @@ mod tests {
                 Ecosystem::Npm,
                 "left-pad",
                 "https://www.npmjs.com/package/left-pad",
+            ),
+            // Old npm packages can have uppercase letters in their name.
+            (
+                Ecosystem::Npm,
+                "JSONStream",
+                "https://www.npmjs.com/package/JSONStream",
             ),
             (
                 Ecosystem::Npm,
