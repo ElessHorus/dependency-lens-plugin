@@ -524,7 +524,12 @@ fn registry_view(
     let bounded = dependency
         .requirement
         .as_ref()
-        .filter(|requirement| !requirement.is_exact_pin() && !info.versions.is_empty())
+        // A plain latest that the requirement allows is the answer: only an excluded one needs the list.
+        .filter(|requirement| {
+            !requirement.is_exact_pin()
+                && !info.versions.is_empty()
+                && !requirement.allows(eco, latest)
+        })
         .and_then(|requirement| requirement.latest_allowed(eco, &info.versions));
     match bounded {
         Some(bounded) => {
@@ -2995,6 +3000,27 @@ mod tests {
             NOW,
             &mut Budget::new(usize::MAX, None),
         )
+    }
+
+    #[test]
+    fn a_latest_version_that_the_requirement_allows_is_never_outside_the_bounds() {
+        // `>=8.0.0-preview.1` names a pre-release, so 9.0.0-rc.1 is allowed too. The stable latest
+        // 8.0.1 is allowed as well: it is the update, and it is not outside the bounds.
+        let analysis = analyze_with_list(
+            Ecosystem::NuGet,
+            parsers::csharp::parse(&csproj_with(&[("Acme.Lib", "8.0.0-preview.1")])),
+            "Acme.Lib",
+            "8.0.1",
+            &["9.0.0-rc.1", "8.0.1", "8.0.0-preview.1"],
+        );
+        let found = entry(&analysis, "Acme.Lib");
+        assert_eq!(
+            found.status,
+            Status::Outdated {
+                latest: "8.0.1".to_owned()
+            }
+        );
+        assert_eq!(found.outside_latest, None);
     }
 
     #[test]
