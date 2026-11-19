@@ -993,6 +993,47 @@ fn requirements_show_registry_versions_and_one_outdated_problem() {
 }
 
 #[test]
+fn a_cargo_path_dependency_has_no_decoration_and_no_link() {
+    let host = host_counting_fetches(Rc::new(Cell::new(0)));
+    host.add_file(
+        "Cargo.toml",
+        "[dependencies]\nserde = \"1.0.0\"\nlocal = { path = \"../local\", version = \"1.0.0\" }\n",
+    );
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(MANIFEST_PATH.to_owned())],
+        &host.invocation(),
+    );
+
+    let decorations = decorations_of(&host, MANIFEST_PATH);
+    // Only serde is shown, and no hover names the local crate.
+    assert_eq!(decorations.len(), 1);
+    assert!(decorations.iter().all(|decoration| {
+        !decoration
+            .hover
+            .as_deref()
+            .unwrap_or_default()
+            .contains("local")
+    }));
+}
+
+#[test]
+fn a_requirement_from_a_private_index_has_no_link() {
+    let host = host_with_pypi(Rc::new(Cell::new(0)));
+    host.add_file(
+        "requirements.txt",
+        "--index-url https://private.example/simple\nrequests==2.28.0\n",
+    );
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(REQUIREMENTS_PATH.to_owned())],
+        &host.invocation(),
+    );
+
+    assert!(decorations_of(&host, REQUIREMENTS_PATH).is_empty());
+}
+
+#[test]
 fn outdated_problems_setting_off_publishes_no_problem_for_a_newer_release() {
     let host = host_with_pypi(Rc::new(Cell::new(0)));
     host.add_file("requirements.txt", REQUIREMENTS);
