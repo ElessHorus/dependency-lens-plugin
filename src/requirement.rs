@@ -75,34 +75,37 @@ impl Requirement {
     /// A pre-release counts only when a constraint of the requirement names one.
     pub fn lowest_allowed(&self, eco: Ecosystem, versions: &[String]) -> Option<String> {
         match eco {
-            Ecosystem::PyPI => self.lowest_allowed_of::<Pep440>(eco, versions),
-            Ecosystem::RubyGems => self.lowest_allowed_of::<GemVersion>(eco, versions),
-            Ecosystem::Pub => self.lowest_allowed_of::<PubVersion>(eco, versions),
-            Ecosystem::Maven => self.lowest_allowed_of::<MavenVersion>(eco, versions),
-            _ => self.lowest_allowed_of::<DottedVersion>(eco, versions),
+            Ecosystem::PyPI => self.lowest_allowed_of::<Pep440>(versions),
+            Ecosystem::RubyGems => self.lowest_allowed_of::<GemVersion>(versions),
+            Ecosystem::Pub => self.lowest_allowed_of::<PubVersion>(versions),
+            Ecosystem::Maven => self.lowest_allowed_of::<MavenVersion>(versions),
+            _ => self.lowest_allowed_of::<DottedVersion>(versions),
         }
     }
 
-    fn lowest_allowed_of<V: UpdateVersion>(
-        &self,
-        eco: Ecosystem,
-        versions: &[String],
-    ) -> Option<String> {
-        let names_pre_release = self
+    /// One pass: each bound is parsed once for the whole list, and each candidate once.
+    fn lowest_allowed_of<V: UpdateVersion>(&self, versions: &[String]) -> Option<String> {
+        let alternatives: Vec<Vec<TypedConstraint<'_, V>>> = self
             .alternatives
             .iter()
+            .map(|constraints| typed_constraints(constraints))
+            .collect();
+        let names_pre_release = alternatives
+            .iter()
             .flatten()
-            .filter_map(|constraint| V::parse_version(&constraint.version))
+            .filter_map(|constraint| constraint.bound.as_ref())
             .any(|bound| bound.is_prerelease_version());
         // The list is newest first, so the reverse scan meets the oldest version first.
         versions
             .iter()
             .rev()
             .find(|text| {
-                (names_pre_release
-                    || V::parse_version(text)
-                        .is_some_and(|version| !version.is_prerelease_version()))
-                    && self.allows(eco, text)
+                V::parse_version(text).is_some_and(|version| {
+                    (names_pre_release || !version.is_prerelease_version())
+                        && alternatives
+                            .iter()
+                            .any(|constraints| satisfies_typed(&version, constraints))
+                })
             })
             .cloned()
     }
@@ -349,17 +352,38 @@ pub fn satisfies_all(eco: Ecosystem, target: &str, constraints: &[Constraint]) -
 }
 
 fn satisfies_all_of<V: UpdateVersion>(target: &str, constraints: &[Constraint]) -> bool {
-    let Some(target) = V::parse_version(target) else {
-        return false;
-    };
+    V::parse_version(target)
+        .is_some_and(|target| satisfies_typed(&target, &typed_constraints(constraints)))
+}
+
+/// A constraint whose bound is parsed once. A bound that is not a version stays `None`, and
+/// refuses every target, as an unreadable constraint must.
+struct TypedConstraint<'a, V> {
+    operator: &'a str,
+    bound: Option<V>,
+}
+
+/// Parses the bound of each constraint, so that a scan over many candidates parses it only once.
+fn typed_constraints<V: UpdateVersion>(constraints: &[Constraint]) -> Vec<TypedConstraint<'_, V>> {
+    constraints
+        .iter()
+        .map(|constraint| TypedConstraint {
+            operator: constraint.operator.as_str(),
+            bound: V::parse_version(&constraint.version),
+        })
+        .collect()
+}
+
+/// Returns `true` when `target` satisfies every constraint.
+fn satisfies_typed<V: UpdateVersion>(target: &V, constraints: &[TypedConstraint<'_, V>]) -> bool {
     constraints.iter().all(|constraint| {
-        let Some(bound) = V::parse_version(&constraint.version) else {
+        let Some(bound) = &constraint.bound else {
             return false;
         };
-        match constraint.operator.as_str() {
-            "<" => target < bound && !target.is_excluded_by_bound("<", &bound),
+        match constraint.operator {
+            "<" => target < bound && !target.is_excluded_by_bound("<", bound),
             "<=" => target <= bound,
-            ">" => target > bound && !target.is_excluded_by_bound(">", &bound),
+            ">" => target > bound && !target.is_excluded_by_bound(">", bound),
             ">=" => target >= bound,
             "==" | "===" => target == bound,
             "!=" => target != bound,

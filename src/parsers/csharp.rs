@@ -12,7 +12,8 @@ use quick_xml::reader::Reader;
 
 use super::spans::LineIndex;
 use super::xml_text::{Field, byte_offset, element_name, read_field, trimmed_field};
-use crate::model::Dependency;
+use crate::model::{Dependency, Ecosystem};
+use crate::requirement::Requirement;
 
 /// Root element of an MSBuild project or props file.
 const ROOT_ELEMENT: &str = "Project";
@@ -237,10 +238,7 @@ fn build_dependency<'a>(item: PendingItem<'a>) -> Option<(Dependency, Option<&'a
         dev: item.kind == ItemKind::GlobalPackageReference || item.is_private_assets_all,
         optional: false,
         has_additional_version_constraints: property_name.is_some(),
-        requirement: crate::requirement::Requirement::parse(
-            crate::model::Ecosystem::NuGet,
-            version.text,
-        ),
+        requirement: Requirement::parse(Ecosystem::NuGet, version.text),
     };
     Some((dependency, property_name))
 }
@@ -411,8 +409,7 @@ pub fn parse(text: &str) -> Vec<Dependency> {
         }
         if let Some(dependency) = dependencies.get_mut(dependency_index) {
             dependency.version = (*value).to_owned();
-            dependency.requirement =
-                crate::requirement::Requirement::parse(crate::model::Ecosystem::NuGet, value);
+            dependency.requirement = Requirement::parse(Ecosystem::NuGet, value);
         }
     }
     dependencies
@@ -635,9 +632,7 @@ mod tests {
                 .find(|dependency| dependency.name == name)
                 .and_then(|dependency| dependency.requirement.clone())
         };
-        let nuget = |text: &str| {
-            crate::requirement::Requirement::parse(crate::model::Ecosystem::NuGet, text)
-        };
+        let nuget = |text: &str| Requirement::parse(Ecosystem::NuGet, text);
         assert_eq!(requirement_of("A"), nuget("1.0"));
         assert_eq!(requirement_of("B"), nuget("[1.0,2.0)"));
         assert!(requirement_of("B").is_some());

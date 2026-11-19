@@ -12,8 +12,9 @@ use taplo::dom::node::{Bool, DomNode, Key, Str};
 use taplo::syntax::SyntaxElement;
 
 use super::spans::LineIndex;
-use crate::model::{Dependency, Span};
+use crate::model::{Dependency, Ecosystem, Span};
 use crate::registries::pypi::normalize_name;
+use crate::requirement::{Constraint as RequirementConstraint, Requirement};
 
 /// PEP 440 operators that may start a version constraint.
 const OPERATORS: [&str; 8] = ["===", "==", ">=", "<=", "!=", "~=", ">", "<"];
@@ -158,7 +159,7 @@ struct Pep508 {
     /// Whether the requirement has more than one constraint.
     has_additional_version_constraints: bool,
     /// Every constraint of the requirement. `None` when a version is a wildcard.
-    requirement: Option<crate::requirement::Requirement>,
+    requirement: Option<Requirement>,
 }
 
 /// One `operator version` pair of a requirement.
@@ -211,10 +212,10 @@ fn parse_pep508(input: &str) -> Option<Pep508> {
         .any(|constraint| input[constraint.version.clone()].contains('*'));
     let requirement = (!has_wildcard)
         .then(|| {
-            crate::requirement::Requirement::from_constraints(
+            Requirement::from_constraints(
                 constraints
                     .iter()
-                    .map(|constraint| crate::requirement::Constraint {
+                    .map(|constraint| RequirementConstraint {
                         operator: constraint.operator.to_owned(),
                         version: input[constraint.version.clone()].to_owned(),
                     })
@@ -581,10 +582,7 @@ fn build_poetry_dependency(
         dev: is_dev,
         optional: is_optional,
         has_additional_version_constraints: false,
-        requirement: crate::requirement::Requirement::parse(
-            crate::model::Ecosystem::PyPI,
-            version_text,
-        ),
+        requirement: Requirement::parse(Ecosystem::PyPI, version_text),
     })
 }
 
@@ -631,7 +629,6 @@ fn raw_content<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Ecosystem;
     use crate::text::to_range;
     use openidea_plugin::Document;
 
@@ -1161,8 +1158,8 @@ internal-dev = { workspace = true }
     }
 
     /// The requirement that `text` gives for PyPI, as a test expectation.
-    fn pypi_requirement(text: &str) -> Option<crate::requirement::Requirement> {
-        crate::requirement::Requirement::parse(crate::model::Ecosystem::PyPI, text)
+    fn pypi_requirement(text: &str) -> Option<Requirement> {
+        Requirement::parse(Ecosystem::PyPI, text)
     }
 
     #[test]
