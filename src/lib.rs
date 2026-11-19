@@ -887,9 +887,14 @@ mod loop_tests {
 
     /// Progress of a chunk that waits for no registry list.
     fn progress(pending: usize) -> Progress {
+        progress_with_lists(pending, 0)
+    }
+
+    /// Progress of a chunk that still waits for `lists_waiting` registry lists.
+    fn progress_with_lists(pending: usize, lists_waiting: usize) -> Progress {
         Progress {
             pending,
-            lists_waiting: 0,
+            lists_waiting,
         }
     }
 
@@ -958,15 +963,11 @@ mod loop_tests {
     #[test]
     fn stops_when_neither_counter_decreases() {
         let now = Instant::now();
-        let waiting = |pending, lists_waiting| Progress {
-            pending,
-            lists_waiting,
-        };
         for (current, previous) in [
-            (waiting(280, 0), waiting(280, 0)),
-            (waiting(281, 0), waiting(280, 0)),
-            (waiting(2, 1), waiting(2, 1)),
-            (waiting(2, 2), waiting(2, 1)),
+            (progress(280), progress(280)),
+            (progress(281), progress(280)),
+            (progress_with_lists(2, 1), progress_with_lists(2, 1)),
+            (progress_with_lists(2, 2), progress_with_lists(2, 1)),
         ] {
             assert!(
                 !should_continue(current, Some(previous), false, now, open_deadline(now)),
@@ -978,17 +979,9 @@ mod loop_tests {
     #[test]
     fn continues_when_a_list_resolved_and_the_pending_count_did_not_fall() {
         let now = Instant::now();
-        let current = Progress {
-            pending: 2,
-            lists_waiting: 0,
-        };
-        let previous = Progress {
-            pending: 2,
-            lists_waiting: 1,
-        };
         assert!(should_continue(
-            current,
-            Some(previous),
+            progress_with_lists(2, 0),
+            Some(progress_with_lists(2, 1)),
             false,
             now,
             open_deadline(now)
