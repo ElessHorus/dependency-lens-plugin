@@ -6,7 +6,7 @@ use crate::registries::dotted::{DottedVersion, PubVersion, is_dev_branch, segmen
 use crate::registries::gem_version::GemVersion;
 use crate::registries::maven_version::MavenVersion;
 use crate::registries::pep440::Pep440;
-use crate::update::UpdateVersion;
+use crate::update::{ExclusiveBound, UpdateVersion};
 
 /// One constraint of a requirement, such as `<` and `1` in `flask>=0.12.2,<1`.
 ///
@@ -381,9 +381,11 @@ fn satisfies_typed<V: UpdateVersion>(target: &V, constraints: &[TypedConstraint<
             return false;
         };
         match constraint.operator {
-            "<" => target < bound && !target.is_excluded_by_bound("<", bound),
+            "<" => target < bound && !target.is_excluded_by_bound(ExclusiveBound::LessThan, bound),
             "<=" => target <= bound,
-            ">" => target > bound && !target.is_excluded_by_bound(">", bound),
+            ">" => {
+                target > bound && !target.is_excluded_by_bound(ExclusiveBound::GreaterThan, bound)
+            }
             ">=" => target >= bound,
             "==" | "===" => target == bound,
             "!=" => target != bound,

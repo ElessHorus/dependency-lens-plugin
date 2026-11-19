@@ -1261,3 +1261,155 @@ mod path_case_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod load_action_tests {
+    use super::*;
+    use crate::osv::deferred;
+    use openidea_plugin::mock::MockHost;
+    use openidea_plugin::{HttpResponse, Position};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    const MANIFEST_PATH: &str = "/p/requirements.txt";
+    const PYPI_URL_PREFIX: &str = "https://pypi.org/pypi/requests/";
+    /// The 2.x line starts at 2.0.0, so `>1.12,<2.10` allows 2.0.0 and 2.9.2 only.
+    const PYPI_BODY: &str = r#"{"info":{"version":"2.34.2"},"releases":{"1.2.3":[{"yanked":false}],"2.0.0":[{"yanked":false}],"2.9.2":[{"yanked":false}],"2.34.2":[{"yanked":false}]}}"#;
+
+    /// The URL and the body of each request that the host received, in order.
+    type RequestLog = Rc<RefCell<Vec<(String, String)>>>;
+
+    /// The number of advisories that OSV names for the checked version.
+    const ADVISORY_COUNT: usize = 12;
+
+    /// A batch answer with `count` advisories for its one query.
+    fn batch_answer_of(count: usize) -> String {
+        let vulns: Vec<String> = (0..count)
+            .map(|number| format!(r#"{{"id":"GHSA-{number:04}"}}"#))
+            .collect();
+        format!(r#"{{"results":[{{"vulns":[{}]}}]}}"#, vulns.join(","))
+    }
+
+    /// A host that answers PyPI and OSV, and records the URL and the body of each request.
+    fn recording_host(manifest: &str) -> (MockHost, RequestLog) {
+        let host = MockHost::install().with_capabilities(&[
+            "events",
+            "project.read",
+            "editor.read",
+            "net:api.osv.dev",
+            "net:pypi.org",
+        ]);
+        host.set_project_root(Some("/p"));
+        host.add_file("requirements.txt", manifest);
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let log = requests.clone();
+        host.on_fetch(move |request| {
+            let body =
+                String::from_utf8_lossy(request.body.as_deref().unwrap_or_default()).into_owned();
+            log.borrow_mut().push((request.url.clone(), body));
+            let answer = if request.url.starts_with("https://pypi.org/pypi/") {
+                PYPI_BODY
+            } else if request.url.ends_with("/v1/querybatch") {
+                // Twelve advisories: two more than the ten whose details load by default.
+                &batch_answer_of(ADVISORY_COUNT)
+            } else if request.url.contains("/v1/vulns/") {
+                r#"{"id":"GHSA-x","summary":"Test advisory","database_specific":{"severity":"HIGH"}}"#
+            } else {
+                return Err(Error::Failed(format!("unexpected request {}", request.url)));
+            };
+            Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: answer.as_bytes().to_vec(),
+            })
+        });
+        (host, requests)
+    }
+
+    fn manifest_document(text: &str) -> Document {
+        Document {
+            path: MANIFEST_PATH.to_owned(),
+            language: "pip-requirements".to_owned(),
+            version: 1,
+            text: text.to_owned(),
+        }
+    }
+
+    /// A plugin whose cache holds one deferred advisory for the bound text `1.12` of `requests`,
+    /// as after a registry failure that has expired: advisories without a fresh list.
+    fn plugin_with_bound_text_advisory() -> DependencyLens {
+        let mut plugin = DependencyLens::default();
+        plugin.cache.put_vulnerabilities(
+            Ecosystem::PyPI,
+            "requests",
+            "1.12",
+            vec![deferred("GHSA-bound-text")],
+            now_secs(),
+        );
+        plugin
+    }
+
+    fn load_action(package: &str) -> CodeAction {
+        CodeAction {
+            title: "Load".to_owned(),
+            kind: Some("quickfix".to_owned()),
+            preferred: false,
+            edits: Vec::new(),
+            data: Some(format!("{}{package}", actions::LOAD_ACTION_PREFIX)),
+        }
+    }
+
+    #[test]
+    fn the_load_action_reads_the_missing_list_and_checks_the_lowest_allowed_version() {
+        let text = "requests>1.12,<2.10\n";
+        let (_host, requests) = recording_host(text);
+        let document = manifest_document(text);
+        let mut plugin = plugin_with_bound_text_advisory();
+
+        // The cache holds advisories for the bound text and no list, so the action is offered.
+        let cursor = Range::new(Position::new(0, 12), Position::new(0, 12));
+        let actions = Providers::code_actions(&mut plugin, &document, cursor);
+        let load = actions
+            .iter()
+            .find(|action| action.title.starts_with("Load "))
+            .expect("a load action");
+        // Listing the actions reads the cache and sends nothing.
+        assert!(requests.borrow().is_empty());
+
+        Providers::resolve_code_action(&mut plugin, &document, load.clone()).unwrap();
+
+        let sent = requests.borrow();
+        // One list lookup, and the details of every advisory (not only ten) of the checked version.
+        let detail_lookups = sent
+            .iter()
+            .filter(|(url, _)| url.contains("/v1/vulns/"))
+            .count();
+        assert_eq!(detail_lookups, ADVISORY_COUNT, "{sent:?}");
+        let list_lookups = sent
+            .iter()
+            .filter(|(url, _)| url.starts_with(PYPI_URL_PREFIX))
+            .count();
+        assert_eq!(list_lookups, 1, "{sent:?}");
+        assert!(
+            sent.iter()
+                .any(|(url, body)| url.ends_with("/v1/querybatch") && body.contains("\"2.0.0\"")),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn the_load_action_sends_nothing_for_a_package_from_a_private_index() {
+        let text = "--index-url https://pypi.example.internal/simple\nrequests>1.12,<2.10\n";
+        let (_host, requests) = recording_host(text);
+        let mut plugin = plugin_with_bound_text_advisory();
+
+        Providers::resolve_code_action(
+            &mut plugin,
+            &manifest_document(text),
+            load_action("requests"),
+        )
+        .unwrap();
+
+        assert!(requests.borrow().is_empty(), "{:?}", requests.borrow());
+    }
+}
