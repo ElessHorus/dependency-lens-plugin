@@ -2877,6 +2877,51 @@ mod tests {
     }
 
     #[test]
+    fn a_budget_of_one_lookup_resolves_the_missing_list_of_one_package() {
+        let run = |budget: &mut Budget| {
+            let mut cache = Cache::new(TTL_SECS);
+            let http = FakeHttp::new()
+                .route("POST", BATCH_URL, 200, &batch_body(1))
+                .route("GET", REQUESTS_URL, 200, RANGE_BODY);
+            let analysis = analyze_python(&mut cache, &http, NOW, RANGE_TEXT, budget);
+            (analysis, http)
+        };
+        // Without a lookup the range waits for its list: no request leaves, and the entry is pending.
+        let (waiting, http) = run(&mut Budget::new(0, None));
+        assert_eq!(entry(&waiting, "requests").status, Status::Pending);
+        assert_eq!(waiting.lists_waiting, 1);
+        assert!(http.requests().is_empty());
+        // One lookup reads the list, and OSV is asked about the lowest allowed version.
+        let (resolved, http) = run(&mut Budget::new(1, None));
+        assert_eq!(resolved.lists_waiting, 0);
+        assert_eq!(
+            entry(&resolved, "requests").checked_version.as_deref(),
+            Some("2.0.0")
+        );
+        assert!(batch_bodies(&http)[0].contains("\"2.0.0\""));
+    }
+
+    #[test]
+    fn an_ignored_package_costs_no_lookup_with_a_budget_of_one() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new();
+        let settings = Settings {
+            ignore: vec!["requests".to_owned()],
+            ..Settings::default()
+        };
+        analyze(
+            Ecosystem::PyPI,
+            parsers::python::parse(RANGE_TEXT),
+            &mut cache,
+            &http,
+            &settings,
+            NOW,
+            &mut Budget::new(1, None),
+        );
+        assert!(http.requests().is_empty());
+    }
+
+    #[test]
     fn a_cache_that_stores_nothing_still_gives_the_list() {
         let mut cache = Cache::new(0);
         let http = FakeHttp::new()

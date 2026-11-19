@@ -448,6 +448,16 @@ fn deadline_after(time_box: Duration) -> Instant {
         .unwrap_or(now)
 }
 
+/// The budget of the load action: every advisory detail, and one registry lookup.
+///
+/// The action works on one package name, so one list lookup is the most it needs: a range whose
+/// list is not fresh would otherwise stay pending, and the next refresh would switch its checked
+/// version in silence. Duplicates of the name share the lookup. The `ignore` filter and the
+/// private-source rules run first in `analyze`, so a private package still costs no request.
+fn load_action_budget(deadline: Instant) -> Budget {
+    Budget::new(1, Some(deadline)).with_detail_limit(usize::MAX)
+}
+
 /// What one chunk of the loop achieved, to tell whether the next chunk can do more.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Progress {
@@ -810,7 +820,7 @@ impl DependencyLens {
         // and the chunk limit stops the fetches before the budget ends.
         let task = host::begin_task(TASK_TITLE, true);
         let deadline = Instant::now() + LOAD_ACTION_LIMIT;
-        let mut budget = Budget::new(0, Some(deadline)).with_detail_limit(usize::MAX);
+        let mut budget = load_action_budget(deadline);
         analyze(
             eco,
             deps,
@@ -983,6 +993,14 @@ mod loop_tests {
             now,
             open_deadline(now)
         ));
+    }
+
+    #[test]
+    fn the_load_action_budget_allows_exactly_one_lookup() {
+        let mut budget = load_action_budget(Instant::now() + Duration::from_secs(30));
+        assert!(budget.take());
+        assert!(!budget.take());
+        assert_eq!(budget.details_per_query(), usize::MAX);
     }
 
     #[test]
