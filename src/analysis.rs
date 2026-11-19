@@ -10,6 +10,7 @@ use crate::requirement::{checked_version_of, needs_list};
 use crate::settings::Settings;
 use crate::update::is_outdated;
 use openidea_plugin::HttpRequest;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -302,15 +303,21 @@ fn resolve_checked_versions(
     now: u64,
     answers: &mut HashMap<String, Lookup>,
 ) -> Vec<CheckedVersion> {
+    // The normalized name of each dependency that needs a list, computed once for both passes.
+    let names: Vec<Option<Cow<'_, str>>> = deps
+        .iter()
+        .map(|dependency| {
+            needs_list(eco, &dependency.version, dependency.requirement.as_ref())
+                .then(|| eco.normalize_package(&dependency.name))
+        })
+        .collect();
     // Pass 1 makes no request: it settles every dependency that the cache or the call already answers.
     let mut resolved: Vec<Option<CheckedVersion>> = deps
         .iter()
-        .map(|dependency| {
-            if !needs_list(eco, &dependency.version, dependency.requirement.as_ref()) {
-                return Some(checked_with_list(eco, dependency, None));
-            }
-            let name = eco.normalize_package(&dependency.name);
-            checked_from_known_list(eco, dependency, &name, cache, answers, now)
+        .zip(&names)
+        .map(|(dependency, name)| match name {
+            None => Some(checked_with_list(eco, dependency, None)),
+            Some(name) => checked_from_known_list(eco, dependency, name, cache, answers, now),
         })
         .collect();
     let answered = deps
@@ -326,13 +333,13 @@ fn resolve_checked_versions(
         .map_or(usize::MAX, |slice| slice.max(answered));
     // Pass 2 looks up the lists that are still missing, in manifest order.
     let mut lookups_done = 0;
-    for (dependency, state) in deps.iter().zip(resolved.iter_mut()) {
-        if state.is_some() {
+    for ((dependency, name), state) in deps.iter().zip(&names).zip(resolved.iter_mut()) {
+        // A dependency without a name here needs no list, so pass 1 settled it.
+        let (None, Some(name)) = (&*state, name) else {
             continue;
-        }
-        let name = eco.normalize_package(&dependency.name);
+        };
         // A name that an earlier dependency of this call looked up answers its duplicates.
-        if let Some(known) = checked_from_known_list(eco, dependency, &name, cache, answers, now) {
+        if let Some(known) = checked_from_known_list(eco, dependency, name, cache, answers, now) {
             *state = Some(known);
             continue;
         }
@@ -346,18 +353,14 @@ fn resolve_checked_versions(
             continue;
         }
         lookups_done += 1;
-        let lookup = lookup_registry(eco, request, &name, http, cache, now);
-        if lookup
-            .as_ref()
-            .is_err_and(|reason| is_cancelled_message(reason))
-        {
-            // The host superseded this call. The entry stays pending, and no lookup follows.
-            budget.cancel();
+        let lookup = lookup_registry(eco, request, name, http, cache, now);
+        if note_cancellation(&lookup, budget) {
+            // The entry stays pending, and no lookup follows.
             *state = Some(CheckedVersion::WaitingForList);
             continue;
         }
-        answers.insert(name.clone().into_owned(), lookup);
-        *state = checked_from_known_list(eco, dependency, &name, cache, answers, now);
+        answers.insert(name.to_string(), lookup);
+        *state = checked_from_known_list(eco, dependency, name, cache, answers, now);
     }
     resolved
         .into_iter()
@@ -450,12 +453,8 @@ fn resolve_registry(
             };
             if budget.take() {
                 let lookup = lookup_registry(eco, request, &name, http, cache, now);
-                if lookup
-                    .as_ref()
-                    .is_err_and(|reason| is_cancelled_message(reason))
-                {
-                    // The host superseded this call. The entry stays pending, and no lookup follows.
-                    budget.cancel();
+                if note_cancellation(&lookup, budget) {
+                    // The entry stays pending, and no lookup follows.
                     pending_count += 1;
                     entry.status = Status::Pending;
                     continue;
@@ -471,6 +470,19 @@ fn resolve_registry(
         entry.status = status;
     }
     pending_count
+}
+
+/// Whether `lookup` failed because the host cancelled it, which also cancels the budget.
+///
+/// The host cancels a request when a newer call supersedes this one, so no lookup follows.
+fn note_cancellation<T>(lookup: &Result<T, String>, budget: &mut Budget) -> bool {
+    let is_cancelled = lookup
+        .as_ref()
+        .is_err_and(|reason| is_cancelled_message(reason));
+    if is_cancelled {
+        budget.cancel();
+    }
+    is_cancelled
 }
 
 /// Borrows the parts of a lookup that the status needs.
