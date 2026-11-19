@@ -1290,9 +1290,10 @@ fn gemfile_requirement_shows_the_registry_version_and_offers_a_major_update() {
         .iter()
         .find(|decoration| decoration.range == RAILS_VERSION_RANGE)
         .expect("decoration on rails");
-    assert_eq!(rails.after, Some("→ 8.1.4.1".to_string()));
-    assert_eq!(rails.style, "info");
-    assert_only_outdated_problem(&host, GEMFILE_PATH, RAILS_VERSION_RANGE, "8.1.4.1");
+    // `~> 7.0.4` stops below 7.1: 7.0.4 is the latest inside the bounds, so no update is due.
+    assert_eq!(rails.after, Some("✓ (latest 8.1.4.1)".to_string()));
+    assert_eq!(rails.style, "muted");
+    assert!(diagnostics_of(&host, GEMFILE_PATH).is_empty());
 
     let fetches_after_refresh = fetches.get();
     let document = Document {
@@ -1314,6 +1315,97 @@ fn gemfile_requirement_shows_the_registry_version_and_offers_a_major_update() {
     assert_eq!(edits[0].range, RAILS_VERSION_RANGE);
     assert_eq!(edits[0].text, "8.1.4.1");
     assert_eq!(fetches.get(), fetches_after_refresh);
+}
+
+const RANGE_REQUIREMENTS: &str = "requests>1.12,<2.10\n";
+/// A PyPI answer with the 2.x line up to 2.34.2: 2.9.2 is the last release below 2.10.
+const RANGE_PYPI_BODY: &str = r#"{"info":{"version":"2.34.2"},"releases":{"2.0.0":[{"yanked":false}],"2.9.2":[{"yanked":false}],"2.10.0":[{"yanked":false}],"2.34.2":[{"yanked":false}]}}"#;
+
+#[test]
+fn a_range_shows_the_latest_inside_the_bounds_and_the_plain_latest() {
+    let host = host_with_registry(
+        Rc::new(Cell::new(0)),
+        "net:pypi.org",
+        "https://pypi.org/pypi/",
+        RANGE_PYPI_BODY,
+    );
+    host.add_file("requirements.txt", RANGE_REQUIREMENTS);
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(REQUIREMENTS_PATH.to_owned())],
+        &host.invocation(),
+    );
+
+    let decorations = decorations_of(&host, REQUIREMENTS_PATH);
+    assert_eq!(decorations.len(), 1, "{decorations:?}");
+    assert_eq!(
+        decorations[0].after.as_deref(),
+        Some("→ 2.9.2 (latest 2.34.2)")
+    );
+    assert_eq!(decorations[0].style, "info");
+    let diagnostics = diagnostics_of(&host, REQUIREMENTS_PATH);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].code.as_deref(), Some("outdated"));
+    assert_eq!(
+        diagnostics[0].message,
+        "requests 2.0.0: newer version 2.9.2 available (latest 2.34.2, outside the bounds)"
+    );
+}
+
+#[test]
+fn a_range_with_no_allowed_fix_says_so_in_the_hover() {
+    let host = MockHost::install().with_capabilities(&[
+        "events",
+        "project.read",
+        "editor.read",
+        "net:api.osv.dev",
+        "net:pypi.org",
+    ]);
+    host.set_project_root(Some("/p"));
+    host.on_fetch(|request| {
+        let body = if request.url.starts_with("https://pypi.org/pypi/") {
+            RANGE_PYPI_BODY.to_owned()
+        } else if request.url.ends_with(OSV_BATCH_SUFFIX) {
+            json!({ "results": [{ "vulns": [{ "id": "GHSA-late" }] }] }).to_string()
+        } else if request.url.starts_with(OSV_DETAIL_PREFIX) {
+            // The only fix is 2.31.0, which lies above the `<2.10` bound.
+            json!({
+                "id": "GHSA-late",
+                "summary": "An old flaw",
+                "database_specific": { "severity": "HIGH" },
+                "affected": [{
+                    "package": { "name": "requests", "ecosystem": "PyPI" },
+                    "ranges": [{
+                        "type": "ECOSYSTEM",
+                        "events": [{ "introduced": "0" }, { "fixed": "2.31.0" }]
+                    }]
+                }]
+            })
+            .to_string()
+        } else {
+            return Err(Error::Failed(format!("unexpected request {}", request.url)));
+        };
+        Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: body.into_bytes(),
+        })
+    });
+    host.add_file("requirements.txt", RANGE_REQUIREMENTS);
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(REQUIREMENTS_PATH.to_owned())],
+        &host.invocation(),
+    );
+
+    let decorations = decorations_of(&host, REQUIREMENTS_PATH);
+    assert_eq!(decorations.len(), 1, "{decorations:?}");
+    let hover = decorations[0].hover.as_deref().expect("a hover");
+    assert!(
+        hover.contains("No allowed version is free of known vulnerabilities. The fix is in 2.31.0, outside the bounds."),
+        "{hover}"
+    );
+    assert!(hover.contains("GHSA-late"), "{hover}");
 }
 
 const PYPI_PREFIX: &str = "https://pypi.org/pypi/";

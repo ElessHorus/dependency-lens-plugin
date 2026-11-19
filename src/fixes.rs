@@ -8,12 +8,14 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use crate::model::{Affected, Ecosystem, RangeEvent};
+use crate::cache::Cache;
+use crate::model::{AdvisorySeverity, Affected, Ecosystem, RangeEvent, Vulnerability};
+use crate::osv::{is_deferred, is_placeholder};
 use crate::registries::dotted::{DottedVersion, PubVersion};
 use crate::registries::gem_version::GemVersion;
 use crate::registries::maven_version::MavenVersion;
 use crate::registries::pep440::Pep440;
-use crate::requirement::Constraint;
+use crate::requirement::{Constraint, Requirement};
 use crate::update::{UpdateVersion, split_operator};
 
 /// Operators that a requirement may start with and that keep the target version allowed.
@@ -150,6 +152,53 @@ pub fn plan_fix(
         Ecosystem::Maven => plan_fix_of::<MavenVersion>(eco, package, current, advisories, allows),
         _ => plan_fix_of::<DottedVersion>(eco, package, current, advisories, allows),
     }
+}
+
+/// The `affected` lists of the advisories that a user sees for one package version.
+///
+/// A placeholder or a deferred advisory takes its details from the cache, and is skipped while they
+/// are missing. An advisory below `minimum_severity` is left out. The result is a `Vec` because
+/// `plan_fix` takes a slice.
+pub fn shown_affected<'a>(
+    cache: &'a Cache,
+    listed: &[Vulnerability],
+    minimum_severity: AdvisorySeverity,
+    now: u64,
+) -> Vec<&'a [Affected]> {
+    listed
+        .iter()
+        .filter_map(|vulnerability| {
+            let known = if is_placeholder(vulnerability) || is_deferred(vulnerability) {
+                cache.advisory(&vulnerability.id, now)?
+            } else {
+                vulnerability
+            };
+            (known.severity >= minimum_severity)
+                .then(|| cache.affected(&known.id, now).unwrap_or_default())
+        })
+        .collect()
+}
+
+/// The version that fixes the advisories when no version inside `requirement` does, else `None`.
+///
+/// It runs the fix plan twice: with the bounds of the requirement, and without any bound. It reports
+/// a version only when the first run finds no fix and the second one finds one.
+pub fn fix_outside_bounds(
+    eco: Ecosystem,
+    package: &str,
+    current: &str,
+    advisories: &[&[Affected]],
+    requirement: &Requirement,
+) -> Option<String> {
+    if advisories.is_empty()
+        || plan_fix(eco, package, current, advisories, |text| {
+            requirement.allows(eco, text)
+        })
+        .is_some()
+    {
+        return None;
+    }
+    plan_fix(eco, package, current, advisories, |_| true).map(|plan| plan.target)
 }
 
 /// Sorts `items` by `compare`, keeping the order of equal items. It never panics.
@@ -739,6 +788,59 @@ mod tests {
         // When every fix leaves the bounds, there is none.
         let only_late: Vec<&[Affected]> = vec![&late];
         assert!(plan_fix(Ecosystem::PyPI, "flask", "0.12.2", &only_late, allows).is_none());
+    }
+
+    /// `fix_outside_bounds` for `requests` 2.0.0 under the PyPI requirement `>1.12,<2.10`.
+    fn fix_outside_below_two_ten(advisories: &[&[Affected]]) -> Option<String> {
+        let requirement =
+            Requirement::parse(Ecosystem::PyPI, ">1.12,<2.10").expect("a readable requirement");
+        fix_outside_bounds(
+            Ecosystem::PyPI,
+            "requests",
+            "2.0.0",
+            advisories,
+            &requirement,
+        )
+    }
+
+    #[test]
+    fn fix_outside_bounds_names_the_fix_that_the_bounds_exclude() {
+        let late = affected(
+            "PyPI",
+            "requests",
+            &[&[("introduced", "0"), ("fixed", "2.31.0")]],
+        );
+        let advisories: Vec<&[Affected]> = vec![&late];
+        assert_eq!(
+            fix_outside_below_two_ten(&advisories),
+            Some("2.31.0".to_owned())
+        );
+    }
+
+    #[test]
+    fn fix_outside_bounds_is_none_when_the_bounds_hold_a_fix() {
+        let inside = affected(
+            "PyPI",
+            "requests",
+            &[&[("introduced", "0"), ("fixed", "2.5.0")]],
+        );
+        let late = affected(
+            "PyPI",
+            "requests",
+            &[&[("introduced", "0"), ("fixed", "2.31.0")]],
+        );
+        // A fix inside the bounds, even a partial one, is something to do: nothing to report.
+        for advisories in [vec![&inside[..]], vec![&inside[..], &late[..]]] {
+            assert_eq!(fix_outside_below_two_ten(&advisories), None);
+        }
+    }
+
+    #[test]
+    fn fix_outside_bounds_is_none_without_any_fix() {
+        let open = affected("PyPI", "requests", &[&[("introduced", "0")]]);
+        let advisories: Vec<&[Affected]> = vec![&open];
+        assert_eq!(fix_outside_below_two_ten(&advisories), None);
+        assert_eq!(fix_outside_below_two_ten(&[]), None);
     }
 
     /// An advisory whose single range holds several intervals, as in the OSV "multiple range" example.

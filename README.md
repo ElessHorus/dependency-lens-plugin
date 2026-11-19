@@ -30,17 +30,18 @@ Each decoration follows the version text of a dependency. Parts that apply appea
 
 | Text | Meaning |
 | --- | --- |
-| `✓` | The declared version is the newest stable release. Only for the ecosystems with a registry. |
-| `→ x.y.z` | A newer stable release `x.y.z` exists. |
+| `✓` | The declared version is the newest stable release that the requirement allows. Only for the ecosystems with a registry. |
+| `→ x.y.z` | A newer stable release `x.y.z` exists. When the requirement has a range, `x.y.z` is the newest release inside it. |
+| `(latest x.y.z)` after `✓` or `→` | The newest release `x.y.z` lies outside the range of the requirement. The hover says so. |
 | `…` | The registry lookup has not run yet. |
 | `?` | The check failed. The hover gives the reason. |
 | `⚠ 1 vulnerability` or `⚠ n vulnerabilities` | Known OSV advisories affect the checked version. |
 
-Example: `→ 2.31.0 · ⚠ 2 vulnerabilities`.
+Examples: `→ 2.31.0 · ⚠ 2 vulnerabilities`, and `→ 2.9.2 (latest 2.34.2)` for `requests>1.12,<2.10`.
 
 ### Hover
 
-The hover shows the package name and the declared version. It adds the latest version when one is newer, and the reason when a check failed. When advisories exist, it adds the checked version and one line per advisory. When the checked version is not the text of the lower bound, one more line says so. Each advisory line links to its OSV page when OSV gives a link.
+The hover shows the package name and the declared version. It adds the latest version when one is newer, and the reason when a check failed. When the requirement excludes the newest release, the hover gives the newest release inside the range and the newest release "outside the bounds". When no version inside the range fixes the advisories of the checked version, the hover names the fix that lies outside the range. When advisories exist, it adds the checked version and one line per advisory. When the checked version is not the text of the lower bound, one more line says so. Each advisory line links to its OSV page when OSV gives a link.
 
 ### Many advisories
 
@@ -58,11 +59,11 @@ Each dependency with advisories gets one problem, on its version text. The sourc
 | Medium | Warning |
 | Low | Info |
 
-A dependency with a newer stable release also gets an `Info` problem on its version text, with the code `outdated`. Its message is `<name> <version>: newer version <latest> available`. The editor shows a quick fix in the hover only where a problem exists, so this problem makes the update quick fix appear in the hover. This applies to the ecosystems that have a registry. Set `outdatedProblems` to `false` to turn it off. The inline hint and the quick fix stay.
+A dependency with a newer stable release also gets an `Info` problem on its version text, with the code `outdated`. Its message is `<name> <version>: newer version <latest> available`. When the requirement excludes the newest release, `<latest>` is the newest release inside the range, and the message ends with `(latest <x>, outside the bounds)`. A dependency that is up to date inside its range gets no such problem. The editor shows a quick fix in the hover only where a problem exists, so this problem makes the update quick fix appear in the hover. This applies to the ecosystems that have a registry. Set `outdatedProblems` to `false` to turn it off. The inline hint and the quick fix stay.
 
 ### Quick fix
 
-On a line with an outdated requirement, the quick fix title is `Update <name> to <version> (major|minor|patch|prerelease)`. Minor and patch updates are marked as preferred. The quick fix appears only after the registry lookup of that package has run, because the code action reads the cache and never calls the network.
+On a line with an outdated requirement, the quick fix title is `Update <name> to <version> (major|minor|patch|prerelease)`. Minor and patch updates are marked as preferred. The quick fix appears only after the registry lookup of that package has run, because the code action reads the cache and never calls the network. The quick fix always writes the newest release, even when the requirement excludes it. For `^1.2` it writes `^3.0.0`, while the text shows the newest release inside the range. A line that is up to date inside its range (`✓ (latest 3.0.0)`) has no `outdated` problem, so this quick fix is in the quick fix menu but not in the hover.
 
 #### Fix a vulnerability
 
@@ -136,7 +137,7 @@ Add the package name to `ignore`, for example `["serde", "left-pad"]`. The name 
 - For Cargo, npm, Go and Maven, the plugin shows no version hint and no update to the latest release. It still offers the fix for a vulnerability.
 - For a Maven dependency, the fix orders versions as Maven does, including text qualifiers such as `RELEASE`, `M1` and `SR0`.
 - The plugin checks the version declared in the manifest, not a lockfile.
-- For a requirement with a range (`^1.2`, `>=2.0`, `>1.12,<2.10`, `||`) in PyPI, Packagist, Pub, NuGet and RubyGems, the plugin checks the lowest version of the registry list that the requirement allows. For `requests>1.12,<2.10` it checks `2.0.0`, because `1.12` does not exist. A dependency with such a range waits for its registry lookup before its OSV query. When the registry gives no list, or no listed version fits, the plugin checks the text of the lower bound of the first alternative. Cargo, npm, Go and Maven have no registry list, so they keep the text of the lower bound. A newer release is still shown as outdated against the lower bound, even when the requirement excludes it. A plain NuGet version such as `Version="1.0"` counts as a minimum, so it waits for the registry list before its OSV query. One wildcard constraint in a PEP 508 line (`>=1.0,!=1.5.*`) turns the whole line back to the text of the lower bound.
+- For a requirement with a range (`^1.2`, `>=2.0`, `>1.12,<2.10`, `||`) in PyPI, Packagist, Pub, NuGet and RubyGems, the plugin checks the lowest version of the registry list that the requirement allows. For `requests>1.12,<2.10` it checks `2.0.0`, because `1.12` does not exist. A dependency with such a range waits for its registry lookup before its OSV query. When the registry gives no list, or no listed version fits, the plugin checks the text of the lower bound of the first alternative. Cargo, npm, Go and Maven have no registry list, so they keep the text of the lower bound. The text shows the newest release that the requirement allows. When the newest release lies outside the range, it follows in brackets (`→ 2.9.2 (latest 2.34.2)`). When no listed version fits, the text follows the newest release. The message "No allowed version is free of known vulnerabilities" covers the advisories of the checked version only. It does not cover advisories that touch only newer versions. A plain NuGet version such as `Version="1.0"` counts as a minimum, so it waits for the registry list before its OSV query. One wildcard constraint in a PEP 508 line (`>=1.0,!=1.5.*`) turns the whole line back to the text of the lower bound.
 - The first lookup of a large manifest takes seconds. The lookups run one after another. The status bar shows the progress, and you can cancel the task. Each chunk of 20 lookups shows its results before the next chunk starts. After a five-minute soft cap, the entries that still show `…` finish on the next open, save or "Dependency Lens: Refresh" of their manifest.
 - Answers are cached in memory for `cacheTtlSeconds` (one hour by default). OSV gives a revision (the `modified` time) with each advisory. After the lifetime, an advisory whose revision did not change stays valid without a new download, and one whose revision changed is downloaded again. The cache is also kept on disk (see Cache on disk). A failed lookup is retried after 60 seconds.
 - The IDE unloads an idle plugin after about five minutes. The next open reads the cache again from the disk and shows it at once. The quick fix reads only answers younger than `cacheTtlSeconds`, so for older ones it appears after the check that follows the open.

@@ -566,6 +566,7 @@ fn fill_pending_from_old(
             } else if has_answer(entry) {
                 Entry {
                     status: old_entry.status.clone(),
+                    outside_latest: old_entry.outside_latest.clone(),
                     ..entry.clone()
                 }
             } else {
@@ -1034,6 +1035,8 @@ mod disk_cache_tests {
             status,
             vulnerabilities: Vec::new(),
             checked_version: Some("1.0".to_owned()),
+            outside_latest: None,
+            fix_outside: None,
         }
     }
 
@@ -1067,6 +1070,31 @@ mod disk_cache_tests {
         let statuses: Vec<&Status> = shown.entries.iter().map(|entry| &entry.status).collect();
         assert_eq!(statuses, [&outdated, &Status::UpToDate, &Status::Pending]);
         assert_eq!(shown.pending, 2);
+    }
+
+    #[test]
+    fn old_data_gives_its_latest_outside_the_bounds_to_an_entry_with_a_fresh_answer() {
+        let outdated = Status::Outdated {
+            latest: "2.9.2".to_owned(),
+        };
+        let analysis = Analysis {
+            entries: vec![entry_with("a==1.0\n", Status::Pending)],
+            pending: 1,
+            lists_waiting: 0,
+        };
+        let mut old_entry = entry_with("a==1.0\n", outdated.clone());
+        old_entry.outside_latest = Some("2.34.2".to_owned());
+        let old = Analysis {
+            entries: vec![old_entry],
+            pending: 0,
+            lists_waiting: 0,
+        };
+
+        // The entry has its OSV answer, so only its registry part comes from the old data.
+        let shown = fill_pending_from_old(&analysis, &old, |_| true);
+
+        assert_eq!(shown.entries[0].status, outdated);
+        assert_eq!(shown.entries[0].outside_latest.as_deref(), Some("2.34.2"));
     }
 
     #[test]

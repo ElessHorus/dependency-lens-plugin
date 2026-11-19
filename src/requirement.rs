@@ -74,17 +74,29 @@ impl Requirement {
     ///
     /// A pre-release counts only when a constraint of the requirement names one.
     pub fn lowest_allowed(&self, eco: Ecosystem, versions: &[String]) -> Option<String> {
+        self.allowed_in(eco, versions, Scan::FromOldest)
+    }
+
+    /// The latest version of `versions` (newest first) that the requirement allows.
+    ///
+    /// The pre-release rule is the one of [`Requirement::lowest_allowed`].
+    pub fn latest_allowed(&self, eco: Ecosystem, versions: &[String]) -> Option<String> {
+        self.allowed_in(eco, versions, Scan::FromNewest)
+    }
+
+    fn allowed_in(&self, eco: Ecosystem, versions: &[String], scan: Scan) -> Option<String> {
         match eco {
-            Ecosystem::PyPI => self.lowest_allowed_of::<Pep440>(versions),
-            Ecosystem::RubyGems => self.lowest_allowed_of::<GemVersion>(versions),
-            Ecosystem::Pub => self.lowest_allowed_of::<PubVersion>(versions),
-            Ecosystem::Maven => self.lowest_allowed_of::<MavenVersion>(versions),
-            _ => self.lowest_allowed_of::<DottedVersion>(versions),
+            Ecosystem::PyPI => self.allowed_of::<Pep440>(versions, scan),
+            Ecosystem::RubyGems => self.allowed_of::<GemVersion>(versions, scan),
+            Ecosystem::Pub => self.allowed_of::<PubVersion>(versions, scan),
+            Ecosystem::Maven => self.allowed_of::<MavenVersion>(versions, scan),
+            _ => self.allowed_of::<DottedVersion>(versions, scan),
         }
     }
 
-    /// One pass: each bound is parsed once for the whole list, and each candidate once.
-    fn lowest_allowed_of<V: UpdateVersion>(&self, versions: &[String]) -> Option<String> {
+    /// One pass: each bound is parsed once for the whole list, and each candidate once. The scan
+    /// stops at the first fit.
+    fn allowed_of<V: UpdateVersion>(&self, versions: &[String], scan: Scan) -> Option<String> {
         let alternatives: Vec<Vec<TypedConstraint<'_, V>>> = self
             .alternatives
             .iter()
@@ -95,20 +107,28 @@ impl Requirement {
             .flatten()
             .filter_map(|constraint| constraint.bound.as_ref())
             .any(|bound| bound.is_prerelease_version());
-        // The list is newest first, so the reverse scan meets the oldest version first.
-        versions
-            .iter()
-            .rev()
-            .find(|text| {
-                V::parse_version(text).is_some_and(|version| {
-                    (names_pre_release || !version.is_prerelease_version())
-                        && alternatives
-                            .iter()
-                            .any(|constraints| satisfies_typed(&version, constraints))
-                })
+        let is_allowed = |text: &&String| {
+            V::parse_version(text).is_some_and(|version| {
+                (names_pre_release || !version.is_prerelease_version())
+                    && alternatives
+                        .iter()
+                        .any(|constraints| satisfies_typed(&version, constraints))
             })
-            .cloned()
+        };
+        // The list is newest first, so the reverse scan meets the oldest version first.
+        match scan {
+            Scan::FromOldest => versions.iter().rev().find(is_allowed),
+            Scan::FromNewest => versions.iter().find(is_allowed),
+        }
+        .cloned()
     }
+}
+
+/// Which end of a newest-first list a scan for an allowed version starts from.
+#[derive(Clone, Copy)]
+enum Scan {
+    FromOldest,
+    FromNewest,
 }
 
 /// Builds the constraint of `operator` and `version`.
@@ -653,6 +673,101 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn a_parsed_range_gives_its_latest_allowed_version() {
+        let cases = [
+            (
+                Ecosystem::PyPI,
+                ">1.12,<2.10",
+                &["2.34.2", "2.10.0", "2.9.2", "2.0.0", "1.12"][..],
+                "2.9.2",
+            ),
+            (
+                Ecosystem::PyPI,
+                "~=1.2",
+                &["2.0", "1.9.4", "1.2"][..],
+                "1.9.4",
+            ),
+            (
+                Ecosystem::Packagist,
+                "^1.2",
+                &["3.0.0", "2.0.0", "1.9.4", "1.2.0"][..],
+                "1.9.4",
+            ),
+            (
+                Ecosystem::Packagist,
+                "^1.2 || ^3.0",
+                &["3.1.0", "2.0.0", "1.9.4"][..],
+                "3.1.0",
+            ),
+            (
+                Ecosystem::Pub,
+                "^0.0.3",
+                &["0.1.0", "0.0.5", "0.0.3"][..],
+                "0.0.5",
+            ),
+            (
+                Ecosystem::Pub,
+                "^1.2.3",
+                &["2.0.0", "1.9.0", "1.2.3"][..],
+                "1.9.0",
+            ),
+            (
+                Ecosystem::NuGet,
+                "[1.0,2.0)",
+                &["2.0.0", "1.9.0", "1.0.0"][..],
+                "1.9.0",
+            ),
+            (
+                Ecosystem::NuGet,
+                "(1.0,2.0]",
+                &["2.0.0", "1.9.0", "1.0.0"][..],
+                "2.0.0",
+            ),
+        ];
+        for (eco, text, list, expected) in cases {
+            let parsed = Requirement::parse(eco, text).expect("a readable requirement");
+            assert_eq!(
+                parsed.latest_allowed(eco, &versions(list)),
+                Some(expected.to_owned()),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rubygems_range_gives_its_latest_allowed_version() {
+        let compatible = requirement(&[&[("~>", "1.2")]]);
+        assert_eq!(
+            compatible.latest_allowed(Ecosystem::RubyGems, &versions(&["2.0.0", "1.9.4", "1.2.0"])),
+            Some("1.9.4".to_owned())
+        );
+        let interval = requirement(&[&[(">=", "1"), ("<", "3")]]);
+        assert_eq!(
+            interval.latest_allowed(Ecosystem::RubyGems, &versions(&["3.0.0", "2.5.0"])),
+            Some("2.5.0".to_owned())
+        );
+    }
+
+    #[test]
+    fn latest_allowed_follows_the_pre_release_rule_of_lowest_allowed() {
+        let open = Requirement::parse(Ecosystem::PyPI, ">=1.0").expect("a minimum");
+        assert_eq!(
+            open.latest_allowed(Ecosystem::PyPI, &versions(&["2.0rc1", "1.9"])),
+            Some("1.9".to_owned())
+        );
+        let named = Requirement::parse(Ecosystem::PyPI, ">=2.0rc1").expect("a minimum");
+        assert_eq!(
+            named.latest_allowed(Ecosystem::PyPI, &versions(&["2.0rc2", "1.9"])),
+            Some("2.0rc2".to_owned())
+        );
+        let below = Requirement::parse(Ecosystem::PyPI, "<1").expect("a maximum");
+        assert_eq!(
+            below.latest_allowed(Ecosystem::PyPI, &versions(&["2.0", "1.5"])),
+            None
+        );
     }
 
     #[test]
