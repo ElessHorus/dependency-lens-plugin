@@ -594,7 +594,8 @@ fn query_missing_vulnerabilities(
     budget: &mut Budget,
 ) -> FreshOsv {
     let mut fresh = FreshOsv::default();
-    if budget.is_offline {
+    // A cancelled run is superseded by a newer call, which would throw this answer away.
+    if budget.is_offline || budget.is_cancelled() {
         return fresh;
     }
     let details_per_query = budget.details_per_query();
@@ -2801,6 +2802,48 @@ mod tests {
         );
         assert!(analysis.entries.is_empty());
         assert!(http.requests().is_empty());
+    }
+
+    #[test]
+    fn a_cancelled_registry_lookup_sends_no_osv_batch() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .transport_error("GET", "https://pypi.org/pypi/aaa/json", "cancelled");
+        let mut budget = Budget::new(usize::MAX, None);
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            "aaa>=1.0\nbbb==2.0.0\n",
+            &mut budget,
+        );
+        assert!(budget.is_cancelled());
+        // The answer of OSV would be thrown away, so the request is not sent.
+        assert!(
+            http.requests().iter().all(|(method, _)| method != "POST"),
+            "{:?}",
+            http.requests()
+        );
+        assert_eq!(analysis.pending, 2);
+        assert!(
+            cache
+                .failure(FailureKind::Registry, Ecosystem::PyPI, "aaa", NOW)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_cancelled_list_lookup_keeps_a_range_waiting_for_its_list() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .transport_error("GET", "https://pypi.org/pypi/aaa/json", "cancelled");
+        let mut budget = Budget::new(usize::MAX, None);
+        let analysis = analyze_python(&mut cache, &http, NOW, "aaa>=1.0\n", &mut budget);
+        assert!(budget.is_cancelled());
+        assert_eq!(entry(&analysis, "aaa").status, Status::Pending);
+        assert_eq!(entry(&analysis, "aaa").checked_version, None);
     }
 
     #[test]
