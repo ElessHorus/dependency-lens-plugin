@@ -63,7 +63,7 @@ A dependency with a newer stable release also gets an `Info` problem on its vers
 
 ### Quick fix
 
-On a line with an outdated requirement, the quick fix title is `Update <name> to <version> (major|minor|patch|prerelease)`. Minor and patch updates are marked as preferred. The quick fix appears only after the registry lookup of that package has run, because the code action reads the cache and never calls the network.
+On a line with an outdated requirement, the quick fix title is `Update <name> to <version> (major|minor|patch|prerelease)`. Minor and patch updates are marked as preferred. The quick fix appears only after the registry lookup of that package has run, because the code action reads the cache and never calls the network. The quick fix always writes the newest release, even when the requirement excludes it. For `^1.2` it writes `^3.0.0`, while the text shows the newest release inside the range. A line that is up to date inside its range (`✓ (latest 3.0.0)`) has no `outdated` problem, so this quick fix is in the quick fix menu but not in the hover.
 
 #### Fix a vulnerability
 
