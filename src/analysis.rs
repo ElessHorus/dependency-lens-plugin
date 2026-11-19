@@ -518,9 +518,6 @@ fn registry_view(
         );
     };
     let declared = dependency.version.as_str();
-    let outdated = |latest: &str| Status::Outdated {
-        latest: latest.to_owned(),
-    };
     let bounded = dependency
         .requirement
         .as_ref()
@@ -531,20 +528,18 @@ fn registry_view(
                 && !requirement.allows(eco, latest)
         })
         .and_then(|requirement| requirement.latest_allowed(eco, &info.versions));
-    match bounded {
-        Some(bounded) => {
-            let outside_latest = (latest != bounded && is_outdated(eco, declared, latest))
-                .then(|| latest.to_owned());
-            let status = if is_outdated(eco, declared, &bounded) {
-                outdated(&bounded)
-            } else {
-                Status::UpToDate
-            };
-            (status, outside_latest)
+    let target = bounded.as_deref().unwrap_or(latest);
+    // The plain latest is kept apart only when the status follows another version.
+    let outside_latest =
+        (target != latest && is_outdated(eco, declared, latest)).then(|| latest.to_owned());
+    let status = if is_outdated(eco, declared, target) {
+        Status::Outdated {
+            latest: target.to_owned(),
         }
-        None if is_outdated(eco, declared, latest) => (outdated(latest), None),
-        None => (Status::UpToDate, None),
-    }
+    } else {
+        Status::UpToDate
+    };
+    (status, outside_latest)
 }
 
 /// Sends `request` to the registry, stores the answer or the failure under `name`, and returns the outcome.
@@ -855,19 +850,17 @@ fn build_entry(
         None => Status::NotChecked,
     };
     // Only a range can exclude a fix: an exact pin names its version on purpose.
-    let fix_outside = checked_version
-        .as_deref()
-        .zip(answer)
-        .zip(
-            dependency
-                .requirement
-                .as_ref()
-                .filter(|requirement| !requirement.is_exact_pin()),
-        )
-        .and_then(|((version, listed), requirement)| {
+    let fix_outside = match (
+        checked_version.as_deref(),
+        answer,
+        dependency.requirement.as_ref(),
+    ) {
+        (Some(version), Some(listed), Some(requirement)) if !requirement.is_exact_pin() => {
             let affected = shown_affected(cache, listed, settings.minimum_severity, now);
             fix_outside_bounds(eco, &dependency.name, version, &affected, requirement)
-        });
+        }
+        _ => None,
+    };
     Entry {
         dependency,
         status,
@@ -2865,17 +2858,7 @@ mod tests {
 
     /// Runs `analyze_python` on `text` with the `RANGE_BODY` registry answer.
     fn analyze_range(text: &str) -> Analysis {
-        let mut cache = Cache::new(TTL_SECS);
-        let http = FakeHttp::new()
-            .route("POST", BATCH_URL, 200, &batch_body(1))
-            .route("GET", REQUESTS_URL, 200, RANGE_BODY);
-        analyze_python(
-            &mut cache,
-            &http,
-            NOW,
-            text,
-            &mut Budget::new(usize::MAX, None),
-        )
+        analyze_range_with(&mut Cache::new(TTL_SECS), &Settings::default(), text)
     }
 
     #[test]

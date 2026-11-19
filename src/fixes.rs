@@ -790,10 +790,17 @@ mod tests {
         assert!(plan_fix(Ecosystem::PyPI, "flask", "0.12.2", &only_late, allows).is_none());
     }
 
-    /// The requirement `>1.12,<2.10` of PyPI.
-    fn below_two_ten() -> crate::requirement::Requirement {
-        crate::requirement::Requirement::parse(Ecosystem::PyPI, ">1.12,<2.10")
-            .expect("a readable requirement")
+    /// `fix_outside_bounds` for `requests` 2.0.0 under the PyPI requirement `>1.12,<2.10`.
+    fn fix_outside_below_two_ten(advisories: &[&[Affected]]) -> Option<String> {
+        let requirement =
+            Requirement::parse(Ecosystem::PyPI, ">1.12,<2.10").expect("a readable requirement");
+        fix_outside_bounds(
+            Ecosystem::PyPI,
+            "requests",
+            "2.0.0",
+            advisories,
+            &requirement,
+        )
     }
 
     #[test]
@@ -805,13 +812,7 @@ mod tests {
         );
         let advisories: Vec<&[Affected]> = vec![&late];
         assert_eq!(
-            fix_outside_bounds(
-                Ecosystem::PyPI,
-                "requests",
-                "2.0.0",
-                &advisories,
-                &below_two_ten()
-            ),
+            fix_outside_below_two_ten(&advisories),
             Some("2.31.0".to_owned())
         );
     }
@@ -830,16 +831,7 @@ mod tests {
         );
         // A fix inside the bounds, even a partial one, is something to do: nothing to report.
         for advisories in [vec![&inside[..]], vec![&inside[..], &late[..]]] {
-            assert_eq!(
-                fix_outside_bounds(
-                    Ecosystem::PyPI,
-                    "requests",
-                    "2.0.0",
-                    &advisories,
-                    &below_two_ten()
-                ),
-                None
-            );
+            assert_eq!(fix_outside_below_two_ten(&advisories), None);
         }
     }
 
@@ -847,20 +839,8 @@ mod tests {
     fn fix_outside_bounds_is_none_without_any_fix() {
         let open = affected("PyPI", "requests", &[&[("introduced", "0")]]);
         let advisories: Vec<&[Affected]> = vec![&open];
-        assert_eq!(
-            fix_outside_bounds(
-                Ecosystem::PyPI,
-                "requests",
-                "2.0.0",
-                &advisories,
-                &below_two_ten()
-            ),
-            None
-        );
-        assert_eq!(
-            fix_outside_bounds(Ecosystem::PyPI, "requests", "2.0.0", &[], &below_two_ten()),
-            None
-        );
+        assert_eq!(fix_outside_below_two_ten(&advisories), None);
+        assert_eq!(fix_outside_below_two_ten(&[]), None);
     }
 
     /// An advisory whose single range holds several intervals, as in the OSV "multiple range" example.
