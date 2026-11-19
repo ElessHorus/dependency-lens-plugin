@@ -1034,6 +1034,8 @@ mod disk_cache_tests {
             status,
             vulnerabilities: Vec::new(),
             checked_version: Some("1.0".to_owned()),
+            outside_latest: None,
+            fix_outside: None,
         }
     }
 

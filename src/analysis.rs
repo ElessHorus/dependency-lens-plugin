@@ -23,7 +23,8 @@ pub enum Status {
     UpToDate,
     /// A newer release exists.
     Outdated {
-        /// Newest release reported by the registry.
+        /// Newest release that the declared requirement allows. Without a readable range, it is
+        /// the newest release reported by the registry.
         latest: String,
     },
     /// The check failed, with the reason.
@@ -43,6 +44,10 @@ pub struct Entry {
     pub vulnerabilities: Vec<Vulnerability>,
     /// Version that was checked, or `None` when the requirement names no registry version.
     pub checked_version: Option<String>,
+    /// The newest release of the registry when the requirement excludes it, else `None`.
+    pub outside_latest: Option<String>,
+    /// The version that fixes the advisories when no version inside the requirement does, else `None`.
+    pub fix_outside: Option<String>,
 }
 
 /// Analysis result for one manifest.
@@ -437,13 +442,12 @@ fn resolve_registry(
             && !matches!(entry.status, Status::Unknown(_) | Status::Pending)
     }) {
         let name = eco.normalize_package(&entry.dependency.name);
-        let declared = entry.dependency.version.as_str();
-        let status = if let Some(info) = cache.version_info(eco, &name, now) {
-            status_from_lookup(eco, declared, Ok(info.latest.as_deref()))
+        let (status, outside_latest) = if let Some(info) = cache.version_info(eco, &name, now) {
+            registry_view(eco, &entry.dependency, Ok(info))
         } else if let Some(reason) = cache.failure(FailureKind::Registry, eco, &name, now) {
-            status_from_lookup(eco, declared, Err(reason))
+            registry_view(eco, &entry.dependency, Err(reason))
         } else if let Some(lookup) = fresh.get(&*name) {
-            status_from_lookup(eco, declared, lookup_view(lookup))
+            registry_view(eco, &entry.dependency, lookup_view(lookup))
         } else {
             // The request is built before the budget is spent, so an invalid name costs no lookup.
             // Its status is not cached, so a later fix of the manifest takes effect at once.
@@ -457,16 +461,18 @@ fn resolve_registry(
                     // The entry stays pending, and no lookup follows.
                     pending_count += 1;
                     entry.status = Status::Pending;
+                    entry.outside_latest = None;
                     continue;
                 }
-                let status = status_from_lookup(eco, declared, lookup_view(&lookup));
+                let view = registry_view(eco, &entry.dependency, lookup_view(&lookup));
                 fresh.insert(name.into_owned(), lookup);
-                status
+                view
             } else {
                 pending_count += 1;
-                Status::Pending
+                (Status::Pending, None)
             }
         };
+        entry.outside_latest = outside_latest;
         entry.status = status;
     }
     pending_count
@@ -486,26 +492,52 @@ fn note_cancellation<T>(lookup: &Result<T, String>, budget: &mut Budget) -> bool
 }
 
 /// Borrows the parts of a lookup that the status needs.
-fn lookup_view(lookup: &Lookup) -> Result<Option<&str>, &str> {
-    lookup
-        .as_ref()
-        .map(|info| info.latest.as_deref())
-        .map_err(String::as_str)
+fn lookup_view(lookup: &Lookup) -> Result<&VersionInfo, &str> {
+    lookup.as_ref().map_err(String::as_str)
 }
 
-/// Builds the registry status of one entry from its lookup outcome.
-fn status_from_lookup(
+/// Builds the registry status of one entry and its latest version outside the bounds.
+///
+/// With a readable range and a registry list, the status follows the newest listed version that the
+/// requirement allows, and the plain latest is kept apart when the requirement excludes it. Without
+/// them, or when no listed version fits, the status follows the plain latest.
+fn registry_view(
     eco: Ecosystem,
-    declared: &str,
-    lookup: Result<Option<&str>, &str>,
-) -> Status {
-    match lookup {
-        Err(reason) => Status::Unknown(reason.to_owned()),
-        Ok(None) => Status::Unknown("registry: no version found".to_owned()),
-        Ok(Some(latest)) if is_outdated(eco, declared, latest) => Status::Outdated {
-            latest: latest.to_owned(),
-        },
-        Ok(Some(_)) => Status::UpToDate,
+    dependency: &Dependency,
+    lookup: Result<&VersionInfo, &str>,
+) -> (Status, Option<String>) {
+    let info = match lookup {
+        Err(reason) => return (Status::Unknown(reason.to_owned()), None),
+        Ok(info) => info,
+    };
+    let Some(latest) = info.latest.as_deref() else {
+        return (
+            Status::Unknown("registry: no version found".to_owned()),
+            None,
+        );
+    };
+    let declared = dependency.version.as_str();
+    let outdated = |latest: &str| Status::Outdated {
+        latest: latest.to_owned(),
+    };
+    let bounded = dependency
+        .requirement
+        .as_ref()
+        .filter(|requirement| !requirement.is_exact_pin() && !info.versions.is_empty())
+        .and_then(|requirement| requirement.latest_allowed(eco, &info.versions));
+    match bounded {
+        Some(bounded) => {
+            let outside_latest = (latest != bounded && is_outdated(eco, declared, latest))
+                .then(|| latest.to_owned());
+            let status = if is_outdated(eco, declared, &bounded) {
+                outdated(&bounded)
+            } else {
+                Status::UpToDate
+            };
+            (status, outside_latest)
+        }
+        None if is_outdated(eco, declared, latest) => (outdated(latest), None),
+        None => (Status::UpToDate, None),
     }
 }
 
@@ -773,6 +805,8 @@ fn build_entry(
             status: Status::NotChecked,
             vulnerabilities: Vec::new(),
             checked_version,
+            outside_latest: None,
+            fix_outside: None,
         };
     }
     let answer = checked_version.as_deref().and_then(|version| {
@@ -819,6 +853,8 @@ fn build_entry(
         status,
         vulnerabilities,
         checked_version,
+        outside_latest: None,
+        fix_outside: None,
     }
 }
 
@@ -1552,12 +1588,10 @@ mod tests {
             &mut Budget::new(usize::MAX, None),
         );
         assert_eq!(analysis.pending, 0);
-        assert_eq!(
-            entry(&analysis, "rails").status,
-            Status::Outdated {
-                latest: "8.1.4.1".to_owned()
-            }
-        );
+        // `~> 7.0.4` stops below 7.1, so 7.0.4 is the latest inside the bounds and 8.1.4.1 lies outside.
+        let rails = entry(&analysis, "rails");
+        assert_eq!(rails.status, Status::UpToDate);
+        assert_eq!(rails.outside_latest.as_deref(), Some("8.1.4.1"));
         assert_eq!(
             entry(&analysis, "rack").status,
             Status::Unknown("registry: HTTP 404".to_owned())
@@ -2800,12 +2834,201 @@ mod tests {
         );
         let requests = entry(&analysis, "requests");
         assert_eq!(requests.checked_version.as_deref(), Some("1.12"));
+        assert_eq!(requests.outside_latest, None);
         assert!(
             matches!(&requests.status, Status::Unknown(reason) if reason.starts_with("registry:")),
             "{:?}",
             requests.status
         );
         assert!(batch_bodies(&http)[0].contains("\"1.12\""));
+    }
+
+    /// Runs `analyze_python` on `text` with the `RANGE_BODY` registry answer.
+    fn analyze_range(text: &str) -> Analysis {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", REQUESTS_URL, 200, RANGE_BODY);
+        analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            text,
+            &mut Budget::new(usize::MAX, None),
+        )
+    }
+
+    #[test]
+    fn a_range_shows_the_latest_inside_the_bounds() {
+        let analysis = analyze_range(RANGE_TEXT);
+        let requests = entry(&analysis, "requests");
+        assert_eq!(
+            requests.status,
+            Status::Outdated {
+                latest: "2.9.2".to_owned()
+            }
+        );
+        assert_eq!(requests.outside_latest.as_deref(), Some("2.34.2"));
+    }
+
+    #[test]
+    fn an_open_range_keeps_the_plain_latest() {
+        let analysis = analyze_range("requests>=2.0\n");
+        let requests = entry(&analysis, "requests");
+        assert_eq!(
+            requests.status,
+            Status::Outdated {
+                latest: "2.34.2".to_owned()
+            }
+        );
+        assert_eq!(requests.outside_latest, None);
+    }
+
+    #[test]
+    fn a_range_at_its_top_is_up_to_date_with_an_outside_latest() {
+        let analysis = analyze_range("requests>=2.9.2,<2.10\n");
+        let requests = entry(&analysis, "requests");
+        assert_eq!(requests.status, Status::UpToDate);
+        assert_eq!(requests.outside_latest.as_deref(), Some("2.34.2"));
+    }
+
+    #[test]
+    fn an_exact_pin_keeps_the_plain_latest() {
+        let analysis = analyze_range("requests==2.0.0\n");
+        let requests = entry(&analysis, "requests");
+        assert_eq!(
+            requests.status,
+            Status::Outdated {
+                latest: "2.34.2".to_owned()
+            }
+        );
+        assert_eq!(requests.outside_latest, None);
+    }
+
+    #[test]
+    fn a_range_that_no_listed_version_fits_keeps_the_plain_latest() {
+        // No listed version is both at least 1.5 and below 2.0.
+        let analysis = analyze_range("requests>=1.5,<2.0\n");
+        let requests = entry(&analysis, "requests");
+        assert_eq!(
+            requests.status,
+            Status::Outdated {
+                latest: "2.34.2".to_owned()
+            }
+        );
+        assert_eq!(requests.outside_latest, None);
+    }
+
+    #[test]
+    fn a_registry_answer_without_a_list_keeps_the_plain_latest() {
+        let mut cache = Cache::new(TTL_SECS);
+        cache.put_version_info(
+            Ecosystem::PyPI,
+            "requests",
+            VersionInfo {
+                latest: Some("2.34.2".to_owned()),
+                versions: Vec::new(),
+            },
+            NOW,
+        );
+        let http = FakeHttp::new().route("POST", BATCH_URL, 200, &batch_body(1));
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            RANGE_TEXT,
+            &mut Budget::new(usize::MAX, None),
+        );
+        let requests = entry(&analysis, "requests");
+        assert_eq!(
+            requests.status,
+            Status::Outdated {
+                latest: "2.34.2".to_owned()
+            }
+        );
+        assert_eq!(requests.outside_latest, None);
+    }
+
+    /// Analyzes `deps` of `eco` with a registry answer for `name` that sits in the cache.
+    fn analyze_with_list(
+        eco: Ecosystem,
+        deps: Vec<Dependency>,
+        name: &str,
+        latest: &str,
+        versions: &[&str],
+    ) -> Analysis {
+        let mut cache = Cache::new(TTL_SECS);
+        cache.put_version_info(
+            eco,
+            &eco.normalize_package(name),
+            VersionInfo {
+                latest: Some(latest.to_owned()),
+                versions: versions
+                    .iter()
+                    .map(|version| (*version).to_owned())
+                    .collect(),
+            },
+            NOW,
+        );
+        let http = FakeHttp::new().route("POST", BATCH_URL, 200, &batch_body(1));
+        analyze(
+            eco,
+            deps,
+            &mut cache,
+            &http,
+            &Settings::default(),
+            NOW,
+            &mut Budget::new(usize::MAX, None),
+        )
+    }
+
+    #[test]
+    fn each_constraint_syntax_shows_the_latest_inside_its_bounds() {
+        let composer = analyze_with_list(
+            Ecosystem::Packagist,
+            parsers::php::parse(r#"{"require":{"acme/lib":"^1.2"}}"#),
+            "acme/lib",
+            "3.0.0",
+            &["3.0.0", "1.9.4", "1.2.0"],
+        );
+        let pubspec = analyze_with_list(
+            Ecosystem::Pub,
+            parsers::dart::parse("dependencies:\n  http: ^1.2.3\n"),
+            "http",
+            "2.0.0",
+            &["2.0.0", "1.9.0", "1.2.3"],
+        );
+        let csproj = analyze_with_list(
+            Ecosystem::NuGet,
+            parsers::csharp::parse(&csproj_with(&[("Acme.Lib", "[1.0,2.0)")])),
+            "Acme.Lib",
+            "2.0.0",
+            &["2.0.0", "1.9.0", "1.0.0"],
+        );
+        let gemfile = analyze_with_list(
+            Ecosystem::RubyGems,
+            parsers::ruby::parse("gem 'acme', '~> 1.2'\n"),
+            "acme",
+            "2.0.0",
+            &["2.0.0", "1.9.4", "1.2.0"],
+        );
+        let cases = [
+            (&composer, "acme/lib", "1.9.4", "3.0.0"),
+            (&pubspec, "http", "1.9.0", "2.0.0"),
+            (&csproj, "Acme.Lib", "1.9.0", "2.0.0"),
+            (&gemfile, "acme", "1.9.4", "2.0.0"),
+        ];
+        for (analysis, name, bounded, plain) in cases {
+            let found = entry(analysis, name);
+            assert_eq!(
+                found.status,
+                Status::Outdated {
+                    latest: bounded.to_owned()
+                },
+                "{name}"
+            );
+            assert_eq!(found.outside_latest.as_deref(), Some(plain), "{name}");
+        }
     }
 
     #[test]

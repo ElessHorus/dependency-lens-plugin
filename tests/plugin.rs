@@ -1290,9 +1290,10 @@ fn gemfile_requirement_shows_the_registry_version_and_offers_a_major_update() {
         .iter()
         .find(|decoration| decoration.range == RAILS_VERSION_RANGE)
         .expect("decoration on rails");
-    assert_eq!(rails.after, Some("→ 8.1.4.1".to_string()));
-    assert_eq!(rails.style, "info");
-    assert_only_outdated_problem(&host, GEMFILE_PATH, RAILS_VERSION_RANGE, "8.1.4.1");
+    // `~> 7.0.4` stops below 7.1: 7.0.4 is the latest inside the bounds, so no update is due.
+    assert_eq!(rails.after, Some("✓".to_string()));
+    assert_eq!(rails.style, "muted");
+    assert!(diagnostics_of(&host, GEMFILE_PATH).is_empty());
 
     let fetches_after_refresh = fetches.get();
     let document = Document {
