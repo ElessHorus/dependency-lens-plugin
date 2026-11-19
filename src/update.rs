@@ -33,6 +33,12 @@ pub(crate) trait UpdateVersion: Ord + Sized {
     fn is_prerelease_version(&self) -> bool;
     /// Returns the release segments, such as `[2, 31, 0]`. Borrowed when the version stores them.
     fn release_segments(&self) -> Cow<'_, [u64]>;
+    /// Whether an exclusive bound (`>` or `<`) keeps `self` out although the order allows it.
+    ///
+    /// Only PEP 440 has such a rule, so the default is `false`.
+    fn is_excluded_by_bound(&self, _operator: &str, _bound: &Self) -> bool {
+        false
+    }
 }
 
 impl UpdateVersion for Pep440 {
@@ -46,6 +52,16 @@ impl UpdateVersion for Pep440 {
 
     fn release_segments(&self) -> Cow<'_, [u64]> {
         Cow::Borrowed(self.release())
+    }
+
+    /// PEP 440: `>V` does not allow a post-release of `V` unless `V` is one, and `<V` does not
+    /// allow a pre-release of `V` unless `V` is one.
+    fn is_excluded_by_bound(&self, operator: &str, bound: &Self) -> bool {
+        match operator {
+            ">" => self.is_post_release_of(bound),
+            "<" => !bound.is_prerelease() && self.is_pre_release_of(bound),
+            _ => false,
+        }
     }
 }
 

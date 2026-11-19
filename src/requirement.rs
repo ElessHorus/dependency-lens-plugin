@@ -353,9 +353,9 @@ fn satisfies_all_of<V: UpdateVersion>(target: &str, constraints: &[Constraint]) 
             return false;
         };
         match constraint.operator.as_str() {
-            "<" => target < bound,
+            "<" => target < bound && !target.is_excluded_by_bound("<", &bound),
             "<=" => target <= bound,
-            ">" => target > bound,
+            ">" => target > bound && !target.is_excluded_by_bound(">", &bound),
             ">=" => target >= bound,
             "==" | "===" => target == bound,
             "!=" => target != bound,
@@ -623,6 +623,32 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn pep440_exclusive_bounds_follow_the_standard() {
+        let cases = [
+            (">", "1.0", "1.0.post1", false),
+            (">", "1.0", "1.1", true),
+            (">", "1.0.post1", "1.0.post2", true),
+            ("<", "2.0", "2.0rc1", false),
+            ("<", "2.0", "2.0.dev1", false),
+            ("<", "2.0", "1.9", true),
+            ("<", "2.0rc2", "2.0rc1", true),
+        ];
+        for (operator, bound, target, expected) in cases {
+            let allowed = requirement(&[&[(operator, bound)]]);
+            assert_eq!(
+                allowed.allows(Ecosystem::PyPI, target),
+                expected,
+                "{target} against {operator}{bound}"
+            );
+        }
+        let after_one = requirement(&[&[(">", "1.0")]]);
+        assert_eq!(
+            after_one.lowest_allowed(Ecosystem::PyPI, &versions(&["1.1", "1.0.post1", "1.0"])),
+            Some("1.1".to_owned())
+        );
     }
 
     #[test]
