@@ -5,7 +5,8 @@ use crate::fixes::{fix_outside_bounds, shown_affected};
 use crate::http::{Http, is_cancelled_message, is_success};
 use crate::model::{Dependency, Ecosystem, VersionInfo, Vulnerability};
 use crate::osv::{
-    DEFAULT_DETAILS_PER_QUERY, OsvQuery, is_deferred, is_placeholder, query_batch_limited,
+    DEFAULT_DETAILS_PER_QUERY, OsvQuery, declared_version_for_osv, is_deferred, is_placeholder,
+    query_batch_limited,
 };
 use crate::requirement::{checked_version_of, needs_list};
 use crate::settings::Settings;
@@ -443,12 +444,13 @@ fn resolve_registry(
             && !matches!(entry.status, Status::Unknown(_) | Status::Pending)
     }) {
         let name = eco.normalize_package(&entry.dependency.name);
+        let checked_version = entry.checked_version.as_deref();
         let (status, outside_latest) = if let Some(info) = cache.version_info(eco, &name, now) {
-            registry_view(eco, &entry.dependency, Ok(info))
+            registry_view(eco, &entry.dependency, checked_version, Ok(info))
         } else if let Some(reason) = cache.failure(FailureKind::Registry, eco, &name, now) {
-            registry_view(eco, &entry.dependency, Err(reason))
+            registry_view(eco, &entry.dependency, checked_version, Err(reason))
         } else if let Some(lookup) = fresh.get(&*name) {
-            registry_view(eco, &entry.dependency, lookup_view(lookup))
+            registry_view(eco, &entry.dependency, checked_version, lookup_view(lookup))
         } else {
             // The request is built before the budget is spent, so an invalid name costs no lookup.
             // Its status is not cached, so a later fix of the manifest takes effect at once.
@@ -465,7 +467,12 @@ fn resolve_registry(
                     entry.outside_latest = None;
                     continue;
                 }
-                let view = registry_view(eco, &entry.dependency, lookup_view(&lookup));
+                let view = registry_view(
+                    eco,
+                    &entry.dependency,
+                    checked_version,
+                    lookup_view(&lookup),
+                );
                 fresh.insert(name.into_owned(), lookup);
                 view
             } else {
@@ -497,6 +504,26 @@ fn lookup_view(lookup: &Lookup) -> Result<&VersionInfo, &str> {
     lookup.as_ref().map_err(String::as_str)
 }
 
+/// The version that a newer release must beat: the text of the lower bound, or the checked version
+/// when the requirement refuses that text.
+///
+/// `>2.9,<2.10` refuses `2.9`, so the version in use is the checked 2.9.2, and a status that offers
+/// 2.9.2 as an update would contradict itself. `^3.0` allows `3.0`, so the bound text stays the base
+/// even when the registry has no such release: raising the bound is the update.
+fn comparison_base<'a>(
+    eco: Ecosystem,
+    dependency: &'a Dependency,
+    checked_version: Option<&'a str>,
+) -> &'a str {
+    dependency
+        .requirement
+        .as_ref()
+        .zip(declared_version_for_osv(&dependency.version))
+        .filter(|(requirement, bound_text)| !requirement.allows(eco, bound_text))
+        .and(checked_version)
+        .unwrap_or(dependency.version.as_str())
+}
+
 /// Builds the registry status of one entry and its latest version outside the bounds.
 ///
 /// With a readable range and a registry list, the status follows the newest listed version that the
@@ -505,6 +532,7 @@ fn lookup_view(lookup: &Lookup) -> Result<&VersionInfo, &str> {
 fn registry_view(
     eco: Ecosystem,
     dependency: &Dependency,
+    checked_version: Option<&str>,
     lookup: Result<&VersionInfo, &str>,
 ) -> (Status, Option<String>) {
     let info = match lookup {
@@ -517,7 +545,7 @@ fn registry_view(
             None,
         );
     };
-    let declared = dependency.version.as_str();
+    let base = comparison_base(eco, dependency, checked_version);
     let bounded = dependency
         .requirement
         .as_ref()
@@ -531,8 +559,8 @@ fn registry_view(
     let target = bounded.as_deref().unwrap_or(latest);
     // The plain latest is kept apart only when the status follows another version.
     let outside_latest =
-        (target != latest && is_outdated(eco, declared, latest)).then(|| latest.to_owned());
-    let status = if is_outdated(eco, declared, target) {
+        (target != latest && is_outdated(eco, base, latest)).then(|| latest.to_owned());
+    let status = if is_outdated(eco, base, target) {
         Status::Outdated {
             latest: target.to_owned(),
         }
@@ -2872,6 +2900,22 @@ mod tests {
             }
         );
         assert_eq!(requests.outside_latest.as_deref(), Some("2.34.2"));
+    }
+
+    #[test]
+    fn a_range_whose_only_allowed_version_is_the_checked_one_is_up_to_date() {
+        // Only 2.9.2 lies in `>2.9,<2.10`, and only 2.0.0 in `>1.12,<2.9`: each is the checked version,
+        // so nothing newer is allowed, whatever the text of the lower bound says.
+        for (text, checked) in [
+            ("requests>2.9,<2.10\n", "2.9.2"),
+            ("requests>1.12,<2.9\n", "2.0.0"),
+        ] {
+            let analysis = analyze_range(text);
+            let requests = entry(&analysis, "requests");
+            assert_eq!(requests.checked_version.as_deref(), Some(checked), "{text}");
+            assert_eq!(requests.status, Status::UpToDate, "{text}");
+            assert_eq!(requests.outside_latest.as_deref(), Some("2.34.2"), "{text}");
+        }
     }
 
     #[test]
