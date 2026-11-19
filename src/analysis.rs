@@ -3183,6 +3183,22 @@ mod tests {
     }
 
     #[test]
+    fn a_range_from_a_private_index_has_no_entry_and_no_registry_data() {
+        // The cache holds a list and an advisory for the name, so only the private index keeps it out.
+        let mut cache = cache_with_advisory(AdvisorySeverity::High, "2.31.0");
+        let http = FakeHttp::new();
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            "--index-url https://pypi.internal.example/simple\nrequests>1.12,<2.10\n",
+            &mut Budget::new(usize::MAX, None),
+        );
+        assert!(analysis.entries.is_empty());
+        assert!(http.requests().is_empty());
+    }
+
+    #[test]
     fn a_cancelled_registry_lookup_sends_no_osv_batch() {
         let mut cache = Cache::new(TTL_SECS);
         let http = FakeHttp::new()
