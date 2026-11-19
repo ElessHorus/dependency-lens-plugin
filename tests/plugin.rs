@@ -160,6 +160,20 @@ fn opening_manifest_shows_serde_advisory_only() {
 }
 
 #[test]
+fn the_hover_of_a_public_dependency_links_its_package_page() {
+    let host = host_counting_fetches(Rc::new(Cell::new(0)));
+    let mut plugin = DependencyLens::default();
+    open_manifest(&host, &mut plugin);
+
+    let decorations = decorations_of(&host, MANIFEST_PATH);
+    let hover = decorations[0].hover.as_deref().unwrap_or_default();
+    assert!(
+        hover.contains("[Page on crates.io](https://crates.io/crates/serde)"),
+        "{hover}"
+    );
+}
+
+#[test]
 fn advisories_are_shown_when_the_cache_lifetime_is_zero() {
     // `cacheTtlSeconds = 0` keeps nothing between refreshes; a refresh must still show what it fetched.
     let host = host_counting_fetches(Rc::new(Cell::new(0)));
@@ -976,6 +990,47 @@ fn requirements_show_registry_versions_and_one_outdated_problem() {
     assert_eq!(flask.after, Some("✓".to_string()));
     assert_eq!(flask.style, "muted");
     assert_only_outdated_problem(&host, REQUIREMENTS_PATH, REQUESTS_VERSION_RANGE, "2.31.0");
+}
+
+#[test]
+fn a_cargo_path_dependency_has_no_decoration_and_no_link() {
+    let host = host_counting_fetches(Rc::new(Cell::new(0)));
+    host.add_file(
+        "Cargo.toml",
+        "[dependencies]\nserde = \"1.0.0\"\nlocal = { path = \"../local\", version = \"1.0.0\" }\n",
+    );
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(MANIFEST_PATH.to_owned())],
+        &host.invocation(),
+    );
+
+    let decorations = decorations_of(&host, MANIFEST_PATH);
+    // Only serde is shown, and no hover names the local crate.
+    assert_eq!(decorations.len(), 1);
+    assert!(decorations.iter().all(|decoration| {
+        !decoration
+            .hover
+            .as_deref()
+            .unwrap_or_default()
+            .contains("local")
+    }));
+}
+
+#[test]
+fn a_requirement_from_a_private_index_has_no_link() {
+    let host = host_with_pypi(Rc::new(Cell::new(0)));
+    host.add_file(
+        "requirements.txt",
+        "--index-url https://private.example/simple\nrequests==2.28.0\n",
+    );
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(REQUIREMENTS_PATH.to_owned())],
+        &host.invocation(),
+    );
+
+    assert!(decorations_of(&host, REQUIREMENTS_PATH).is_empty());
 }
 
 #[test]

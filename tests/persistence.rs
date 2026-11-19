@@ -168,6 +168,14 @@ fn after_texts(host: &MockHost) -> Vec<Option<String>> {
     after_texts_at(host, MANIFEST_PATH)
 }
 
+/// The hover text of each decoration of the manifest.
+fn hover_texts(host: &MockHost) -> Vec<String> {
+    decorations_at(host, MANIFEST_PATH)
+        .into_iter()
+        .map(|decoration| decoration.hover.unwrap_or_default())
+        .collect()
+}
+
 /// The Cargo block that the host storage holds, as JSON.
 fn stored_cargo_block(host: &MockHost) -> Value {
     serde_json::from_str(&host.storage()[CARGO_KEY]).unwrap()
@@ -218,11 +226,14 @@ fn an_expired_disk_cache_is_shown_first_and_then_refreshed() {
 
     assert!(osv.requests.get() > 0, "the real lookup was tried");
     assert_eq!(after_texts(&host), [Some("⚠ 1 vulnerability".to_owned())]);
+    // The old data keeps the link to the package page.
+    assert!(hover_texts(&host)[0].contains("[Page on crates.io](https://crates.io/crates/serde)"));
 
     // Once the host answers, the normal pass replaces the old data.
     osv.is_cancelling.set(false);
     open_manifest(&host, &mut plugin, MANIFEST);
     assert_eq!(after_texts(&host), [Some("⚠ 2 vulnerabilities".to_owned())]);
+    assert!(hover_texts(&host)[0].contains("[Page on crates.io](https://crates.io/crates/serde)"));
 }
 
 #[test]

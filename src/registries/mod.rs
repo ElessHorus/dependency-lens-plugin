@@ -97,7 +97,117 @@ fn is_packagist_segment(segment: &str) -> bool {
     is_bounded_run(segment, 100, is_dotted_byte) && segment != "." && segment != ".."
 }
 
+/// True when `name` is safe to put in the URL of a package page and in a Markdown link.
+///
+/// The five ecosystems with a registry client reuse `is_valid_package_name`. The others
+/// follow the name grammar of their registry, in ASCII only. The name is never encoded:
+/// the allow-list keeps it inside the URL path and cannot break the Markdown link.
+fn is_linkable_name(eco: Ecosystem, name: &str) -> bool {
+    match eco {
+        Ecosystem::PyPI
+        | Ecosystem::Packagist
+        | Ecosystem::Pub
+        | Ecosystem::NuGet
+        | Ecosystem::RubyGems => is_valid_package_name(eco, name),
+        Ecosystem::Cargo => {
+            is_bounded_run(name, 64, is_word_or_hyphen_byte)
+                && name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        }
+        Ecosystem::Npm => is_npm_name(name),
+        Ecosystem::Go => {
+            name.len() <= 256
+                && name
+                    .split('/')
+                    .all(|segment| is_path_segment(segment, is_tilde_dotted_byte))
+        }
+        Ecosystem::Maven => name
+            .split_once(':')
+            .is_some_and(|(group, artifact)| is_maven_part(group) && is_maven_part(artifact)),
+    }
+}
+
+/// Letters, digits, `_` and `-`: the class of Cargo crate names.
+fn is_word_or_hyphen_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+}
+
+/// Letters, digits and `-._~`: the class of Go path segments.
+fn is_tilde_dotted_byte(byte: u8) -> bool {
+    is_dotted_byte(byte) || byte == b'~'
+}
+
+/// Letters, digits and `-._~`: the class of npm name parts. Old packages have uppercase letters.
+fn is_npm_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+}
+
+/// True when `segment` is a non-empty path segment, is not `.` or `..`, and passes `is_allowed`.
+fn is_path_segment(segment: &str, is_allowed: fn(u8) -> bool) -> bool {
+    !segment.is_empty() && segment != "." && segment != ".." && segment.bytes().all(is_allowed)
+}
+
+/// True for `name` or `@scope/name`, at most 214 bytes, where no part starts with `.` or `_`.
+fn is_npm_name(name: &str) -> bool {
+    let is_npm_part =
+        |part: &str| is_bounded_run(part, 214, is_npm_byte) && !part.starts_with(['.', '_']);
+    if name.len() > 214 {
+        return false;
+    }
+    match name.strip_prefix('@') {
+        Some(scoped) => scoped
+            .split_once('/')
+            .is_some_and(|(scope, package)| is_npm_part(scope) && is_npm_part(package)),
+        None => is_npm_part(name),
+    }
+}
+
+/// One side of a Maven `group:artifact` name: letters, digits and `-._`, starting with a letter or a digit.
+fn is_maven_part(part: &str) -> bool {
+    is_bounded_run(part, 128, is_dotted_byte) && starts_alphanumeric(part)
+}
+
 impl Ecosystem {
+    /// Returns the URL of the package page on the public registry, or `None` for an unsafe name.
+    ///
+    /// The URL needs no request. The name is normalized first, so it matches the registry spelling.
+    pub fn package_page_url(self, name: &str) -> Option<String> {
+        let package = self.normalize_package(name);
+        if !is_linkable_name(self, &package) {
+            return None;
+        }
+        let url = match self {
+            Ecosystem::PyPI => format!("https://pypi.org/project/{package}"),
+            Ecosystem::Packagist => format!("https://packagist.org/packages/{package}"),
+            Ecosystem::Pub => format!("https://pub.dev/packages/{package}"),
+            Ecosystem::NuGet => format!("https://www.nuget.org/packages/{package}"),
+            Ecosystem::RubyGems => format!("https://rubygems.org/gems/{package}"),
+            Ecosystem::Cargo => format!("https://crates.io/crates/{package}"),
+            Ecosystem::Npm => format!("https://www.npmjs.com/package/{package}"),
+            Ecosystem::Go => format!("https://pkg.go.dev/{package}"),
+            // `is_linkable_name` guarantees one `:`, which becomes the path separator.
+            Ecosystem::Maven => format!(
+                "https://central.sonatype.com/artifact/{}",
+                package.replacen(':', "/", 1)
+            ),
+        };
+        Some(url)
+    }
+
+    /// The name of the public registry, as shown in the text of the package page link.
+    pub fn registry_label(self) -> &'static str {
+        match self {
+            Ecosystem::PyPI => "PyPI",
+            Ecosystem::Packagist => "Packagist",
+            Ecosystem::Pub => "pub.dev",
+            Ecosystem::NuGet => "NuGet",
+            Ecosystem::RubyGems => "RubyGems",
+            Ecosystem::Cargo => "crates.io",
+            Ecosystem::Npm => "npm",
+            Ecosystem::Go => "pkg.go.dev",
+            Ecosystem::Maven => "Maven Central",
+        }
+    }
+
     /// Returns the registry spelling of `name`. Borrows when nothing changes.
     pub fn normalize_package(self, name: &str) -> Cow<'_, str> {
         match self {
@@ -402,6 +512,119 @@ mod tests {
         assert!(Ecosystem::Pub.registry_request("a-b").is_none());
         assert!(Ecosystem::NuGet.registry_request("x?y").is_none());
         assert!(Ecosystem::RubyGems.registry_request("x#y").is_none());
+    }
+
+    #[test]
+    fn package_page_url_table() {
+        let cases = [
+            (
+                Ecosystem::PyPI,
+                "Flask_Login",
+                "https://pypi.org/project/flask-login",
+            ),
+            (
+                Ecosystem::Packagist,
+                "Monolog/Monolog",
+                "https://packagist.org/packages/monolog/monolog",
+            ),
+            (Ecosystem::Pub, "http", "https://pub.dev/packages/http"),
+            (
+                Ecosystem::NuGet,
+                "Newtonsoft.Json",
+                "https://www.nuget.org/packages/newtonsoft.json",
+            ),
+            (
+                Ecosystem::RubyGems,
+                "rails",
+                "https://rubygems.org/gems/rails",
+            ),
+            (Ecosystem::Cargo, "serde", "https://crates.io/crates/serde"),
+            (
+                Ecosystem::Npm,
+                "left-pad",
+                "https://www.npmjs.com/package/left-pad",
+            ),
+            // Old npm packages can have uppercase letters in their name.
+            (
+                Ecosystem::Npm,
+                "JSONStream",
+                "https://www.npmjs.com/package/JSONStream",
+            ),
+            (
+                Ecosystem::Npm,
+                "@types/node",
+                "https://www.npmjs.com/package/@types/node",
+            ),
+            (
+                Ecosystem::Go,
+                "github.com/Masterminds/semver/v3",
+                "https://pkg.go.dev/github.com/Masterminds/semver/v3",
+            ),
+            (
+                Ecosystem::Maven,
+                "org.apache.commons:commons-lang3",
+                "https://central.sonatype.com/artifact/org.apache.commons/commons-lang3",
+            ),
+        ];
+        for (eco, name, expected) in cases {
+            assert_eq!(
+                eco.package_page_url(name).as_deref(),
+                Some(expected),
+                "{eco:?} {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn package_page_url_refuses_unsafe_names() {
+        let too_long = "a".repeat(300);
+        let unsafe_names = [
+            "",
+            "a b",
+            "a)",
+            "a]",
+            "a?x",
+            "a#x",
+            "café",
+            too_long.as_str(),
+        ];
+        for eco in Ecosystem::ALL {
+            for name in unsafe_names {
+                assert_eq!(eco.package_page_url(name), None, "{eco:?} {name:?}");
+            }
+        }
+        let refused = [
+            (Ecosystem::Npm, "@scope"),
+            (Ecosystem::Npm, "@/x"),
+            (Ecosystem::Go, "a//b"),
+            (Ecosystem::Go, "a/"),
+            (Ecosystem::Go, "a/../b"),
+            (Ecosystem::Maven, "nocolon"),
+            (Ecosystem::Maven, "a:b:c"),
+            (Ecosystem::Maven, "group:"),
+            (Ecosystem::Packagist, "novendor"),
+        ];
+        for (eco, name) in refused {
+            assert_eq!(eco.package_page_url(name), None, "{eco:?} {name:?}");
+        }
+    }
+
+    #[test]
+    fn registry_label_table() {
+        let labels = [
+            (Ecosystem::PyPI, "PyPI"),
+            (Ecosystem::Packagist, "Packagist"),
+            (Ecosystem::Pub, "pub.dev"),
+            (Ecosystem::NuGet, "NuGet"),
+            (Ecosystem::RubyGems, "RubyGems"),
+            (Ecosystem::Cargo, "crates.io"),
+            (Ecosystem::Npm, "npm"),
+            (Ecosystem::Go, "pkg.go.dev"),
+            (Ecosystem::Maven, "Maven Central"),
+        ];
+        for (eco, label) in labels {
+            assert_eq!(eco.registry_label(), label, "{eco:?}");
+        }
     }
 
     #[test]
