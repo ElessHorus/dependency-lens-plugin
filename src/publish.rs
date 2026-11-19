@@ -127,7 +127,7 @@ impl<'a> AdvisoryView<'a> {
 
 /// Builds the decoration of one entry, or `None` when it has nothing to show.
 fn decoration_of(range: Range, entry: &Entry) -> Option<Decoration> {
-    let parts: Vec<(String, Tone)> = status_part(&entry.status)
+    let parts: Vec<(String, Tone)> = status_part(entry)
         .into_iter()
         .chain(vulnerability_part(&AdvisoryView::of(
             &entry.vulnerabilities,
@@ -149,10 +149,16 @@ fn decoration_of(range: Range, entry: &Entry) -> Option<Decoration> {
 }
 
 /// The version part of the `after` text, or `None` when the status shows no version.
-fn status_part(status: &Status) -> Option<(String, Tone)> {
-    match status {
-        Status::UpToDate => Some(("✓".to_owned(), Tone::Muted)),
-        Status::Outdated { latest } => Some((format!("→ {latest}"), Tone::Info)),
+///
+/// A latest version that the requirement excludes follows in brackets.
+fn status_part(entry: &Entry) -> Option<(String, Tone)> {
+    let outside = |text: String| match &entry.outside_latest {
+        Some(latest) => format!("{text} (latest {latest})"),
+        None => text,
+    };
+    match &entry.status {
+        Status::UpToDate => Some((outside("✓".to_owned()), Tone::Muted)),
+        Status::Outdated { latest } => Some((outside(format!("→ {latest}")), Tone::Info)),
         Status::Pending => Some(("…".to_owned(), Tone::Muted)),
         Status::Unknown(_) => Some(("?".to_owned(), Tone::Muted)),
         Status::NotChecked => None,
@@ -185,10 +191,18 @@ fn hover_of(entry: &Entry) -> String {
         .as_deref()
         .unwrap_or(&entry.dependency.version);
     let mut blocks = vec![format!("**{}** {version}", entry.dependency.name)];
-    match &entry.status {
-        Status::Outdated { latest } => blocks.push(format!("Latest version: {latest}")),
-        Status::Unknown(reason) => blocks.push(format!("Could not check: {reason}")),
-        Status::UpToDate | Status::Pending | Status::NotChecked => {}
+    match (&entry.status, &entry.outside_latest) {
+        (Status::Outdated { latest }, None) => blocks.push(format!("Latest version: {latest}")),
+        (Status::Outdated { latest }, Some(_)) => {
+            blocks.push(format!("Latest version in the bounds: {latest}"));
+        }
+        (Status::Unknown(reason), _) => blocks.push(format!("Could not check: {reason}")),
+        (Status::UpToDate | Status::Pending | Status::NotChecked, _) => {}
+    }
+    if let Some(outside_latest) = &entry.outside_latest {
+        blocks.push(format!(
+            "Latest version: {outside_latest} (outside the bounds)"
+        ));
     }
     let view = AdvisoryView::of(&entry.vulnerabilities);
     if view.total() > 0 {
@@ -202,6 +216,11 @@ fn hover_of(entry: &Entry) -> String {
                     "Lowest version that the requirement allows (the manifest writes {bound_text})."
                 ));
             }
+        }
+        if let Some(fix_outside) = &entry.fix_outside {
+            blocks.push(format!(
+                "No allowed version is free of known vulnerabilities. The fix is in {fix_outside}, outside the bounds."
+            ));
         }
         let mut advisory_lines: Vec<String> = view
             .known
@@ -288,8 +307,13 @@ fn outdated_diagnostic_of(range: Range, entry: &Entry) -> Option<Diagnostic> {
         .checked_version
         .as_deref()
         .unwrap_or(&entry.dependency.version);
+    let outside_note = entry
+        .outside_latest
+        .as_ref()
+        .map(|outside_latest| format!(" (latest {outside_latest}, outside the bounds)"))
+        .unwrap_or_default();
     let message = format!(
-        "{} {version}: newer version {latest} available",
+        "{} {version}: newer version {latest} available{outside_note}",
         entry.dependency.name
     );
     let mut diagnostic =
@@ -507,6 +531,90 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A `serde` analysis whose entry has `outside_latest` and `fix_outside` set.
+    fn serde_entry_outside(
+        status: Status,
+        vulnerabilities: Vec<Vulnerability>,
+        outside_latest: Option<&str>,
+        fix_outside: Option<&str>,
+    ) -> Analysis {
+        let mut analysis = serde_entry(status, vulnerabilities, Some("1.0.0"));
+        analysis.entries[0].outside_latest = outside_latest.map(str::to_owned);
+        analysis.entries[0].fix_outside = fix_outside.map(str::to_owned);
+        analysis
+    }
+
+    #[test]
+    fn a_latest_version_outside_the_bounds_shows_in_the_text_and_the_hover() {
+        let outdated = Status::Outdated {
+            latest: "2.9.2".to_owned(),
+        };
+        // (status, outside latest, expected after, expected style, expected hover)
+        let cases = [
+            (
+                outdated,
+                Some("2.34.2"),
+                "→ 2.9.2 (latest 2.34.2)",
+                "info",
+                "**serde** 1.0.0\n\nLatest version in the bounds: 2.9.2\n\nLatest version: 2.34.2 (outside the bounds)",
+            ),
+            (
+                Status::UpToDate,
+                Some("3.0.0"),
+                "✓ (latest 3.0.0)",
+                "muted",
+                "**serde** 1.0.0\n\nLatest version: 3.0.0 (outside the bounds)",
+            ),
+        ];
+        for (status, outside_latest, after, style, hover) in cases {
+            let analysis = serde_entry_outside(status.clone(), vec![], outside_latest, None);
+            let decorations = decorations(SERDE_TEXT, &analysis);
+            assert_eq!(decorations.len(), 1, "{status:?}");
+            assert_eq!(decorations[0].after.as_deref(), Some(after), "{status:?}");
+            assert_eq!(decorations[0].style, style, "{status:?}");
+            assert_eq!(decorations[0].hover.as_deref(), Some(hover), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn a_fix_outside_the_bounds_is_said_before_the_advisories() {
+        let analysis = serde_entry_outside(
+            Status::NotChecked,
+            vec![vulnerability("GHSA-high", AdvisorySeverity::High, None)],
+            None,
+            Some("2.33.0"),
+        );
+        let hover = decorations(SERDE_TEXT, &analysis)[0]
+            .hover
+            .clone()
+            .expect("a hover");
+        let notice = "No allowed version is free of known vulnerabilities. The fix is in 2.33.0, outside the bounds.";
+        let notice_at = hover.find(notice).expect("the notice");
+        assert!(
+            notice_at < hover.find("GHSA-high").expect("the advisory"),
+            "{hover}"
+        );
+    }
+
+    #[test]
+    fn the_outdated_problem_names_the_latest_outside_the_bounds() {
+        let outdated = Status::Outdated {
+            latest: "2.9.2".to_owned(),
+        };
+        let outside = serde_entry_outside(outdated.clone(), vec![], Some("2.34.2"), None);
+        assert_eq!(
+            diagnostics(SERDE_TEXT, &outside, true)[0].message,
+            "serde 1.0.0: newer version 2.9.2 available (latest 2.34.2, outside the bounds)"
+        );
+        let plain = serde_entry_outside(outdated, vec![], None, None);
+        assert_eq!(
+            diagnostics(SERDE_TEXT, &plain, true)[0].message,
+            "serde 1.0.0: newer version 2.9.2 available"
+        );
+        let up_to_date = serde_entry_outside(Status::UpToDate, vec![], Some("3.0.0"), None);
+        assert!(diagnostics(SERDE_TEXT, &up_to_date, true).is_empty());
     }
 
     #[test]

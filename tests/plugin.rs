@@ -1291,7 +1291,7 @@ fn gemfile_requirement_shows_the_registry_version_and_offers_a_major_update() {
         .find(|decoration| decoration.range == RAILS_VERSION_RANGE)
         .expect("decoration on rails");
     // `~> 7.0.4` stops below 7.1: 7.0.4 is the latest inside the bounds, so no update is due.
-    assert_eq!(rails.after, Some("✓".to_string()));
+    assert_eq!(rails.after, Some("✓ (latest 8.1.4.1)".to_string()));
     assert_eq!(rails.style, "muted");
     assert!(diagnostics_of(&host, GEMFILE_PATH).is_empty());
 
