@@ -40,7 +40,7 @@ title = "Dependency Lens: Clear cache"
 category = "Dependency Lens"
 
 [[contributes.providers]]
-kinds = ["code-actions"]
+kinds = ["code-actions", "hover"]
 languages = ["*"]
 
 [contributes.settings]

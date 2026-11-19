@@ -4,6 +4,7 @@ pub mod actions;
 pub mod analysis;
 pub mod cache;
 pub mod fixes;
+pub mod hover;
 pub mod http;
 pub mod model;
 pub mod osv;
@@ -25,10 +26,11 @@ use crate::osv::DEFAULT_DETAILS_PER_QUERY;
 use crate::settings::Settings;
 use crate::store::{HostStore, Store, block_key};
 use openidea_plugin::host::Task;
+use openidea_plugin::hover::{Hover, HoverProvider};
 use openidea_plugin::providers::{CodeAction, Document, Providers};
 use openidea_plugin::{
-    Context, Decoration, Diagnostic, Error, Event, EventKind, Invocation, LogLevel, Plugin, Range,
-    host, register_plugin,
+    Context, Decoration, Diagnostic, Error, Event, EventKind, Invocation, LogLevel, Plugin,
+    Position, Range, host, register_plugin,
 };
 use std::collections::HashSet;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -884,7 +886,20 @@ impl Providers for DependencyLens {
     }
 }
 
-register_plugin!(DependencyLens, providers);
+impl HoverProvider for DependencyLens {
+    /// Links the package page of the dependency under the cursor. It reads no cache and makes no request.
+    fn hover(&mut self, doc: &Document, at: Position) -> Option<Hover> {
+        hover::package_link_hover(
+            &self.settings,
+            &doc.path,
+            project_root_of(&doc.path).as_deref(),
+            &doc.text,
+            at,
+        )
+    }
+}
+
+register_plugin!(DependencyLens, providers, hover);
 
 #[cfg(test)]
 mod loop_tests {

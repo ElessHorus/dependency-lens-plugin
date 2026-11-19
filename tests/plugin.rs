@@ -2,6 +2,7 @@
 
 use dependency_lens::DependencyLens;
 use dependency_lens::publish::DECORATION_SET;
+use openidea_plugin::hover::HoverProvider;
 use openidea_plugin::mock::MockHost;
 use openidea_plugin::providers::{Document, Providers};
 use openidea_plugin::{
@@ -157,6 +158,33 @@ fn opening_manifest_shows_serde_advisory_only() {
     assert_eq!(diagnostics[0].range, SERDE_VERSION_RANGE);
     assert_eq!(diagnostics[0].severity, Severity::Error);
     assert_eq!(diagnostics[0].code.as_deref(), Some(HIGH_ID));
+}
+
+#[test]
+fn the_ide_hover_links_the_package_page_of_the_dependency_under_the_cursor() {
+    let host = host_counting_fetches(Rc::new(Cell::new(0)));
+    let mut plugin = DependencyLens::default();
+    open_manifest(&host, &mut plugin);
+    let requests_after_open = host.requests().len();
+
+    let document = Document {
+        path: MANIFEST_PATH.to_owned(),
+        language: "toml".to_owned(),
+        version: 1,
+        text: MANIFEST.to_owned(),
+    };
+    let hover = HoverProvider::hover(&mut plugin, &document, Position::new(5, 10))
+        .expect("a hover on the version of serde");
+    assert_eq!(
+        hover.markdown,
+        "[Page on crates.io](https://crates.io/crates/serde)"
+    );
+    // Off the dependencies, the plugin adds nothing. It never reaches the network.
+    assert_eq!(
+        HoverProvider::hover(&mut plugin, &document, Position::new(1, 2)),
+        None
+    );
+    assert_eq!(host.requests().len(), requests_after_open);
 }
 
 #[test]
