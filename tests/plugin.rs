@@ -188,17 +188,16 @@ fn the_ide_hover_links_the_package_page_of_the_dependency_under_the_cursor() {
 }
 
 #[test]
-fn the_hover_of_a_public_dependency_links_its_package_page() {
+fn the_decoration_hover_keeps_the_advisory_and_has_no_package_link() {
+    // The clickable link comes from the hover provider, since a decoration tooltip is plain text.
     let host = host_counting_fetches(Rc::new(Cell::new(0)));
     let mut plugin = DependencyLens::default();
     open_manifest(&host, &mut plugin);
 
     let decorations = decorations_of(&host, MANIFEST_PATH);
     let hover = decorations[0].hover.as_deref().unwrap_or_default();
-    assert!(
-        hover.contains("[Page on crates.io](https://crates.io/crates/serde)"),
-        "{hover}"
-    );
+    assert!(hover.contains(HIGH_ID), "{hover}");
+    assert!(!hover.contains("Page on"), "{hover}");
 }
 
 #[test]

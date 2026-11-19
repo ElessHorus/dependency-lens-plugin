@@ -345,7 +345,7 @@ impl DependencyLens {
         if old.pending >= fresh_pending {
             return None;
         }
-        publish_analysis(eco, path, text, &old, self.settings.outdated_problems);
+        publish_analysis(path, text, &old, self.settings.outdated_problems);
         Some(old)
     }
 
@@ -418,7 +418,6 @@ impl DependencyLens {
             );
             let cache = &self.cache;
             publish_over_old_data(
-                eco,
                 path,
                 text,
                 &analysis,
@@ -501,14 +500,8 @@ fn should_continue(
 }
 
 /// Publishes the decorations and problems of one analysis of the manifest `text` at `path`.
-fn publish_analysis(
-    eco: Ecosystem,
-    path: &str,
-    text: &str,
-    analysis: &Analysis,
-    outdated_problems: bool,
-) {
-    let editor_decorations = publish::decorations(text, analysis, eco);
+fn publish_analysis(path: &str, text: &str, analysis: &Analysis, outdated_problems: bool) {
+    let editor_decorations = publish::decorations(text, analysis);
     let problems = publish::diagnostics(text, analysis, outdated_problems);
     publish_results(path, &editor_decorations, &problems);
 }
@@ -518,7 +511,6 @@ fn publish_analysis(
 /// An entry that still waits keeps what the old data showed for it until its answer comes.
 /// `has_answer` tells whether OSV already answered for an entry, whose advisories are then kept.
 fn publish_over_old_data(
-    eco: Ecosystem,
     path: &str,
     text: &str,
     analysis: &Analysis,
@@ -530,7 +522,6 @@ fn publish_over_old_data(
         .filter(|_| analysis.pending > 0)
         .map(|old| fill_pending_from_old(analysis, old, has_answer));
     publish_analysis(
-        eco,
         path,
         text,
         shown.as_ref().unwrap_or(analysis),

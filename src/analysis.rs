@@ -1194,39 +1194,6 @@ mod tests {
     }
 
     #[test]
-    fn an_ignored_package_has_no_package_link() {
-        // The same advisory for every queried package, so each entry gets a hover.
-        let hover_links = |ignore: Vec<String>, result_count: usize| -> Vec<String> {
-            let results = vec![r#"{"vulns":[{"id":"GHSA-x"}]}"#; result_count].join(",");
-            let http = FakeHttp::new().route(
-                "POST",
-                BATCH_URL,
-                200,
-                &format!(r#"{{"results":[{results}]}}"#),
-            );
-            let settings = Settings {
-                ignore,
-                ..Settings::default()
-            };
-            let analysis = run(&mut Cache::new(TTL_SECS), &http, &settings, NOW, MANIFEST);
-            crate::publish::decorations(MANIFEST, &analysis, Ecosystem::Cargo)
-                .into_iter()
-                .filter_map(|decoration| decoration.hover)
-                .collect()
-        };
-        let serde_link = "https://crates.io/crates/serde";
-        // The baseline proves that the hover holds the link when nothing is ignored.
-        assert!(
-            hover_links(vec![], 3)
-                .iter()
-                .any(|hover| hover.contains(serde_link))
-        );
-        let hovers = hover_links(vec!["serde".to_owned()], 2);
-        assert!(!hovers.is_empty());
-        assert!(hovers.iter().all(|hover| !hover.contains(serde_link)));
-    }
-
-    #[test]
     fn minimum_severity_filters_at_read_time_on_cached_answers() {
         let mut cache = Cache::new(TTL_SECS);
         let http = FakeHttp::new()
