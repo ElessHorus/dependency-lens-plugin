@@ -254,6 +254,19 @@ fn parse_word(eco: Ecosystem, word: &str) -> Option<Vec<Constraint>> {
     }
     Some(match (operator, eco) {
         ("" | "=" | "==", _) => vec![constraint("==", version)],
+        ("^", Ecosystem::Pub) => {
+            let mut segments = numeric_prefix(version);
+            // Dart `nextBreaking` raises the minor when the major is 0 (`^0.0.3` stops at `0.1`),
+            // and the major otherwise. A short version is padded so `^0` keeps a minor segment.
+            let kept = if segments.first() == Some(&0) { 2 } else { 1 };
+            if segments.len() < kept {
+                segments.resize(kept, 0);
+            }
+            vec![
+                constraint(">=", version),
+                constraint("<", &upper_bound(&segments, kept)?),
+            ]
+        }
         ("^", _) => {
             let segments = numeric_prefix(version);
             // The first non-zero segment is the one that may not change (`^0.2.3` stops at `0.3`).
@@ -593,6 +606,8 @@ mod tests {
                 "1.2.1",
             ),
             (Ecosystem::Pub, "^0.0.3", &["0.0.4", "0.0.3"][..], "0.0.3"),
+            // Dart reads `^0.0.3` as `>=0.0.3 <0.1.0`, so `0.0.5` is allowed and `0.0.2` is not.
+            (Ecosystem::Pub, "^0.0.3", &["0.0.5", "0.0.2"][..], "0.0.5"),
             (
                 Ecosystem::PyPI,
                 "^1.5",
@@ -605,6 +620,23 @@ mod tests {
             assert_eq!(
                 parsed.lowest_allowed(eco, &versions(list)),
                 Some(expected.to_owned()),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn pub_caret_follows_dart_next_breaking() {
+        let cases = [
+            ("^0.0.3", "0.0.3", "0.1"),
+            ("^0.2.3", "0.2.3", "0.3"),
+            ("^1.2.3", "1.2.3", "2"),
+            ("^0", "0", "0.1"),
+        ];
+        for (text, lower, upper) in cases {
+            assert_eq!(
+                Requirement::parse(Ecosystem::Pub, text),
+                Some(requirement(&[&[(">=", lower), ("<", upper)]])),
                 "{text}"
             );
         }
