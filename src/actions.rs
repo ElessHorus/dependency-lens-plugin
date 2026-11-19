@@ -2,10 +2,10 @@
 //! vulnerabilities, or to the latest registry release.
 
 use crate::cache::Cache;
-use crate::fixes::{line_constraints, plan_fix, render_fix};
+use crate::fixes::{line_constraints, plan_fix, render_fix, shown_affected};
 use crate::is_manifest_in;
-use crate::model::{Affected, Dependency, Ecosystem};
-use crate::osv::{declared_version_for_osv, is_deferred, is_placeholder};
+use crate::model::{Dependency, Ecosystem};
+use crate::osv::{declared_version_for_osv, is_deferred};
 use crate::requirement::{checked_version_of, needs_list, satisfies_all};
 use crate::settings::Settings;
 use crate::text::to_range;
@@ -163,18 +163,7 @@ fn fix_action_for(
         return None;
     }
     let listed = cache.vulnerabilities(eco, &dep.name, current, now)?;
-    let affected: Vec<&[Affected]> = listed
-        .iter()
-        .filter_map(|vulnerability| {
-            let known = if is_placeholder(vulnerability) || is_deferred(vulnerability) {
-                cache.advisory(&vulnerability.id, now)?
-            } else {
-                vulnerability
-            };
-            (known.severity >= settings.minimum_severity)
-                .then(|| cache.affected(&known.id, now).unwrap_or_default())
-        })
-        .collect();
+    let affected = shown_affected(cache, listed, settings.minimum_severity, now);
     // For PyPI and RubyGems, the version text excludes its operator, so the operator and the other
     // constraints sit in the line. The other ecosystems write them inside the version text, and an
     // XML tag such as `<version>` would read as an operator.

@@ -1,6 +1,7 @@
 //! Analysis pipeline: turns parsed dependencies into entries with status and advisories.
 
 use crate::cache::{Cache, FailureKind};
+use crate::fixes::{fix_outside_bounds, shown_affected};
 use crate::http::{Http, is_cancelled_message, is_success};
 use crate::model::{Dependency, Ecosystem, VersionInfo, Vulnerability};
 use crate::osv::{
@@ -848,13 +849,27 @@ fn build_entry(
         None if waits_for_osv || waits_for_list => Status::Pending,
         None => Status::NotChecked,
     };
+    // Only a range can exclude a fix: an exact pin names its version on purpose.
+    let fix_outside = checked_version
+        .as_deref()
+        .zip(answer)
+        .zip(
+            dependency
+                .requirement
+                .as_ref()
+                .filter(|requirement| !requirement.is_exact_pin()),
+        )
+        .and_then(|((version, listed), requirement)| {
+            let affected = shown_affected(cache, listed, settings.minimum_severity, now);
+            fix_outside_bounds(eco, &dependency.name, version, &affected, requirement)
+        });
     Entry {
         dependency,
         status,
         vulnerabilities,
         checked_version,
         outside_latest: None,
-        fix_outside: None,
+        fix_outside,
     }
 }
 
@@ -862,7 +877,7 @@ fn build_entry(
 mod tests {
     use super::*;
     use crate::http::FakeHttp;
-    use crate::model::{AdvisorySeverity, Span};
+    use crate::model::{AdvisorySeverity, Affected, RangeEvent, Span};
     use crate::parsers;
     use std::collections::BTreeSet;
     use std::time::Duration;
@@ -3029,6 +3044,95 @@ mod tests {
             );
             assert_eq!(found.outside_latest.as_deref(), Some(plain), "{name}");
         }
+    }
+
+    /// The cache of a `requests` range at `2.0.0` that holds one advisory of `severity`, fixed in `fixed`.
+    fn cache_with_advisory(severity: AdvisorySeverity, fixed: &str) -> Cache {
+        let mut cache = Cache::new(TTL_SECS);
+        cache.put_vulnerabilities(
+            Ecosystem::PyPI,
+            "requests",
+            "2.0.0",
+            vec![Vulnerability {
+                id: "GHSA-late".to_owned(),
+                severity,
+                summary: "an old flaw".to_owned(),
+                url: None,
+            }],
+            NOW,
+        );
+        cache.put_affected(
+            "GHSA-late",
+            vec![Affected {
+                ecosystem: "PyPI".to_owned(),
+                name: "requests".to_owned(),
+                ranges: vec![vec![
+                    RangeEvent::Introduced("0".to_owned()),
+                    RangeEvent::Fixed(fixed.to_owned()),
+                ]],
+                versions: Vec::new(),
+            }],
+            NOW,
+        );
+        cache
+    }
+
+    /// Analyzes `text` with the `RANGE_BODY` registry answer and the given cache and settings.
+    fn analyze_range_with(cache: &mut Cache, settings: &Settings, text: &str) -> Analysis {
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", REQUESTS_URL, 200, RANGE_BODY);
+        analyze(
+            Ecosystem::PyPI,
+            parsers::python::parse(text),
+            cache,
+            &http,
+            settings,
+            NOW,
+            &mut Budget::new(usize::MAX, None),
+        )
+    }
+
+    #[test]
+    fn an_entry_with_no_allowed_fix_names_the_fix_outside() {
+        let mut cache = cache_with_advisory(AdvisorySeverity::High, "2.31.0");
+        let analysis = analyze_range_with(&mut cache, &Settings::default(), RANGE_TEXT);
+        let requests = entry(&analysis, "requests");
+        assert_eq!(requests.vulnerabilities.len(), 1);
+        assert_eq!(requests.fix_outside.as_deref(), Some("2.31.0"));
+    }
+
+    #[test]
+    fn a_fix_inside_the_bounds_leaves_no_fix_outside() {
+        let mut cache = cache_with_advisory(AdvisorySeverity::High, "2.5.0");
+        let analysis = analyze_range_with(&mut cache, &Settings::default(), RANGE_TEXT);
+        assert_eq!(entry(&analysis, "requests").fix_outside, None);
+    }
+
+    #[test]
+    fn an_exact_pin_has_no_fix_outside() {
+        let mut cache = cache_with_advisory(AdvisorySeverity::High, "2.31.0");
+        let analysis = analyze_range_with(&mut cache, &Settings::default(), "requests==2.0.0\n");
+        assert_eq!(entry(&analysis, "requests").fix_outside, None);
+    }
+
+    #[test]
+    fn an_entry_without_a_loaded_advisory_has_no_fix_outside() {
+        let mut cache = Cache::new(TTL_SECS);
+        cache.put_vulnerabilities(Ecosystem::PyPI, "requests", "2.0.0", Vec::new(), NOW);
+        let analysis = analyze_range_with(&mut cache, &Settings::default(), RANGE_TEXT);
+        assert_eq!(entry(&analysis, "requests").fix_outside, None);
+    }
+
+    #[test]
+    fn an_advisory_below_the_minimum_severity_gives_no_fix_outside() {
+        let mut cache = cache_with_advisory(AdvisorySeverity::High, "2.31.0");
+        let settings = Settings {
+            minimum_severity: AdvisorySeverity::Critical,
+            ..Settings::default()
+        };
+        let analysis = analyze_range_with(&mut cache, &settings, RANGE_TEXT);
+        assert_eq!(entry(&analysis, "requests").fix_outside, None);
     }
 
     #[test]
