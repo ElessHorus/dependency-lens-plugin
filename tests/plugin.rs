@@ -160,6 +160,20 @@ fn opening_manifest_shows_serde_advisory_only() {
 }
 
 #[test]
+fn the_hover_of_a_public_dependency_links_its_package_page() {
+    let host = host_counting_fetches(Rc::new(Cell::new(0)));
+    let mut plugin = DependencyLens::default();
+    open_manifest(&host, &mut plugin);
+
+    let decorations = decorations_of(&host, MANIFEST_PATH);
+    let hover = decorations[0].hover.as_deref().unwrap_or_default();
+    assert!(
+        hover.contains("[Page on crates.io](https://crates.io/crates/serde)"),
+        "{hover}"
+    );
+}
+
+#[test]
 fn advisories_are_shown_when_the_cache_lifetime_is_zero() {
     // `cacheTtlSeconds = 0` keeps nothing between refreshes; a refresh must still show what it fetched.
     let host = host_counting_fetches(Rc::new(Cell::new(0)));

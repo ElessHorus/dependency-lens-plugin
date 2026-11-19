@@ -41,7 +41,7 @@ Examples: `→ 2.31.0 · ⚠ 2 vulnerabilities`, and `→ 2.9.2 (latest 2.34.2)`
 
 ### Hover
 
-The hover shows the package name and the declared version. It adds the latest version when one is newer, and the reason when a check failed. When the requirement excludes the newest release, the hover gives the newest release inside the range and the newest release "outside the bounds". When no version inside the range fixes the advisories of the checked version, the hover names the fix that lies outside the range. When advisories exist, it adds the checked version and one line per advisory. When the checked version is not the text of the lower bound, one more line says so. Each advisory line links to its OSV page when OSV gives a link.
+The hover shows the package name and the declared version. A link to the page of the package on its public registry follows, for example `Page on PyPI`. A package with unusual characters in its name has no link, and a dependency with no hover has no link. The hover then adds the latest version when one is newer, and the reason when a check failed. When the requirement excludes the newest release, the hover gives the newest release inside the range and the newest release "outside the bounds". When no version inside the range fixes the advisories of the checked version, the hover names the fix that lies outside the range. When advisories exist, it adds the checked version and one line per advisory. When the checked version is not the text of the lower bound, one more line says so. Each advisory line links to its OSV page when OSV gives a link.
 
 ### Many advisories
 

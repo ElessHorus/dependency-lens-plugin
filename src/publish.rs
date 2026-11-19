@@ -1,7 +1,7 @@
 //! Turns an analysis into editor decorations and problems for one manifest.
 
 use crate::analysis::{Analysis, Entry, Status};
-use crate::model::{AdvisorySeverity, Vulnerability};
+use crate::model::{AdvisorySeverity, Ecosystem, Vulnerability};
 use crate::osv::{declared_version_for_osv, is_deferred, is_placeholder};
 use crate::text::to_range_in_line;
 use openidea_plugin::{Decoration, Diagnostic, Range, Severity};
@@ -39,7 +39,7 @@ impl Tone {
 }
 
 /// Editor decorations for every entry with a resolvable version range and something to show.
-pub fn decorations(text: &str, analysis: &Analysis) -> Vec<Decoration> {
+pub fn decorations(text: &str, analysis: &Analysis, eco: Ecosystem) -> Vec<Decoration> {
     // The lines are split once, so each entry finds its line without a walk from the text start.
     let lines: Vec<&str> = text.lines().collect();
     analysis
@@ -47,7 +47,7 @@ pub fn decorations(text: &str, analysis: &Analysis) -> Vec<Decoration> {
         .iter()
         .filter_map(|entry| {
             let range = range_of_version(&lines, entry)?;
-            decoration_of(range, entry)
+            decoration_of(range, entry, eco)
         })
         .collect()
 }
@@ -126,7 +126,7 @@ impl<'a> AdvisoryView<'a> {
 }
 
 /// Builds the decoration of one entry, or `None` when it has nothing to show.
-fn decoration_of(range: Range, entry: &Entry) -> Option<Decoration> {
+fn decoration_of(range: Range, entry: &Entry, eco: Ecosystem) -> Option<Decoration> {
     let parts: Vec<(String, Tone)> = status_part(entry)
         .into_iter()
         .chain(vulnerability_part(&AdvisoryView::of(
@@ -143,7 +143,7 @@ fn decoration_of(range: Range, entry: &Entry) -> Option<Decoration> {
     Some(Decoration {
         range,
         style: tone.style().to_owned(),
-        hover: Some(hover_of(entry)),
+        hover: Some(hover_of(entry, eco)),
         after: Some(after),
     })
 }
@@ -184,13 +184,17 @@ fn vulnerability_part(view: &AdvisoryView<'_>) -> Option<(String, Tone)> {
     Some((text, tone))
 }
 
-/// Builds the Markdown hover: one block per fact, joined by blank lines.
-fn hover_of(entry: &Entry) -> String {
+/// Builds the Markdown hover: one block per fact, joined by blank lines. The link to the package page comes second.
+fn hover_of(entry: &Entry, eco: Ecosystem) -> String {
     let version = entry
         .checked_version
         .as_deref()
         .unwrap_or(&entry.dependency.version);
     let mut blocks = vec![format!("**{}** {version}", entry.dependency.name)];
+    // The link follows the title. An unsafe name gives no link, so the hover stays valid Markdown.
+    if let Some(url) = eco.package_page_url(&entry.dependency.name) {
+        blocks.push(format!("[Page on {}]({url})", eco.registry_label()));
+    }
     match (&entry.status, &entry.outside_latest) {
         (Status::Outdated { latest }, None) => blocks.push(format!("Latest version: {latest}")),
         (Status::Outdated { latest }, Some(_)) => {
@@ -429,7 +433,7 @@ mod tests {
                 Some("1.0.0"),
                 Some("✓"),
                 Some("muted"),
-                "**serde** 1.0.0",
+                "**serde** 1.0.0\n\n[Page on crates.io](https://crates.io/crates/serde)",
             ),
             (
                 outdated(),
@@ -437,7 +441,7 @@ mod tests {
                 Some("1.0.0"),
                 Some("→ 2.0.0"),
                 Some("info"),
-                "**serde** 1.0.0\n\nLatest version: 2.0.0",
+                "**serde** 1.0.0\n\n[Page on crates.io](https://crates.io/crates/serde)\n\nLatest version: 2.0.0",
             ),
             (
                 Status::Pending,
@@ -445,7 +449,7 @@ mod tests {
                 Some("1.0.0"),
                 Some("…"),
                 Some("muted"),
-                "**serde** 1.0.0",
+                "**serde** 1.0.0\n\n[Page on crates.io](https://crates.io/crates/serde)",
             ),
             (
                 Status::Unknown("OSV: HTTP 500".to_owned()),
@@ -453,7 +457,7 @@ mod tests {
                 Some("1.0.0"),
                 Some("?"),
                 Some("muted"),
-                "**serde** 1.0.0\n\nCould not check: OSV: HTTP 500",
+                "**serde** 1.0.0\n\n[Page on crates.io](https://crates.io/crates/serde)\n\nCould not check: OSV: HTTP 500",
             ),
             (Status::NotChecked, vec![], Some("1.0.0"), None, None, ""),
             (
@@ -462,7 +466,7 @@ mod tests {
                 Some("1.0.0"),
                 Some("⚠ 1 vulnerability"),
                 Some("error"),
-                "**serde** 1.0.0\n\nChecked version: 1.0.0\n\n- GHSA-high (High) – Summary of GHSA-high",
+                "**serde** 1.0.0\n\n[Page on crates.io](https://crates.io/crates/serde)\n\nChecked version: 1.0.0\n\n- GHSA-high (High) – Summary of GHSA-high",
             ),
             (
                 Status::NotChecked,
@@ -470,7 +474,7 @@ mod tests {
                 Some("1.0.0"),
                 Some("⚠ 1 vulnerability"),
                 Some("warning"),
-                "**serde** 1.0.0\n\nChecked version: 1.0.0\n\n- GHSA-low (Low) – Summary of GHSA-low",
+                "**serde** 1.0.0\n\n[Page on crates.io](https://crates.io/crates/serde)\n\nChecked version: 1.0.0\n\n- GHSA-low (Low) – Summary of GHSA-low",
             ),
             (
                 Status::NotChecked,
@@ -478,7 +482,7 @@ mod tests {
                 Some("1.0.0"),
                 Some("⚠ 1 vulnerability"),
                 Some("error"),
-                "**serde** 1.0.0\n\nChecked version: 1.0.0\n\n- GHSA-critical (Critical) – Summary of GHSA-critical",
+                "**serde** 1.0.0\n\n[Page on crates.io](https://crates.io/crates/serde)\n\nChecked version: 1.0.0\n\n- GHSA-critical (Critical) – Summary of GHSA-critical",
             ),
             (
                 Status::NotChecked,
@@ -486,7 +490,7 @@ mod tests {
                 Some("1.0.0"),
                 Some("⚠ 2 vulnerabilities"),
                 Some("warning"),
-                "**serde** 1.0.0\n\nChecked version: 1.0.0\n\n- GHSA-medium-a (Medium) – Summary of GHSA-medium-a\n- GHSA-medium-b (Medium) – Summary of GHSA-medium-b",
+                "**serde** 1.0.0\n\n[Page on crates.io](https://crates.io/crates/serde)\n\nChecked version: 1.0.0\n\n- GHSA-medium-a (Medium) – Summary of GHSA-medium-a\n- GHSA-medium-b (Medium) – Summary of GHSA-medium-b",
             ),
             (
                 Status::UpToDate,
@@ -494,7 +498,7 @@ mod tests {
                 Some("1.0.0"),
                 Some("✓ · ⚠ 1 vulnerability"),
                 Some("warning"),
-                "**serde** 1.0.0\n\nChecked version: 1.0.0\n\n- [GHSA-medium](https://osv.dev/vulnerability/GHSA-medium) (Medium) – Summary of GHSA-medium",
+                "**serde** 1.0.0\n\n[Page on crates.io](https://crates.io/crates/serde)\n\nChecked version: 1.0.0\n\n- [GHSA-medium](https://osv.dev/vulnerability/GHSA-medium) (Medium) – Summary of GHSA-medium",
             ),
             (
                 outdated(),
@@ -502,7 +506,7 @@ mod tests {
                 Some("1.0.0"),
                 Some("→ 2.0.0 · ⚠ 2 vulnerabilities"),
                 Some("error"),
-                "**serde** 1.0.0\n\nLatest version: 2.0.0\n\nChecked version: 1.0.0\n\n- GHSA-high (High) – Summary of GHSA-high\n- GHSA-high (High) – Summary of GHSA-high",
+                "**serde** 1.0.0\n\n[Page on crates.io](https://crates.io/crates/serde)\n\nLatest version: 2.0.0\n\nChecked version: 1.0.0\n\n- GHSA-high (High) – Summary of GHSA-high\n- GHSA-high (High) – Summary of GHSA-high",
             ),
             (
                 Status::Unknown("OSV: timeout".to_owned()),
@@ -510,12 +514,12 @@ mod tests {
                 None,
                 Some("? · ⚠ 1 vulnerability"),
                 Some("warning"),
-                "**serde** 1.0.0\n\nCould not check: OSV: timeout\n\n- [GHSA-medium](https://osv.dev/vulnerability/GHSA-medium) (Medium) – Summary of GHSA-medium",
+                "**serde** 1.0.0\n\n[Page on crates.io](https://crates.io/crates/serde)\n\nCould not check: OSV: timeout\n\n- [GHSA-medium](https://osv.dev/vulnerability/GHSA-medium) (Medium) – Summary of GHSA-medium",
             ),
         ];
         for (status, vulnerabilities, checked_version, after, style, hover) in cases {
             let analysis = serde_entry(status.clone(), vulnerabilities, checked_version);
-            let decorations = decorations(SERDE_TEXT, &analysis);
+            let decorations = decorations(SERDE_TEXT, &analysis, Ecosystem::Cargo);
             match after {
                 None => assert!(decorations.is_empty(), "{status:?} should not decorate"),
                 Some(after) => {
@@ -558,19 +562,19 @@ mod tests {
                 Some("2.34.2"),
                 "→ 2.9.2 (latest 2.34.2)",
                 "info",
-                "**serde** 1.0.0\n\nLatest version in the bounds: 2.9.2\n\nLatest version: 2.34.2 (outside the bounds)",
+                "**serde** 1.0.0\n\n[Page on crates.io](https://crates.io/crates/serde)\n\nLatest version in the bounds: 2.9.2\n\nLatest version: 2.34.2 (outside the bounds)",
             ),
             (
                 Status::UpToDate,
                 Some("3.0.0"),
                 "✓ (latest 3.0.0)",
                 "muted",
-                "**serde** 1.0.0\n\nLatest version: 3.0.0 (outside the bounds)",
+                "**serde** 1.0.0\n\n[Page on crates.io](https://crates.io/crates/serde)\n\nLatest version: 3.0.0 (outside the bounds)",
             ),
         ];
         for (status, outside_latest, after, style, hover) in cases {
             let analysis = serde_entry_outside(status.clone(), vec![], outside_latest, None);
-            let decorations = decorations(SERDE_TEXT, &analysis);
+            let decorations = decorations(SERDE_TEXT, &analysis, Ecosystem::Cargo);
             assert_eq!(decorations.len(), 1, "{status:?}");
             assert_eq!(decorations[0].after.as_deref(), Some(after), "{status:?}");
             assert_eq!(decorations[0].style, style, "{status:?}");
@@ -586,7 +590,7 @@ mod tests {
             None,
             Some("2.33.0"),
         );
-        let hover = decorations(SERDE_TEXT, &analysis)[0]
+        let hover = decorations(SERDE_TEXT, &analysis, Ecosystem::Cargo)[0]
             .hover
             .clone()
             .expect("a hover");
@@ -631,10 +635,16 @@ mod tests {
             pending: 0,
             lists_waiting: 0,
         };
-        let decorations = decorations("[dependencies]\nserde = \"*\"\n", &analysis);
+        let decorations = decorations(
+            "[dependencies]\nserde = \"*\"\n",
+            &analysis,
+            Ecosystem::Cargo,
+        );
         assert_eq!(
             decorations[0].hover.as_deref(),
-            Some("**serde** *\n\nCould not check: OSV: HTTP 500")
+            Some(
+                "**serde** *\n\n[Page on crates.io](https://crates.io/crates/serde)\n\nCould not check: OSV: HTTP 500"
+            )
         );
     }
 
@@ -652,7 +662,7 @@ mod tests {
             pending: 0,
             lists_waiting: 0,
         };
-        assert!(decorations(SERDE_TEXT, &analysis).is_empty());
+        assert!(decorations(SERDE_TEXT, &analysis, Ecosystem::Cargo).is_empty());
     }
 
     #[test]
@@ -671,7 +681,7 @@ mod tests {
             pending: 0,
             lists_waiting: 0,
         };
-        let decorations = decorations(text, &analysis);
+        let decorations = decorations(text, &analysis, Ecosystem::Cargo);
         let document = Document {
             version: 1,
             text: text.to_owned(),
@@ -884,7 +894,7 @@ mod tests {
             .extend((0..5).map(|number| deferred_vulnerability(&format!("GHSA-d{number}"))));
         let analysis = serde_entry(Status::NotChecked, vulnerabilities, Some("1.0.0"));
 
-        let decoration = &decorations(SERDE_TEXT, &analysis)[0];
+        let decoration = &decorations(SERDE_TEXT, &analysis, Ecosystem::Cargo)[0];
         assert_eq!(decoration.after.as_deref(), Some("⚠ 7 vulnerabilities"));
         assert_eq!(decoration.style, "error");
         let hover = decoration.hover.as_deref().unwrap();
@@ -912,7 +922,7 @@ mod tests {
         ];
         let analysis = serde_entry(Status::NotChecked, vulnerabilities, Some("1.0.0"));
 
-        let decoration = &decorations(SERDE_TEXT, &analysis)[0];
+        let decoration = &decorations(SERDE_TEXT, &analysis, Ecosystem::Cargo)[0];
         assert_eq!(decoration.after.as_deref(), Some("⚠ 2 vulnerabilities"));
         assert_eq!(decoration.style, "warning");
 
@@ -954,7 +964,10 @@ mod tests {
             vulnerability("GHSA-low", AdvisorySeverity::Low, None),
         ];
         let analysis = serde_entry(Status::NotChecked, vulnerabilities, Some("1.0.0"));
-        let hover = decorations(SERDE_TEXT, &analysis)[0].hover.clone().unwrap();
+        let hover = decorations(SERDE_TEXT, &analysis, Ecosystem::Cargo)[0]
+            .hover
+            .clone()
+            .unwrap();
         assert!(hover.contains("GHSA-wait (severity unknown)"), "{hover}");
         let problem = &diagnostics(SERDE_TEXT, &analysis, true)[0];
         // The only known severity is Low, so the problem is informational.
@@ -984,10 +997,51 @@ mod tests {
         let high = vulnerability("GHSA-high", AdvisorySeverity::High, None);
         let range = serde_entry(Status::UpToDate, vec![high.clone()], Some("2.0.0"));
         assert_eq!(
-            hover_of(&range.entries[0]),
-            "**serde** 2.0.0\n\nChecked version: 2.0.0\n\nLowest version that the requirement allows (the manifest writes 1.0.0).\n\n- GHSA-high (High) – Summary of GHSA-high"
+            hover_of(&range.entries[0], Ecosystem::Cargo),
+            "**serde** 2.0.0\n\n[Page on crates.io](https://crates.io/crates/serde)\n\nChecked version: 2.0.0\n\nLowest version that the requirement allows (the manifest writes 1.0.0).\n\n- GHSA-high (High) – Summary of GHSA-high"
         );
         let same = serde_entry(Status::UpToDate, vec![high], Some("1.0.0"));
-        assert!(!hover_of(&same.entries[0]).contains("Lowest version"));
+        assert!(!hover_of(&same.entries[0], Ecosystem::Cargo).contains("Lowest version"));
+    }
+
+    /// An entry named `name` that is up to date, with no advisory.
+    fn quiet_entry(name: &str) -> Entry {
+        Entry {
+            dependency: dependency(name, "1.0.0", span(1, 9, 5)),
+            status: Status::UpToDate,
+            vulnerabilities: vec![],
+            checked_version: Some("1.0.0".to_owned()),
+            outside_latest: None,
+            fix_outside: None,
+        }
+    }
+
+    #[test]
+    fn the_hover_links_the_package_page_under_the_title() {
+        assert_eq!(
+            hover_of(&quiet_entry("serde"), Ecosystem::Cargo),
+            "**serde** 1.0.0\n\n[Page on crates.io](https://crates.io/crates/serde)"
+        );
+    }
+
+    #[test]
+    fn the_hover_has_no_link_for_an_unsafe_name() {
+        assert_eq!(
+            hover_of(&quiet_entry("bad)name"), Ecosystem::Cargo),
+            "**bad)name** 1.0.0"
+        );
+    }
+
+    #[test]
+    fn the_link_follows_the_ecosystem_of_the_manifest() {
+        let entry = quiet_entry("requests");
+        assert!(
+            hover_of(&entry, Ecosystem::PyPI)
+                .ends_with("[Page on PyPI](https://pypi.org/project/requests)")
+        );
+        assert!(
+            hover_of(&entry, Ecosystem::Cargo)
+                .ends_with("[Page on crates.io](https://crates.io/crates/requests)")
+        );
     }
 }
