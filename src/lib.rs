@@ -880,6 +880,8 @@ impl Providers for DependencyLens {
 impl HoverProvider for DependencyLens {
     /// Links the package page of the dependency under the cursor. It reads no cache and makes no request.
     fn hover(&mut self, doc: &Document, at: Position) -> Option<Hover> {
+        // The provider runs for every file, so the cheap file-name test comes before the host call.
+        Ecosystem::detect(&doc.path)?;
         hover::package_link_hover(
             &self.settings,
             &doc.path,

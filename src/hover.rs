@@ -27,9 +27,10 @@ pub fn package_link_hover(
         return None;
     }
     let dependencies = eco.parse(doc_text);
-    let dependency = dependencies
-        .iter()
-        .find(|dependency| is_under_cursor(doc_text, dependency, at))?;
+    // The hover names the span under the cursor: the editor anchors the tooltip on that range.
+    let (dependency, hovered_range) = dependencies.iter().find_map(|dependency| {
+        range_under_cursor(doc_text, dependency, at).map(|range| (dependency, range))
+    })?;
     // The ignore set is built only for a match, so a hover over plain text allocates nothing.
     if settings
         .ignored_packages(eco)
@@ -38,17 +39,18 @@ pub fn package_link_hover(
         return None;
     }
     let url = eco.package_page_url(&dependency.name)?;
-    let name_range = range_of_span(doc_text, dependency.name_span)?;
-    Some(Hover::new(format!("[Page on {}]({url})", eco.registry_label())).range(name_range))
+    Some(Hover::new(format!("[Page on {}]({url})", eco.registry_label())).range(hovered_range))
 }
 
-/// Whether `at` lies on the name or on the version of `dependency`. The end of a span is exclusive.
-fn is_under_cursor(doc_text: &str, dependency: &Dependency, at: Position) -> bool {
+/// The range of the name or of the version of `dependency` that holds `at`, if any.
+///
+/// The end of a span is exclusive.
+fn range_under_cursor(doc_text: &str, dependency: &Dependency, at: Position) -> Option<Range> {
     [dependency.name_span, dependency.version_span]
         .into_iter()
         .filter(|span| span.line == at.line)
         .filter_map(|span| range_of_span(doc_text, span))
-        .any(|range| range.start.character <= at.character && at.character < range.end.character)
+        .find(|range| range.start.character <= at.character && at.character < range.end.character)
 }
 
 /// The UTF-16 range of `span`, read from its own line only (no walk when the line is far away).
@@ -111,19 +113,22 @@ mod tests {
     }
 
     #[test]
-    fn the_hover_names_the_range_of_the_package_name() {
-        let hover = package_link_hover(
-            &Settings::default(),
-            "/p/Cargo.toml",
-            None,
-            CARGO,
-            Position::new(5, 10),
-        )
-        .expect("a hover");
-        assert_eq!(
-            hover.range,
-            Some(Range::new(Position::new(5, 0), Position::new(5, 5)))
-        );
+    fn the_hover_names_the_span_under_the_cursor() {
+        // The editor anchors the tooltip on this range. A range away from the cursor would close
+        // the tooltip on the next mouse move, so the link could not be clicked.
+        let name = Range::new(Position::new(5, 0), Position::new(5, 5));
+        let version = Range::new(Position::new(5, 9), Position::new(5, 14));
+        for (character, expected) in [(0, name), (4, name), (9, version), (13, version)] {
+            let hover = package_link_hover(
+                &Settings::default(),
+                "/p/Cargo.toml",
+                None,
+                CARGO,
+                Position::new(5, character),
+            )
+            .expect("a hover");
+            assert_eq!(hover.range, Some(expected), "column {character}");
+        }
     }
 
     #[test]
