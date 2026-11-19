@@ -375,7 +375,7 @@ impl DependencyLens {
         let run_started_at = now_secs();
         self.load_block(eco, &HostStore);
         let old_data = self.show_old_data_first(eco, path, text, deps, run_started_at);
-        let mut previous_pending = None;
+        let mut previous_progress = None;
         loop {
             // The dependency vector is cloned per chunk; the parse is not repeated.
             // Each chunk gets its own deadline. The first registry lookup of a chunk runs unless the deadline has passed,
@@ -400,15 +400,16 @@ impl DependencyLens {
                 // A newer call supersedes this one and refreshes the manifest. Publishing the
                 // unfinished analysis would replace good results with `…` or `?`. After the first
                 // chunk, what the editor shows is already a published result, so it stays as it is.
-                return previous_pending.is_some().then_some(0);
+                return previous_progress.is_some().then_some(0);
             }
             let pending = analysis.pending;
+            let progress = Progress::of(&analysis);
             let cancelled = task.is_cancelled();
             // Whether the loop ends here is known before the publication: the last one must not
             // present old data as current for an entry that this run never re-checked.
             let is_last_chunk = !should_continue(
-                pending,
-                previous_pending,
+                progress,
+                previous_progress,
                 cancelled,
                 Instant::now(),
                 limits.deadline,
@@ -434,7 +435,7 @@ impl DependencyLens {
             if is_last_chunk {
                 return Some(analysis.unloaded_advisory_count());
             }
-            previous_pending = Some(pending);
+            previous_progress = Some(progress);
         }
     }
 }
@@ -447,21 +448,53 @@ fn deadline_after(time_box: Duration) -> Instant {
         .unwrap_or(now)
 }
 
-/// Whether the chunk loop runs one more chunk after a chunk that left `pending` entries.
+/// The budget of the load action: every advisory detail, and one registry lookup.
 ///
-/// `previous_pending` is the pending count of the chunk before, or `None` after the first chunk.
-/// A chunk that does not lower the pending count stops the loop, because the next chunk would repeat it.
-fn should_continue(
+/// The action works on one package name, so one list lookup is the most it needs: a range whose
+/// list is not fresh would otherwise stay pending, and the next refresh would switch its checked
+/// version in silence. Duplicates of the name share the lookup. The `ignore` filter and the
+/// private-source rules run first in `analyze`, so a private package still costs no request.
+fn load_action_budget(deadline: Instant) -> Budget {
+    Budget::new(1, Some(deadline)).with_detail_limit(usize::MAX)
+}
+
+/// What one chunk of the loop achieved, to tell whether the next chunk can do more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Progress {
+    /// Entries whose check is still running.
     pending: usize,
-    previous_pending: Option<usize>,
+    /// Entries whose checked version still waits for a registry list.
+    lists_waiting: usize,
+}
+
+impl Progress {
+    fn of(analysis: &Analysis) -> Self {
+        Self {
+            pending: analysis.pending,
+            lists_waiting: analysis.lists_waiting,
+        }
+    }
+}
+
+/// Whether the chunk loop runs one more chunk after a chunk that left `progress.pending` entries.
+///
+/// `previous` is the progress of the chunk before, or `None` after the first chunk. A chunk that
+/// lowers neither counter stops the loop, because the next chunk would repeat it. A chunk that
+/// only resolves a registry list leaves the pending count as it was, but the next chunk can then
+/// send the OSV query of that range, so it counts as progress too.
+fn should_continue(
+    progress: Progress,
+    previous: Option<Progress>,
     cancelled: bool,
     now: Instant,
     deadline: Instant,
 ) -> bool {
-    pending > 0
+    progress.pending > 0
         && !cancelled
         && now < deadline
-        && previous_pending.is_none_or(|previous| pending < previous)
+        && previous.is_none_or(|previous| {
+            progress.pending < previous.pending || progress.lists_waiting < previous.lists_waiting
+        })
 }
 
 /// Publishes the decorations and problems of one analysis of the manifest `text` at `path`.
@@ -543,6 +576,7 @@ fn fill_pending_from_old(
     Analysis {
         entries,
         pending: analysis.pending,
+        lists_waiting: analysis.lists_waiting,
     }
 }
 
@@ -786,7 +820,7 @@ impl DependencyLens {
         // and the chunk limit stops the fetches before the budget ends.
         let task = host::begin_task(TASK_TITLE, true);
         let deadline = Instant::now() + LOAD_ACTION_LIMIT;
-        let mut budget = Budget::new(0, Some(deadline)).with_detail_limit(usize::MAX);
+        let mut budget = load_action_budget(deadline);
         analyze(
             eco,
             deps,
@@ -851,13 +885,32 @@ mod loop_tests {
         now + Duration::from_secs(60)
     }
 
+    /// Progress of a chunk that waits for no registry list.
+    fn progress(pending: usize) -> Progress {
+        progress_with_lists(pending, 0)
+    }
+
+    /// Progress of a chunk that still waits for `lists_waiting` registry lists.
+    fn progress_with_lists(pending: usize, lists_waiting: usize) -> Progress {
+        Progress {
+            pending,
+            lists_waiting,
+        }
+    }
+
     #[test]
     fn continues_while_pending_and_progressing_before_the_deadline() {
         let now = Instant::now();
-        assert!(should_continue(280, None, false, now, open_deadline(now)));
         assert!(should_continue(
-            260,
-            Some(280),
+            progress(280),
+            None,
+            false,
+            now,
+            open_deadline(now)
+        ));
+        assert!(should_continue(
+            progress(260),
+            Some(progress(280)),
             false,
             now,
             open_deadline(now)
@@ -868,21 +921,27 @@ mod loop_tests {
     fn stops_when_nothing_is_pending() {
         let now = Instant::now();
         assert!(!should_continue(
-            0,
-            Some(20),
+            progress(0),
+            Some(progress(20)),
             false,
             now,
             open_deadline(now)
         ));
-        assert!(!should_continue(0, None, false, now, open_deadline(now)));
+        assert!(!should_continue(
+            progress(0),
+            None,
+            false,
+            now,
+            open_deadline(now)
+        ));
     }
 
     #[test]
     fn stops_when_cancelled() {
         let now = Instant::now();
         assert!(!should_continue(
-            260,
-            Some(280),
+            progress(260),
+            Some(progress(280)),
             true,
             now,
             open_deadline(now)
@@ -892,26 +951,49 @@ mod loop_tests {
     #[test]
     fn stops_at_or_after_the_deadline() {
         let now = Instant::now();
-        assert!(!should_continue(260, Some(280), false, now, now));
+        assert!(!should_continue(
+            progress(260),
+            Some(progress(280)),
+            false,
+            now,
+            now
+        ));
     }
 
     #[test]
-    fn stops_when_the_pending_count_does_not_decrease() {
+    fn stops_when_neither_counter_decreases() {
         let now = Instant::now();
-        assert!(!should_continue(
-            280,
-            Some(280),
+        for (current, previous) in [
+            (progress(280), progress(280)),
+            (progress(281), progress(280)),
+            (progress_with_lists(2, 1), progress_with_lists(2, 1)),
+            (progress_with_lists(2, 2), progress_with_lists(2, 1)),
+        ] {
+            assert!(
+                !should_continue(current, Some(previous), false, now, open_deadline(now)),
+                "{current:?} after {previous:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn continues_when_a_list_resolved_and_the_pending_count_did_not_fall() {
+        let now = Instant::now();
+        assert!(should_continue(
+            progress_with_lists(2, 0),
+            Some(progress_with_lists(2, 1)),
             false,
             now,
             open_deadline(now)
         ));
-        assert!(!should_continue(
-            281,
-            Some(280),
-            false,
-            now,
-            open_deadline(now)
-        ));
+    }
+
+    #[test]
+    fn the_load_action_budget_allows_exactly_one_lookup() {
+        let mut budget = load_action_budget(Instant::now() + Duration::from_secs(30));
+        assert!(budget.take());
+        assert!(!budget.take());
+        assert_eq!(budget.details_per_query(), usize::MAX);
     }
 
     #[test]
@@ -967,6 +1049,7 @@ mod disk_cache_tests {
                 entry_with("c==1.0\n", Status::Pending),
             ],
             pending: 2,
+            lists_waiting: 0,
         };
         let old = Analysis {
             entries: vec![
@@ -975,6 +1058,7 @@ mod disk_cache_tests {
                 entry_with("c==1.0\n", Status::Pending),
             ],
             pending: 1,
+            lists_waiting: 0,
         };
 
         let shown = fill_pending_from_old(&analysis, &old, |_| false);
@@ -1013,10 +1097,12 @@ mod disk_cache_tests {
         let analysis = Analysis {
             entries: vec![waiting.clone()],
             pending: 1,
+            lists_waiting: 0,
         };
         let old = Analysis {
             entries: vec![entry_with("a==1.0\n", outdated.clone())],
             pending: 0,
+            lists_waiting: 0,
         };
 
         // OSV has answered for this entry: its advisories are the news, only its registry status waits.
@@ -1166,5 +1252,157 @@ mod path_case_tests {
             "C:/Work/vendor/App/Cargo.toml",
             Some("c:\\work\\vendor\\app")
         ));
+    }
+}
+
+#[cfg(test)]
+mod load_action_tests {
+    use super::*;
+    use crate::osv::deferred;
+    use openidea_plugin::mock::MockHost;
+    use openidea_plugin::{HttpResponse, Position};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    const MANIFEST_PATH: &str = "/p/requirements.txt";
+    const PYPI_URL_PREFIX: &str = "https://pypi.org/pypi/requests/";
+    /// The 2.x line starts at 2.0.0, so `>1.12,<2.10` allows 2.0.0 and 2.9.2 only.
+    const PYPI_BODY: &str = r#"{"info":{"version":"2.34.2"},"releases":{"1.2.3":[{"yanked":false}],"2.0.0":[{"yanked":false}],"2.9.2":[{"yanked":false}],"2.34.2":[{"yanked":false}]}}"#;
+
+    /// The URL and the body of each request that the host received, in order.
+    type RequestLog = Rc<RefCell<Vec<(String, String)>>>;
+
+    /// The number of advisories that OSV names for the checked version.
+    const ADVISORY_COUNT: usize = 12;
+
+    /// A batch answer with `count` advisories for its one query.
+    fn batch_answer_of(count: usize) -> String {
+        let vulns: Vec<String> = (0..count)
+            .map(|number| format!(r#"{{"id":"GHSA-{number:04}"}}"#))
+            .collect();
+        format!(r#"{{"results":[{{"vulns":[{}]}}]}}"#, vulns.join(","))
+    }
+
+    /// A host that answers PyPI and OSV, and records the URL and the body of each request.
+    fn recording_host(manifest: &str) -> (MockHost, RequestLog) {
+        let host = MockHost::install().with_capabilities(&[
+            "events",
+            "project.read",
+            "editor.read",
+            "net:api.osv.dev",
+            "net:pypi.org",
+        ]);
+        host.set_project_root(Some("/p"));
+        host.add_file("requirements.txt", manifest);
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let log = requests.clone();
+        host.on_fetch(move |request| {
+            let body =
+                String::from_utf8_lossy(request.body.as_deref().unwrap_or_default()).into_owned();
+            log.borrow_mut().push((request.url.clone(), body));
+            let answer = if request.url.starts_with("https://pypi.org/pypi/") {
+                PYPI_BODY
+            } else if request.url.ends_with("/v1/querybatch") {
+                // Twelve advisories: two more than the ten whose details load by default.
+                &batch_answer_of(ADVISORY_COUNT)
+            } else if request.url.contains("/v1/vulns/") {
+                r#"{"id":"GHSA-x","summary":"Test advisory","database_specific":{"severity":"HIGH"}}"#
+            } else {
+                return Err(Error::Failed(format!("unexpected request {}", request.url)));
+            };
+            Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: answer.as_bytes().to_vec(),
+            })
+        });
+        (host, requests)
+    }
+
+    fn manifest_document(text: &str) -> Document {
+        Document {
+            path: MANIFEST_PATH.to_owned(),
+            language: "pip-requirements".to_owned(),
+            version: 1,
+            text: text.to_owned(),
+        }
+    }
+
+    /// A plugin whose cache holds one deferred advisory for the bound text `1.12` of `requests`,
+    /// as after a registry failure that has expired: advisories without a fresh list.
+    fn plugin_with_bound_text_advisory() -> DependencyLens {
+        let mut plugin = DependencyLens::default();
+        plugin.cache.put_vulnerabilities(
+            Ecosystem::PyPI,
+            "requests",
+            "1.12",
+            vec![deferred("GHSA-bound-text")],
+            now_secs(),
+        );
+        plugin
+    }
+
+    fn load_action(package: &str) -> CodeAction {
+        CodeAction {
+            title: "Load".to_owned(),
+            kind: Some("quickfix".to_owned()),
+            preferred: false,
+            edits: Vec::new(),
+            data: Some(format!("{}{package}", actions::LOAD_ACTION_PREFIX)),
+        }
+    }
+
+    #[test]
+    fn the_load_action_reads_the_missing_list_and_checks_the_lowest_allowed_version() {
+        let text = "requests>1.12,<2.10\n";
+        let (_host, requests) = recording_host(text);
+        let document = manifest_document(text);
+        let mut plugin = plugin_with_bound_text_advisory();
+
+        // The cache holds advisories for the bound text and no list, so the action is offered.
+        let cursor = Range::new(Position::new(0, 12), Position::new(0, 12));
+        let actions = Providers::code_actions(&mut plugin, &document, cursor);
+        let load = actions
+            .iter()
+            .find(|action| action.title.starts_with("Load "))
+            .expect("a load action");
+        // Listing the actions reads the cache and sends nothing.
+        assert!(requests.borrow().is_empty());
+
+        Providers::resolve_code_action(&mut plugin, &document, load.clone()).unwrap();
+
+        let sent = requests.borrow();
+        // One list lookup, and the details of every advisory (not only ten) of the checked version.
+        let detail_lookups = sent
+            .iter()
+            .filter(|(url, _)| url.contains("/v1/vulns/"))
+            .count();
+        assert_eq!(detail_lookups, ADVISORY_COUNT, "{sent:?}");
+        let list_lookups = sent
+            .iter()
+            .filter(|(url, _)| url.starts_with(PYPI_URL_PREFIX))
+            .count();
+        assert_eq!(list_lookups, 1, "{sent:?}");
+        assert!(
+            sent.iter()
+                .any(|(url, body)| url.ends_with("/v1/querybatch") && body.contains("\"2.0.0\"")),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn the_load_action_sends_nothing_for_a_package_from_a_private_index() {
+        let text = "--index-url https://pypi.example.internal/simple\nrequests>1.12,<2.10\n";
+        let (_host, requests) = recording_host(text);
+        let mut plugin = plugin_with_bound_text_advisory();
+
+        Providers::resolve_code_action(
+            &mut plugin,
+            &manifest_document(text),
+            load_action("requests"),
+        )
+        .unwrap();
+
+        assert!(requests.borrow().is_empty(), "{:?}", requests.borrow());
     }
 }

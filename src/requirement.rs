@@ -6,7 +6,7 @@ use crate::registries::dotted::{DottedVersion, PubVersion, is_dev_branch, segmen
 use crate::registries::gem_version::GemVersion;
 use crate::registries::maven_version::MavenVersion;
 use crate::registries::pep440::Pep440;
-use crate::update::UpdateVersion;
+use crate::update::{ExclusiveBound, UpdateVersion};
 
 /// One constraint of a requirement, such as `<` and `1` in `flask>=0.12.2,<1`.
 ///
@@ -75,34 +75,37 @@ impl Requirement {
     /// A pre-release counts only when a constraint of the requirement names one.
     pub fn lowest_allowed(&self, eco: Ecosystem, versions: &[String]) -> Option<String> {
         match eco {
-            Ecosystem::PyPI => self.lowest_allowed_of::<Pep440>(eco, versions),
-            Ecosystem::RubyGems => self.lowest_allowed_of::<GemVersion>(eco, versions),
-            Ecosystem::Pub => self.lowest_allowed_of::<PubVersion>(eco, versions),
-            Ecosystem::Maven => self.lowest_allowed_of::<MavenVersion>(eco, versions),
-            _ => self.lowest_allowed_of::<DottedVersion>(eco, versions),
+            Ecosystem::PyPI => self.lowest_allowed_of::<Pep440>(versions),
+            Ecosystem::RubyGems => self.lowest_allowed_of::<GemVersion>(versions),
+            Ecosystem::Pub => self.lowest_allowed_of::<PubVersion>(versions),
+            Ecosystem::Maven => self.lowest_allowed_of::<MavenVersion>(versions),
+            _ => self.lowest_allowed_of::<DottedVersion>(versions),
         }
     }
 
-    fn lowest_allowed_of<V: UpdateVersion>(
-        &self,
-        eco: Ecosystem,
-        versions: &[String],
-    ) -> Option<String> {
-        let names_pre_release = self
+    /// One pass: each bound is parsed once for the whole list, and each candidate once.
+    fn lowest_allowed_of<V: UpdateVersion>(&self, versions: &[String]) -> Option<String> {
+        let alternatives: Vec<Vec<TypedConstraint<'_, V>>> = self
             .alternatives
             .iter()
+            .map(|constraints| typed_constraints(constraints))
+            .collect();
+        let names_pre_release = alternatives
+            .iter()
             .flatten()
-            .filter_map(|constraint| V::parse_version(&constraint.version))
+            .filter_map(|constraint| constraint.bound.as_ref())
             .any(|bound| bound.is_prerelease_version());
         // The list is newest first, so the reverse scan meets the oldest version first.
         versions
             .iter()
             .rev()
             .find(|text| {
-                (names_pre_release
-                    || V::parse_version(text)
-                        .is_some_and(|version| !version.is_prerelease_version()))
-                    && self.allows(eco, text)
+                V::parse_version(text).is_some_and(|version| {
+                    (names_pre_release || !version.is_prerelease_version())
+                        && alternatives
+                            .iter()
+                            .any(|constraints| satisfies_typed(&version, constraints))
+                })
             })
             .cloned()
     }
@@ -131,6 +134,10 @@ fn parse_nuget_range(text: &str) -> Option<Requirement> {
         return is_plain(text)
             .then(|| Requirement::from_constraints(vec![constraint(">=", text)]))
             .flatten();
+    }
+    // An interval that is still being typed has no closing bracket: its last character would be cut.
+    if !matches!(closing, ']' | ')') {
+        return None;
     }
     // Both brackets are ASCII, so the slice falls on character boundaries.
     let inner = text.get(1..text.len().checked_sub(1)?)?;
@@ -254,6 +261,19 @@ fn parse_word(eco: Ecosystem, word: &str) -> Option<Vec<Constraint>> {
     }
     Some(match (operator, eco) {
         ("" | "=" | "==", _) => vec![constraint("==", version)],
+        ("^", Ecosystem::Pub) => {
+            let mut segments = numeric_prefix(version);
+            // Dart `nextBreaking` raises the minor when the major is 0 (`^0.0.3` stops at `0.1`),
+            // and the major otherwise. A short version is padded so `^0` keeps a minor segment.
+            let kept = if segments.first() == Some(&0) { 2 } else { 1 };
+            if segments.len() < kept {
+                segments.resize(kept, 0);
+            }
+            vec![
+                constraint(">=", version),
+                constraint("<", &upper_bound(&segments, kept)?),
+            ]
+        }
         ("^", _) => {
             let segments = numeric_prefix(version);
             // The first non-zero segment is the one that may not change (`^0.2.3` stops at `0.3`).
@@ -332,17 +352,40 @@ pub fn satisfies_all(eco: Ecosystem, target: &str, constraints: &[Constraint]) -
 }
 
 fn satisfies_all_of<V: UpdateVersion>(target: &str, constraints: &[Constraint]) -> bool {
-    let Some(target) = V::parse_version(target) else {
-        return false;
-    };
+    V::parse_version(target)
+        .is_some_and(|target| satisfies_typed(&target, &typed_constraints(constraints)))
+}
+
+/// A constraint whose bound is parsed once. A bound that is not a version stays `None`, and
+/// refuses every target, as an unreadable constraint must.
+struct TypedConstraint<'a, V> {
+    operator: &'a str,
+    bound: Option<V>,
+}
+
+/// Parses the bound of each constraint, so that a scan over many candidates parses it only once.
+fn typed_constraints<V: UpdateVersion>(constraints: &[Constraint]) -> Vec<TypedConstraint<'_, V>> {
+    constraints
+        .iter()
+        .map(|constraint| TypedConstraint {
+            operator: constraint.operator.as_str(),
+            bound: V::parse_version(&constraint.version),
+        })
+        .collect()
+}
+
+/// Returns `true` when `target` satisfies every constraint.
+fn satisfies_typed<V: UpdateVersion>(target: &V, constraints: &[TypedConstraint<'_, V>]) -> bool {
     constraints.iter().all(|constraint| {
-        let Some(bound) = V::parse_version(&constraint.version) else {
+        let Some(bound) = &constraint.bound else {
             return false;
         };
-        match constraint.operator.as_str() {
-            "<" => target < bound,
+        match constraint.operator {
+            "<" => target < bound && !target.is_excluded_by_bound(ExclusiveBound::LessThan, bound),
             "<=" => target <= bound,
-            ">" => target > bound,
+            ">" => {
+                target > bound && !target.is_excluded_by_bound(ExclusiveBound::GreaterThan, bound)
+            }
             ">=" => target >= bound,
             "==" | "===" => target == bound,
             "!=" => target != bound,
@@ -593,6 +636,8 @@ mod tests {
                 "1.2.1",
             ),
             (Ecosystem::Pub, "^0.0.3", &["0.0.4", "0.0.3"][..], "0.0.3"),
+            // Dart reads `^0.0.3` as `>=0.0.3 <0.1.0`, so `0.0.5` is allowed and `0.0.2` is not.
+            (Ecosystem::Pub, "^0.0.3", &["0.0.5", "0.0.2"][..], "0.0.5"),
             (
                 Ecosystem::PyPI,
                 "^1.5",
@@ -611,8 +656,51 @@ mod tests {
     }
 
     #[test]
+    fn pep440_exclusive_bounds_follow_the_standard() {
+        let cases = [
+            (">", "1.0", "1.0.post1", false),
+            (">", "1.0", "1.1", true),
+            (">", "1.0.post1", "1.0.post2", true),
+            ("<", "2.0", "2.0rc1", false),
+            ("<", "2.0", "2.0.dev1", false),
+            ("<", "2.0", "1.9", true),
+            ("<", "2.0rc2", "2.0rc1", true),
+        ];
+        for (operator, bound, target, expected) in cases {
+            let allowed = requirement(&[&[(operator, bound)]]);
+            assert_eq!(
+                allowed.allows(Ecosystem::PyPI, target),
+                expected,
+                "{target} against {operator}{bound}"
+            );
+        }
+        let after_one = requirement(&[&[(">", "1.0")]]);
+        assert_eq!(
+            after_one.lowest_allowed(Ecosystem::PyPI, &versions(&["1.1", "1.0.post1", "1.0"])),
+            Some("1.1".to_owned())
+        );
+    }
+
+    #[test]
+    fn pub_caret_follows_dart_next_breaking() {
+        let cases = [
+            ("^0.0.3", "0.0.3", "0.1"),
+            ("^0.2.3", "0.2.3", "0.3"),
+            ("^1.2.3", "1.2.3", "2"),
+            ("^0", "0", "0.1"),
+        ];
+        for (text, lower, upper) in cases {
+            assert_eq!(
+                Requirement::parse(Ecosystem::Pub, text),
+                Some(requirement(&[&[(">=", lower), ("<", upper)]])),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn nuget_text_reads_minimums_and_intervals() {
-        let cases: [(&str, Option<Requirement>); 9] = [
+        let cases: [(&str, Option<Requirement>); 13] = [
             ("1.0", Some(requirement(&[&[(">=", "1.0")]]))),
             ("[1.0]", Some(requirement(&[&[("==", "1.0")]]))),
             (
@@ -622,6 +710,11 @@ mod tests {
             ("(1.0,)", Some(requirement(&[&[(">", "1.0")]]))),
             ("(,2.0]", Some(requirement(&[&[("<=", "2.0")]]))),
             ("(,)", None),
+            // An interval that is still being typed has no closing bracket.
+            ("[1.0,2.0", None),
+            ("[1.0,2.0x", None),
+            ("(1.0,2.0", None),
+            ("[1.0", None),
             ("1.*", None),
             ("$(Ver)", None),
             ("", None),

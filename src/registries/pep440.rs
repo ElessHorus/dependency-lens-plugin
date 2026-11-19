@@ -58,6 +58,28 @@ impl Pep440 {
         self.pre.is_some() || self.dev.is_some()
     }
 
+    /// Whether `self` is a post-release of `bound`: the same version once the post part is removed.
+    ///
+    /// A bound that is itself a post-release has no post-releases of its own in this sense, so
+    /// `1.0.post2` is not a post-release of `1.0.post1`. Dev and local parts are ignored.
+    pub fn is_post_release_of(&self, bound: &Pep440) -> bool {
+        self.post.is_some()
+            && bound.post.is_none()
+            && self.epoch == bound.epoch
+            && cmp_release(&self.release, &bound.release) == Ordering::Equal
+            && self.pre == bound.pre
+    }
+
+    /// Whether `self` is a pre-release or dev release of the final release `bound` names.
+    ///
+    /// Only the epoch and the release segments are compared: `2.0rc1` and `2.0.dev1` are
+    /// pre-releases of `2.0`.
+    pub fn is_pre_release_of(&self, bound: &Pep440) -> bool {
+        self.is_prerelease()
+            && self.epoch == bound.epoch
+            && cmp_release(&self.release, &bound.release) == Ordering::Equal
+    }
+
     /// Returns the release segments as written, so `1.2.3` gives `[1, 2, 3]`.
     pub fn release(&self) -> &[u64] {
         &self.release
@@ -240,6 +262,46 @@ mod tests {
     /// Parses a version that the test expects to be valid.
     fn version(text: &str) -> Pep440 {
         Pep440::parse(text).expect("test version must be valid PEP 440")
+    }
+
+    #[test]
+    fn a_post_release_is_found_by_its_base_version() {
+        let cases = [
+            ("1.0.post1", "1.0", true),
+            ("1.0.0.post1", "1.0", true),
+            ("1.0rc1.post1", "1.0rc1", true),
+            ("1.0.post1", "1.0.post1", false),
+            ("1.0.post2", "1.0.post1", false),
+            ("1.0", "1.0", false),
+            ("1.1.post1", "1.0", false),
+            ("1.0rc1.post1", "1.0", false),
+        ];
+        for (target, bound, expected) in cases {
+            assert_eq!(
+                version(target).is_post_release_of(&version(bound)),
+                expected,
+                "{target} of {bound}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pre_release_is_found_by_its_final_release() {
+        let cases = [
+            ("2.0rc1", "2.0", true),
+            ("2.0.dev1", "2.0", true),
+            ("2.0.0a1", "2.0", true),
+            ("1.9rc1", "2.0", false),
+            ("2.0", "2.0", false),
+            ("2.1rc1", "2.0", false),
+        ];
+        for (target, bound, expected) in cases {
+            assert_eq!(
+                version(target).is_pre_release_of(&version(bound)),
+                expected,
+                "{target} of {bound}"
+            );
+        }
     }
 
     #[test]

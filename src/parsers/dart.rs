@@ -5,7 +5,8 @@
 //! so they are skipped. The parser is line based and reads each line once. It
 //! does not use a YAML library, so quoted keys are not read.
 
-use crate::model::{Dependency, Span};
+use crate::model::{Dependency, Ecosystem, Span};
+use crate::requirement::Requirement;
 
 /// Keys that make a map-form entry a non-registry source.
 const SOURCE_KEYS: [&str; 4] = ["sdk", "path", "git", "url"];
@@ -271,10 +272,7 @@ fn finish_entry(entry: Option<PendingEntry<'_>>, dependencies: &mut Vec<Dependen
         dev: entry.dev,
         optional: false,
         has_additional_version_constraints: false,
-        requirement: crate::requirement::Requirement::parse(
-            crate::model::Ecosystem::Pub,
-            version.text,
-        ),
+        requirement: Requirement::parse(Ecosystem::Pub, version.text),
     });
 }
 
@@ -469,7 +467,7 @@ dependencies:
             .expect("http");
         assert_eq!(
             http.requirement,
-            crate::requirement::Requirement::parse(crate::model::Ecosystem::Pub, "^1.2.3")
+            Requirement::parse(Ecosystem::Pub, "^1.2.3")
         );
         assert!(http.requirement.is_some());
         let path = dependencies

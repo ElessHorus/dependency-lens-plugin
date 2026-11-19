@@ -1649,3 +1649,45 @@ fn a_range_checks_the_lowest_version_that_exists_and_shows_it_in_the_hover() {
         "{hover}"
     );
 }
+
+#[test]
+fn a_chunk_of_one_lookup_still_resolves_every_range() {
+    let host = MockHost::install().with_capabilities(&[
+        "events",
+        "project.read",
+        "editor.read",
+        "net:api.osv.dev",
+        "net:pypi.org",
+    ]);
+    host.set_project_root(Some("/p"));
+    host.on_fetch(|request| {
+        if request.url.starts_with("https://pypi.org/pypi/") {
+            return Ok(HttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: REQUESTS_RANGE_BODY.as_bytes().to_vec(),
+            });
+        }
+        answer_osv(request)
+    });
+    // One lookup per chunk: the list of `aaa` takes it, and the pin `bbb` takes the only OSV slot.
+    // The chunk count does not fall, but the list of `ccc` is still to come, so the loop goes on.
+    host.add_file(
+        "requirements.txt",
+        "aaa>1.12,<2.10\nbbb==2.0.0\nccc>1.12,<2.10\n",
+    );
+    let mut plugin = DependencyLens::with_limits(Duration::from_secs(60), 1);
+    plugin.handle_events(
+        &[Event::FileOpened(REQUIREMENTS_PATH.to_owned())],
+        &host.invocation(),
+    );
+
+    let decorations = decorations_of(&host, REQUIREMENTS_PATH);
+    assert_eq!(decorations.len(), 3);
+    assert!(
+        decorations
+            .iter()
+            .all(|decoration| decoration.after.as_deref() != Some("…")),
+        "{decorations:?}"
+    );
+}

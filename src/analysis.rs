@@ -10,6 +10,7 @@ use crate::requirement::{checked_version_of, needs_list};
 use crate::settings::Settings;
 use crate::update::is_outdated;
 use openidea_plugin::HttpRequest;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -51,6 +52,9 @@ pub struct Analysis {
     pub entries: Vec<Entry>,
     /// Number of entries whose check is still running.
     pub pending: usize,
+    /// Number of entries whose checked version still waits for a registry list. They are pending
+    /// too. A chunk that resolves one lowers this count, so the chunk loop knows it made progress.
+    pub lists_waiting: usize,
 }
 
 impl Analysis {
@@ -180,6 +184,7 @@ pub fn analyze(
         return Analysis {
             entries: Vec::new(),
             pending: 0,
+            lists_waiting: 0,
         };
     }
     // The ignore list is normalised once per call, so each dependency name is the only per-item work.
@@ -199,6 +204,10 @@ pub fn analyze(
             .map(|dependency| checked_with_list(eco, dependency, None))
             .collect()
     };
+    let lists_waiting = resolved_versions
+        .iter()
+        .filter(|resolved| matches!(resolved, CheckedVersion::WaitingForList))
+        .count();
     // An entry that waits for its list sends nothing to OSV yet.
     let checked_versions: Vec<Option<String>> = resolved_versions
         .iter()
@@ -242,7 +251,11 @@ pub fn analyze(
         } else {
             0
         };
-    Analysis { entries, pending }
+    Analysis {
+        entries,
+        pending,
+        lists_waiting,
+    }
 }
 
 /// Whether the cache holds an OSV answer or an OSV failure for one version of `dependency`.
@@ -290,15 +303,21 @@ fn resolve_checked_versions(
     now: u64,
     answers: &mut HashMap<String, Lookup>,
 ) -> Vec<CheckedVersion> {
+    // The normalized name of each dependency that needs a list, computed once for both passes.
+    let names: Vec<Option<Cow<'_, str>>> = deps
+        .iter()
+        .map(|dependency| {
+            needs_list(eco, &dependency.version, dependency.requirement.as_ref())
+                .then(|| eco.normalize_package(&dependency.name))
+        })
+        .collect();
     // Pass 1 makes no request: it settles every dependency that the cache or the call already answers.
     let mut resolved: Vec<Option<CheckedVersion>> = deps
         .iter()
-        .map(|dependency| {
-            if !needs_list(eco, &dependency.version, dependency.requirement.as_ref()) {
-                return Some(checked_with_list(eco, dependency, None));
-            }
-            let name = eco.normalize_package(&dependency.name);
-            checked_from_known_list(eco, dependency, &name, cache, answers, now)
+        .zip(&names)
+        .map(|(dependency, name)| match name {
+            None => Some(checked_with_list(eco, dependency, None)),
+            Some(name) => checked_from_known_list(eco, dependency, name, cache, answers, now),
         })
         .collect();
     let answered = deps
@@ -314,13 +333,13 @@ fn resolve_checked_versions(
         .map_or(usize::MAX, |slice| slice.max(answered));
     // Pass 2 looks up the lists that are still missing, in manifest order.
     let mut lookups_done = 0;
-    for (dependency, state) in deps.iter().zip(resolved.iter_mut()) {
-        if state.is_some() {
+    for ((dependency, name), state) in deps.iter().zip(&names).zip(resolved.iter_mut()) {
+        // A dependency without a name here needs no list, so pass 1 settled it.
+        let (None, Some(name)) = (&*state, name) else {
             continue;
-        }
-        let name = eco.normalize_package(&dependency.name);
+        };
         // A name that an earlier dependency of this call looked up answers its duplicates.
-        if let Some(known) = checked_from_known_list(eco, dependency, &name, cache, answers, now) {
+        if let Some(known) = checked_from_known_list(eco, dependency, name, cache, answers, now) {
             *state = Some(known);
             continue;
         }
@@ -334,18 +353,14 @@ fn resolve_checked_versions(
             continue;
         }
         lookups_done += 1;
-        let lookup = lookup_registry(eco, request, &name, http, cache, now);
-        if lookup
-            .as_ref()
-            .is_err_and(|reason| is_cancelled_message(reason))
-        {
-            // The host superseded this call. The entry stays pending, and no lookup follows.
-            budget.cancel();
+        let lookup = lookup_registry(eco, request, name, http, cache, now);
+        if note_cancellation(&lookup, budget) {
+            // The entry stays pending, and no lookup follows.
             *state = Some(CheckedVersion::WaitingForList);
             continue;
         }
-        answers.insert(name.clone().into_owned(), lookup);
-        *state = checked_from_known_list(eco, dependency, &name, cache, answers, now);
+        answers.insert(name.to_string(), lookup);
+        *state = checked_from_known_list(eco, dependency, name, cache, answers, now);
     }
     resolved
         .into_iter()
@@ -438,12 +453,8 @@ fn resolve_registry(
             };
             if budget.take() {
                 let lookup = lookup_registry(eco, request, &name, http, cache, now);
-                if lookup
-                    .as_ref()
-                    .is_err_and(|reason| is_cancelled_message(reason))
-                {
-                    // The host superseded this call. The entry stays pending, and no lookup follows.
-                    budget.cancel();
+                if note_cancellation(&lookup, budget) {
+                    // The entry stays pending, and no lookup follows.
                     pending_count += 1;
                     entry.status = Status::Pending;
                     continue;
@@ -459,6 +470,19 @@ fn resolve_registry(
         entry.status = status;
     }
     pending_count
+}
+
+/// Whether `lookup` failed because the host cancelled it, which also cancels the budget.
+///
+/// The host cancels a request when a newer call supersedes this one, so no lookup follows.
+fn note_cancellation<T>(lookup: &Result<T, String>, budget: &mut Budget) -> bool {
+    let is_cancelled = lookup
+        .as_ref()
+        .is_err_and(|reason| is_cancelled_message(reason));
+    if is_cancelled {
+        budget.cancel();
+    }
+    is_cancelled
 }
 
 /// Borrows the parts of a lookup that the status needs.
@@ -594,7 +618,8 @@ fn query_missing_vulnerabilities(
     budget: &mut Budget,
 ) -> FreshOsv {
     let mut fresh = FreshOsv::default();
-    if budget.is_offline {
+    // A cancelled run is superseded by a newer call, which would throw this answer away.
+    if budget.is_offline || budget.is_cancelled() {
         return fresh;
     }
     let details_per_query = budget.details_per_query();
@@ -1159,6 +1184,7 @@ mod tests {
             Analysis {
                 entries: Vec::new(),
                 pending: 0,
+                lists_waiting: 0,
             }
         );
         assert!(http.requests().is_empty());
@@ -2800,6 +2826,110 @@ mod tests {
             &mut Budget::new(usize::MAX, None),
         );
         assert!(analysis.entries.is_empty());
+        assert!(http.requests().is_empty());
+    }
+
+    #[test]
+    fn a_cancelled_registry_lookup_sends_no_osv_batch() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .transport_error("GET", "https://pypi.org/pypi/aaa/json", "cancelled");
+        let mut budget = Budget::new(usize::MAX, None);
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            "aaa>=1.0\nbbb==2.0.0\n",
+            &mut budget,
+        );
+        assert!(budget.is_cancelled());
+        // The answer of OSV would be thrown away, so the request is not sent.
+        assert!(
+            http.requests().iter().all(|(method, _)| method != "POST"),
+            "{:?}",
+            http.requests()
+        );
+        assert_eq!(analysis.pending, 2);
+        assert!(
+            cache
+                .failure(FailureKind::Registry, Ecosystem::PyPI, "aaa", NOW)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_cancelled_list_lookup_keeps_a_range_waiting_for_its_list() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .transport_error("GET", "https://pypi.org/pypi/aaa/json", "cancelled");
+        let mut budget = Budget::new(usize::MAX, None);
+        let analysis = analyze_python(&mut cache, &http, NOW, "aaa>=1.0\n", &mut budget);
+        assert!(budget.is_cancelled());
+        assert_eq!(entry(&analysis, "aaa").status, Status::Pending);
+        assert_eq!(entry(&analysis, "aaa").checked_version, None);
+    }
+
+    #[test]
+    fn a_chunk_with_one_lookup_reports_the_lists_still_waiting() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new()
+            .route("POST", BATCH_URL, 200, &batch_body(1))
+            .route("GET", PYPI_PREFIX, 200, RANGE_BODY);
+        let analysis = analyze_python(
+            &mut cache,
+            &http,
+            NOW,
+            "aaa>1.12,<2.10\nbbb==2.0.0\nccc>1.12,<2.10\n",
+            &mut Budget::new(1, None).with_first_osv_slice(1),
+        );
+        assert_eq!(analysis.lists_waiting, 1);
+        assert_eq!(analysis.pending, 2);
+    }
+
+    #[test]
+    fn a_budget_of_one_lookup_resolves_the_missing_list_of_one_package() {
+        let run = |budget: &mut Budget| {
+            let mut cache = Cache::new(TTL_SECS);
+            let http = FakeHttp::new()
+                .route("POST", BATCH_URL, 200, &batch_body(1))
+                .route("GET", REQUESTS_URL, 200, RANGE_BODY);
+            let analysis = analyze_python(&mut cache, &http, NOW, RANGE_TEXT, budget);
+            (analysis, http)
+        };
+        // Without a lookup the range waits for its list: no request leaves, and the entry is pending.
+        let (waiting, http) = run(&mut Budget::new(0, None));
+        assert_eq!(entry(&waiting, "requests").status, Status::Pending);
+        assert_eq!(waiting.lists_waiting, 1);
+        assert!(http.requests().is_empty());
+        // One lookup reads the list, and OSV is asked about the lowest allowed version.
+        let (resolved, http) = run(&mut Budget::new(1, None));
+        assert_eq!(resolved.lists_waiting, 0);
+        assert_eq!(
+            entry(&resolved, "requests").checked_version.as_deref(),
+            Some("2.0.0")
+        );
+        assert!(batch_bodies(&http)[0].contains("\"2.0.0\""));
+    }
+
+    #[test]
+    fn an_ignored_package_costs_no_lookup_with_a_budget_of_one() {
+        let mut cache = Cache::new(TTL_SECS);
+        let http = FakeHttp::new();
+        let settings = Settings {
+            ignore: vec!["requests".to_owned()],
+            ..Settings::default()
+        };
+        analyze(
+            Ecosystem::PyPI,
+            parsers::python::parse(RANGE_TEXT),
+            &mut cache,
+            &http,
+            &settings,
+            NOW,
+            &mut Budget::new(1, None),
+        );
         assert!(http.requests().is_empty());
     }
 

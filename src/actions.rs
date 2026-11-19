@@ -46,19 +46,27 @@ pub fn code_actions(
     let ignored = settings.ignored_packages(eco);
     // One parse; the line test is a range check, so lines outside the selection build no action.
     let selected_lines = selection.start.line..=selection.end.line;
+    let document = ManifestText {
+        path: doc_path,
+        text: doc_text,
+    };
     let mut actions: Vec<CodeAction> = eco
         .parse(doc_text)
         .iter()
         .filter(|dep| selected_lines.contains(&dep.version_span.line))
         .filter(|dep| !ignored.contains(&eco.normalize_package(&dep.name)))
         .flat_map(|dep| {
-            let fix = settings
+            // The fix and the load action read the same version: it is worked out once.
+            let current = settings
                 .vulnerabilities
-                .then(|| fix_action_for(cache, settings, eco, dep, doc_path, doc_text, now))
+                .then(|| checked_version_for(cache, eco, dep, now))
                 .flatten();
+            let fix = current.as_deref().and_then(|current| {
+                fix_action_for(cache, settings, eco, dep, current, &document, now)
+            });
             let mut update = eco
                 .offers_updates()
-                .then(|| action_for(cache, eco, dep, doc_path, doc_text, now))
+                .then(|| action_for(cache, eco, dep, &document, now))
                 .flatten();
             // Two preferred actions on one version would leave the choice to the editor.
             if fix.is_some()
@@ -66,10 +74,9 @@ pub fn code_actions(
             {
                 update.preferred = false;
             }
-            let load = settings
-                .vulnerabilities
-                .then(|| load_action_for(cache, eco, dep, now))
-                .flatten();
+            let load = current
+                .as_deref()
+                .and_then(|current| load_action_for(cache, eco, dep, current, now));
             fix.into_iter().chain(update).chain(load)
         })
         .collect();
@@ -82,6 +89,12 @@ pub fn code_actions(
             .is_none_or(|data| seen_data.insert(data.clone()))
     });
     actions
+}
+
+/// The path and the text of the manifest that the actions edit.
+struct ManifestText<'a> {
+    path: &'a str,
+    text: &'a str,
 }
 
 /// The version that the analysis checked for `dep`: the lowest version of the cached registry
@@ -107,11 +120,11 @@ fn load_action_for(
     cache: &Cache,
     eco: Ecosystem,
     dep: &Dependency,
+    current: &str,
     now: u64,
 ) -> Option<CodeAction> {
-    let current = checked_version_for(cache, eco, dep, now)?;
     let waiting = cache
-        .vulnerabilities(eco, &dep.name, &current, now)?
+        .vulnerabilities(eco, &dep.name, current, now)?
         .iter()
         .filter(|vulnerability| {
             is_deferred(vulnerability) && cache.advisory(&vulnerability.id, now).is_none()
@@ -141,16 +154,15 @@ fn fix_action_for(
     settings: &Settings,
     eco: Ecosystem,
     dep: &Dependency,
-    doc_path: &str,
-    doc_text: &str,
+    current: &str,
+    document: &ManifestText<'_>,
     now: u64,
 ) -> Option<CodeAction> {
     // A Maven version that is a property has its text elsewhere, so there is nothing to replace here.
     if eco == Ecosystem::Maven && dep.has_additional_version_constraints {
         return None;
     }
-    let current = checked_version_for(cache, eco, dep, now)?;
-    let listed = cache.vulnerabilities(eco, &dep.name, &current, now)?;
+    let listed = cache.vulnerabilities(eco, &dep.name, current, now)?;
     let affected: Vec<&[Affected]> = listed
         .iter()
         .filter_map(|vulnerability| {
@@ -167,7 +179,7 @@ fn fix_action_for(
     // constraints sit in the line. The other ecosystems write them inside the version text, and an
     // XML tag such as `<version>` would read as an operator.
     let constraints = if matches!(eco, Ecosystem::PyPI | Ecosystem::RubyGems) {
-        let line = doc_text.lines().nth(dep.version_span.line as usize)?;
+        let line = document.text.lines().nth(dep.version_span.line as usize)?;
         Some(line_constraints(
             eco,
             line,
@@ -190,9 +202,9 @@ fn fix_action_for(
         }
         _ => true,
     };
-    let plan = plan_fix(eco, &dep.name, &current, &affected, allows)?;
+    let plan = plan_fix(eco, &dep.name, current, &affected, allows)?;
     let new_text = render_fix(eco, &dep.version, &plan.target)?;
-    let range = to_range(doc_text, dep.version_span)?;
+    let range = to_range(document.text, dep.version_span)?;
     let count = if plan.fixed_count == plan.total_count {
         match plan.fixed_count {
             1 => "1 vulnerability".to_owned(),
@@ -210,7 +222,7 @@ fn fix_action_for(
         // A security fix is the one to take first.
         preferred: true,
         edits: vec![(
-            doc_path.to_string(),
+            document.path.to_string(),
             vec![TextEdit {
                 range,
                 text: new_text,
@@ -225,8 +237,7 @@ fn action_for(
     cache: &Cache,
     eco: Ecosystem,
     dep: &Dependency,
-    doc_path: &str,
-    doc_text: &str,
+    document: &ManifestText<'_>,
     now: u64,
 ) -> Option<CodeAction> {
     let package = eco.normalize_package(&dep.name);
@@ -237,14 +248,14 @@ fn action_for(
     let new_text = render_update(eco, dep, latest)?;
     let current = declared_version_for_osv(&dep.version)?;
     let kind = update_kind(eco, &current, latest)?;
-    let range = to_range(doc_text, dep.version_span)?;
+    let range = to_range(document.text, dep.version_span)?;
     Some(CodeAction {
         title: format!("Update {} to {latest} ({})", dep.name, kind_label(kind)),
         kind: Some("quickfix".to_string()),
         // Minor and patch steps are usually safe in one click; major and pre-release steps are not.
         preferred: matches!(kind, UpdateKind::Minor | UpdateKind::Patch),
         edits: vec![(
-            doc_path.to_string(),
+            document.path.to_string(),
             vec![TextEdit {
                 range,
                 text: new_text,

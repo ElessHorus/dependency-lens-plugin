@@ -24,6 +24,15 @@ pub enum UpdateKind {
     Prerelease,
 }
 
+/// The two operators whose bound is exclusive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExclusiveBound {
+    /// `>V`: the versions above `V`.
+    GreaterThan,
+    /// `<V`: the versions below `V`.
+    LessThan,
+}
+
 /// Version operations that the update rules need. PEP 440 and dotted versions implement it,
 /// so each ecosystem adds one match arm and no new rule code.
 pub(crate) trait UpdateVersion: Ord + Sized {
@@ -33,6 +42,12 @@ pub(crate) trait UpdateVersion: Ord + Sized {
     fn is_prerelease_version(&self) -> bool;
     /// Returns the release segments, such as `[2, 31, 0]`. Borrowed when the version stores them.
     fn release_segments(&self) -> Cow<'_, [u64]>;
+    /// Whether an exclusive bound (`>` or `<`) keeps `self` out although the order allows it.
+    ///
+    /// Only PEP 440 has such a rule, so the default is `false`.
+    fn is_excluded_by_bound(&self, _kind: ExclusiveBound, _bound: &Self) -> bool {
+        false
+    }
 }
 
 impl UpdateVersion for Pep440 {
@@ -46,6 +61,15 @@ impl UpdateVersion for Pep440 {
 
     fn release_segments(&self) -> Cow<'_, [u64]> {
         Cow::Borrowed(self.release())
+    }
+
+    /// PEP 440: `>V` does not allow a post-release of `V` unless `V` is one, and `<V` does not
+    /// allow a pre-release of `V` unless `V` is one.
+    fn is_excluded_by_bound(&self, kind: ExclusiveBound, bound: &Self) -> bool {
+        match kind {
+            ExclusiveBound::GreaterThan => self.is_post_release_of(bound),
+            ExclusiveBound::LessThan => !bound.is_prerelease() && self.is_pre_release_of(bound),
+        }
     }
 }
 

@@ -364,6 +364,7 @@ mod tests {
                 checked_version: checked_version.map(str::to_owned),
             }],
             pending: 0,
+            lists_waiting: 0,
         }
     }
 
@@ -516,6 +517,7 @@ mod tests {
                 checked_version: None,
             }],
             pending: 0,
+            lists_waiting: 0,
         };
         let decorations = decorations("[dependencies]\nserde = \"*\"\n", &analysis);
         assert_eq!(
@@ -534,6 +536,7 @@ mod tests {
                 checked_version: Some("1.0.0".to_owned()),
             }],
             pending: 0,
+            lists_waiting: 0,
         };
         assert!(decorations(SERDE_TEXT, &analysis).is_empty());
     }
@@ -550,6 +553,7 @@ mod tests {
                 checked_version: Some("1.0.0".to_owned()),
             }],
             pending: 0,
+            lists_waiting: 0,
         };
         let decorations = decorations(text, &analysis);
         let document = Document {
@@ -644,6 +648,7 @@ mod tests {
                 checked_version: Some("1.0.0".to_owned()),
             }],
             pending: 0,
+            lists_waiting: 0,
         };
         assert!(diagnostics(SERDE_TEXT, &unresolved, false).is_empty());
     }
@@ -666,6 +671,7 @@ mod tests {
                 },
             ],
             pending: 0,
+            lists_waiting: 0,
         };
         let text = "[dependencies]\nserde = \"1.0.0\"\nanyhow = \"1.0.0\"\n";
         let messages: Vec<String> = diagnostics(text, &analysis, false)
