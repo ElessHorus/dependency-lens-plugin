@@ -998,6 +998,23 @@ mod tests {
     }
 
     #[test]
+    fn a_block_with_an_unnormalized_key_loads_and_is_not_read_for_the_normalized_name() {
+        // Blocks written before A.4 can hold a list under the written name. It stays unreachable
+        // and leaves with the 7-day limit: for Packagist it may even hold a false empty answer.
+        let text = format!(
+            r#"{{"v":1,"lists":{{"Requests":{{"1.0.0":{{"at":{NOW},"total":0,"ids":[]}}}}}}}}"#
+        );
+        let mut cache = Cache::new(LONG_TTL_SECS);
+        cache.import_block(Ecosystem::PyPI, decode_block(&text).unwrap(), NOW);
+
+        assert!(
+            cache
+                .vulnerabilities(Ecosystem::PyPI, "requests", VERSION, NOW)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn a_list_with_a_huge_total_is_not_imported() {
         let text = format!(
             r#"{{"v":1,"lists":{{"requests":{{"1.0.0":{{"at":{NOW},"total":{},"ids":[]}}}}}}}}"#,

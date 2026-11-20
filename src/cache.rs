@@ -17,6 +17,12 @@ pub enum FailureKind {
     Osv,
 }
 
+/// The failure-cache key of one package version, so a failure of one version leaves the others alone.
+/// The package is the normalized name.
+fn osv_failure_key(eco: Ecosystem, package: &str, version: &str) -> String {
+    format!("{}@{version}", eco.normalize_package(package))
+}
+
 /// A cached value and the time it was stored.
 struct Entry<T> {
     value: T,
@@ -146,6 +152,10 @@ impl Cache {
     }
 
     /// Returns the cached vulnerabilities of one package version, if still valid.
+    ///
+    /// The cache is the only gate to the vulnerability tables: `package` is normalized here, so
+    /// every spelling of one package shares one list. Normalizing is idempotent, so a caller that
+    /// already holds the normalized name is safe.
     pub fn vulnerabilities(
         &self,
         eco: Ecosystem,
@@ -153,11 +163,16 @@ impl Cache {
         version: &str,
         now: u64,
     ) -> Option<&[Vulnerability]> {
-        let entry = self.vulnerabilities.get(&eco)?.get(package)?.get(version);
+        let package = eco.normalize_package(package);
+        let entry = self
+            .vulnerabilities
+            .get(&eco)?
+            .get(package.as_ref())?
+            .get(version);
         fresh_value(entry, now, self.read_ttl_secs).map(Vec::as_slice)
     }
 
-    /// Stores the vulnerabilities of one package version, replacing any previous value.
+    /// Stores the vulnerabilities of one package version under the normalized name, replacing any previous value.
     pub fn put_vulnerabilities(
         &mut self,
         eco: Ecosystem,
@@ -173,7 +188,7 @@ impl Cache {
         self.vulnerabilities
             .entry(eco)
             .or_default()
-            .entry(package.to_owned())
+            .entry(eco.normalize_package(package).into_owned())
             .or_default()
             .insert(
                 version.to_owned(),
@@ -215,6 +230,35 @@ impl Cache {
     ) -> Option<&str> {
         let entry = self.failures.get(&(kind, eco))?.get(package);
         fresh_value(entry, now, FAILURE_TTL_SECS).map(String::as_str)
+    }
+
+    /// Stores the OSV failure of one package version for 60 seconds.
+    pub fn put_osv_failure(
+        &mut self,
+        eco: Ecosystem,
+        package: &str,
+        version: &str,
+        reason: String,
+        now: u64,
+    ) {
+        let key = osv_failure_key(eco, package, version);
+        self.put_failure(FailureKind::Osv, eco, &key, reason, now);
+    }
+
+    /// Returns the reason of a recent OSV failure of one package version.
+    pub fn osv_failure(
+        &self,
+        eco: Ecosystem,
+        package: &str,
+        version: &str,
+        now: u64,
+    ) -> Option<&str> {
+        self.failure(
+            FailureKind::Osv,
+            eco,
+            &osv_failure_key(eco, package, version),
+            now,
+        )
     }
 
     /// Returns a cached advisory by its identifier, if still valid.
@@ -365,6 +409,92 @@ mod tests {
         assert_eq!(
             cache.version_info(Ecosystem::Cargo, "serde", START_SECS + 10),
             Some(&newer)
+        );
+    }
+
+    #[test]
+    fn spellings_of_one_package_share_a_vulnerability_list() {
+        for (eco, written, normalized) in [
+            (Ecosystem::PyPI, "Requests", "requests"),
+            (Ecosystem::PyPI, "Python.Jose", "python-jose"),
+            (Ecosystem::NuGet, "Newtonsoft.Json", "newtonsoft.json"),
+            (
+                Ecosystem::Packagist,
+                "Symfony/Http-Kernel",
+                "symfony/http-kernel",
+            ),
+            (Ecosystem::Cargo, "Rand-Core", "rand_core"),
+        ] {
+            let vulns = vec![sample_vulnerability("GHSA-1")];
+            let mut by_written = Cache::new(TTL_SECS);
+            by_written.put_vulnerabilities(eco, written, "1.0.0", vulns.clone(), START_SECS);
+            assert_eq!(
+                by_written.vulnerabilities(eco, normalized, "1.0.0", START_SECS),
+                Some(vulns.as_slice()),
+                "{eco:?} {written}"
+            );
+            let mut by_normalized = Cache::new(TTL_SECS);
+            by_normalized.put_vulnerabilities(eco, normalized, "1.0.0", vulns.clone(), START_SECS);
+            assert_eq!(
+                by_normalized.vulnerabilities(eco, written, "1.0.0", START_SECS),
+                Some(vulns.as_slice()),
+                "{eco:?} {written}"
+            );
+        }
+    }
+
+    #[test]
+    fn case_sensitive_ecosystems_keep_two_vulnerability_lists() {
+        // OSV answers 0 advisories for a changed case in these ecosystems, so the keys must differ.
+        for (eco, written, other) in [
+            (Ecosystem::Npm, "Lodash", "lodash"),
+            (Ecosystem::RubyGems, "Rails", "rails"),
+            (Ecosystem::Pub, "Http", "http"),
+            (
+                Ecosystem::Go,
+                "github.com/Gin-Gonic/gin",
+                "github.com/gin-gonic/gin",
+            ),
+            (Ecosystem::Maven, "org.x:LOG4J", "org.x:log4j"),
+        ] {
+            let mut cache = Cache::new(TTL_SECS);
+            cache.put_vulnerabilities(
+                eco,
+                written,
+                "1.0.0",
+                vec![sample_vulnerability("GHSA-1")],
+                START_SECS,
+            );
+            assert_eq!(
+                cache.vulnerabilities(eco, other, "1.0.0", START_SECS),
+                None,
+                "{eco:?} {written}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_osv_failure_is_found_under_any_spelling() {
+        let mut cache = Cache::new(TTL_SECS);
+        cache.put_osv_failure(
+            Ecosystem::PyPI,
+            "Requests",
+            "1.0",
+            "OSV: down".to_owned(),
+            START_SECS,
+        );
+        assert_eq!(
+            cache.osv_failure(Ecosystem::PyPI, "requests", "1.0", START_SECS),
+            Some("OSV: down")
+        );
+        assert_eq!(
+            cache.osv_failure(Ecosystem::PyPI, "requests", "2.0", START_SECS),
+            None
+        );
+        // A failure lasts 60 seconds, as every failure does.
+        assert_eq!(
+            cache.osv_failure(Ecosystem::PyPI, "requests", "1.0", START_SECS + 61),
+            None
         );
     }
 
