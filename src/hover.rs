@@ -143,7 +143,11 @@ mod tests {
 - `2.10.0` — outside your bounds\n\
 - `2.9.2` — allowed, latest allowed\n\
 - `2.9.1` — allowed\n\
-- `2.9.0rc1` — allowed, pre-release";
+- `2.9.0rc1` — allowed, pre-release\n\
+\n\
+Advisories of newer versions are not checked.\n\
+\n\
+The advisories of 2.0.0 are not known yet, so no release is compared with them.";
 
     fn hover_with_cache(settings: &Settings, text: &str, line: u32) -> Option<String> {
         package_link_hover(

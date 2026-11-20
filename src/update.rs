@@ -212,8 +212,13 @@ pub struct Release<'a> {
 /// The entries of `versions` that order after `base`, in the order of `versions`.
 ///
 /// A text that is not a version of the ecosystem is skipped. A `base` that is not a version gives
-/// no release. The list is not sorted again: the registry clients already rank it.
-pub fn newer_releases<'a>(eco: Ecosystem, base: &str, versions: &'a [String]) -> Vec<Release<'a>> {
+/// `None`, not an empty list, so a caller never reads "nothing is newer" for an unreadable base.
+/// The list is not sorted again: the registry clients already rank it.
+pub fn newer_releases<'a>(
+    eco: Ecosystem,
+    base: &str,
+    versions: &'a [String],
+) -> Option<Vec<Release<'a>>> {
     match eco {
         Ecosystem::PyPI => newer_releases_of::<Pep440>(base, versions),
         Ecosystem::RubyGems => newer_releases_of::<GemVersion>(base, versions),
@@ -224,11 +229,12 @@ pub fn newer_releases<'a>(eco: Ecosystem, base: &str, versions: &'a [String]) ->
 }
 
 /// One pass: `base` is parsed once and each listed text once.
-fn newer_releases_of<'a, V: UpdateVersion>(base: &str, versions: &'a [String]) -> Vec<Release<'a>> {
-    let Some(base) = V::parse_version(base) else {
-        return Vec::new();
-    };
-    versions
+fn newer_releases_of<'a, V: UpdateVersion>(
+    base: &str,
+    versions: &'a [String],
+) -> Option<Vec<Release<'a>>> {
+    let base = V::parse_version(base)?;
+    let releases = versions
         .iter()
         .filter_map(|text| {
             let version = V::parse_version(text)?;
@@ -237,7 +243,8 @@ fn newer_releases_of<'a, V: UpdateVersion>(base: &str, versions: &'a [String]) -
                 is_prerelease: version.is_prerelease_version(),
             })
         })
-        .collect()
+        .collect();
+    Some(releases)
 }
 
 /// Splits a requirement into its leading operator run and the version text after it.
@@ -751,14 +758,19 @@ mod tests {
                 owned(&["1.1.0-preview1", "1.0.0"]),
                 vec![("1.1.0-preview1", true)],
             ),
-            (Ecosystem::PyPI, "not-a-version", owned(&["1.0.0"]), vec![]),
         ];
         for (eco, base, versions, expected) in cases {
             let found: Vec<(&str, bool)> = newer_releases(eco, base, &versions)
+                .expect("a readable base")
                 .into_iter()
                 .map(|release| (release.text, release.is_prerelease))
                 .collect();
             assert_eq!(found, expected, "{eco:?} after {base}");
         }
+        // A base that is not a version gives no answer, so a caller cannot say "nothing is newer".
+        assert_eq!(
+            newer_releases(Ecosystem::PyPI, "not-a-version", &owned(&["1.0.0"])),
+            None
+        );
     }
 }

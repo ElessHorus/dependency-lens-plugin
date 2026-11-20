@@ -16,11 +16,12 @@ const MAX_IDS: usize = 3;
 /// The Markdown section that lists the releases newer than the checked version of `dep`.
 ///
 /// It reads the cache only. It returns `None` when the cache holds no registry list for the
-/// package (an ecosystem without a registry client, an expired answer) or when the dependency has
-/// no checked version. Each release line carries its marks: the bounds of the requirement, the
+/// package (an ecosystem without a registry client, an expired answer), when the dependency has
+/// no checked version, or when the checked version is not a version of the ecosystem. Each release line carries its marks: the bounds of the requirement, the
 /// pre-release flag, and the advisories of the checked version that still affect the release.
 /// Security marks need the `vulnerabilities` setting and a cached vulnerability list for the
-/// checked version.
+/// checked version. With the setting on and no such list, the footer says that no release is
+/// compared.
 pub fn version_history(
     eco: Ecosystem,
     dep: &Dependency,
@@ -30,7 +31,9 @@ pub fn version_history(
 ) -> Option<String> {
     let info = cache.version_info(eco, &eco.normalize_package(&dep.name), now)?;
     let checked = checked_version_for(cache, eco, dep, now)?;
-    let newer = newer_releases(eco, &checked, &info.versions);
+    // A checked version that does not parse gives no section: it is not "nothing is newer", and
+    // the manifest text must not reach the Markdown.
+    let newer = newer_releases(eco, &checked, &info.versions)?;
     if newer.is_empty() {
         return Some(format!("No version after {checked}."));
     }
@@ -87,8 +90,8 @@ pub fn version_history(
     if newer.len() > MAX_RELEASES {
         let _ = write!(text, "\n- … {} more", newer.len() - MAX_RELEASES);
     }
-    if let Some(known) = &advisories {
-        push_advisory_footers(&mut text, known);
+    if settings.vulnerabilities {
+        push_advisory_footers(&mut text, advisories.as_ref(), &checked);
     }
     Some(text)
 }
@@ -115,9 +118,20 @@ fn still_affected_mark(advisories: &ShownAdvisories, indices: &[usize]) -> Strin
 }
 
 /// Appends the footers that tell the limits of the security marks to `text`.
-fn push_advisory_footers(text: &mut String, advisories: &ShownAdvisories) {
+///
+/// `advisories` is `None` when the cache holds no vulnerability list for `checked` yet. The
+/// releases then carry no security mark, and the footer says so: a bare line must never read as
+/// "no known advisory".
+fn push_advisory_footers(text: &mut String, advisories: Option<&ShownAdvisories>, checked: &str) {
     // A blank line ends the list, so a footer is not read as part of the last item.
     text.push_str("\n\nAdvisories of newer versions are not checked.");
+    let Some(advisories) = advisories else {
+        let _ = write!(
+            text,
+            "\n\nThe advisories of {checked} are not known yet, so no release is compared with them."
+        );
+        return;
+    };
     match advisories.unloaded_count {
         0 => {}
         1 => text.push_str("\n\n1 advisory is not loaded, so it is not compared."),
@@ -203,6 +217,14 @@ mod tests {
         }
     }
 
+    /// Settings with the vulnerability marks and footers off, so a test sees the release lines only.
+    fn without_vulnerabilities() -> Settings {
+        Settings {
+            vulnerabilities: false,
+            ..Settings::default()
+        }
+    }
+
     fn history(dep: &Dependency, cache: &Cache, settings: &Settings) -> Option<String> {
         version_history(Ecosystem::PyPI, dep, cache, settings, NOW)
     }
@@ -219,9 +241,40 @@ mod tests {
     fn lists_newer_releases_with_bound_marks() {
         let cache = cache_with_list(&LIST);
         assert_eq!(
-            history(&range_dependency(), &cache, &Settings::default()).as_deref(),
+            history(&range_dependency(), &cache, &without_vulnerabilities()).as_deref(),
             Some(BOUND_LINES)
         );
+    }
+
+    #[test]
+    fn without_the_advisories_of_the_checked_version_the_footer_says_no_release_is_compared() {
+        // Vulnerabilities are on, but OSV has not answered for 2.0.0: a bare line must not read as
+        // "no known advisory".
+        let cache = cache_with_list(&LIST);
+        assert_eq!(
+            history(&range_dependency(), &cache, &Settings::default()).as_deref(),
+            Some(
+                format!(
+                    "{BOUND_LINES}\n\nAdvisories of newer versions are not checked.\n\nThe advisories of 2.0.0 are not known yet, so no release is compared with them."
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn a_checked_version_that_is_not_a_version_gives_none() {
+        // The list holds newer releases, but the checked text does not parse for PEP 440. The
+        // section must not say that nothing is newer, and must not echo the manifest text.
+        let cache = cache_with_list(&LIST);
+        for pin in [
+            "requests===1.0-foo",
+            "requests===1.0<b>",
+            "requests===[1](http",
+        ] {
+            let dep = dependency(&format!("{pin}\n"));
+            assert_eq!(history(&dep, &cache, &Settings::default()), None, "{pin}");
+        }
     }
 
     #[test]
@@ -280,7 +333,7 @@ mod tests {
         let text = history(
             &dependency("requests>=2.0.0\n"),
             &cache,
-            &Settings::default(),
+            &without_vulnerabilities(),
         )
         .expect("a section");
         let lines: Vec<&str> = text.lines().collect();
@@ -307,7 +360,7 @@ mod tests {
         let mut dep = dependency("requests==2.0.0\n");
         dep.requirement = None;
         assert_eq!(
-            history(&dep, &cache, &Settings::default()).as_deref(),
+            history(&dep, &cache, &without_vulnerabilities()).as_deref(),
             Some("Versions after 2.0.0:\n- `3.0.0`")
         );
     }
@@ -316,12 +369,8 @@ mod tests {
     fn vulnerabilities_off_gives_no_security_mark_and_no_footer() {
         let mut cache = cache_with_list(&LIST);
         store_advisories(&mut cache, &[("GHSA-b", "2.9.2")]);
-        let settings = Settings {
-            vulnerabilities: false,
-            ..Settings::default()
-        };
         assert_eq!(
-            history(&range_dependency(), &cache, &settings).as_deref(),
+            history(&range_dependency(), &cache, &without_vulnerabilities()).as_deref(),
             Some(BOUND_LINES)
         );
     }
