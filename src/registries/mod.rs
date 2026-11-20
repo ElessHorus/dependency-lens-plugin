@@ -166,6 +166,15 @@ fn is_maven_part(part: &str) -> bool {
     is_bounded_run(part, 128, is_dotted_byte) && starts_alphanumeric(part)
 }
 
+/// Whether `to_lowercase` may change `name`: an ASCII capital, or any non-ASCII character.
+///
+/// `char::is_uppercase` is false for titlecase letters such as `ǅ`, which `to_lowercase` still
+/// maps, so a non-ASCII name always takes the copying path. Crate, package and gem names are ASCII.
+fn may_change_case(name: &str) -> bool {
+    name.bytes()
+        .any(|byte| byte.is_ascii_uppercase() || !byte.is_ascii())
+}
+
 impl Ecosystem {
     /// Returns the URL of the package page on the public registry, or `None` for an unsafe name.
     ///
@@ -220,13 +229,13 @@ impl Ecosystem {
         match self {
             Ecosystem::PyPI if pypi::is_normalized(name) => Cow::Borrowed(name),
             Ecosystem::PyPI => Cow::Owned(pypi::normalize_name(name)),
-            // Packagist and the NuGet flat container store names in lowercase. Only names with an uppercase letter need a copy.
-            Ecosystem::Packagist | Ecosystem::NuGet if name.chars().any(char::is_uppercase) => {
+            // Packagist and the NuGet flat container store names in lowercase. Only names with an uppercase or a non-ASCII letter need a copy.
+            Ecosystem::Packagist | Ecosystem::NuGet if may_change_case(name) => {
                 Cow::Owned(name.to_lowercase())
             }
             // crates.io ignores case and treats `-` as `_`; OSV accepts the same (measured 2026-11-20).
             // The index rule maps each `-` to `_` one for one, so runs are not collapsed.
-            Ecosystem::Cargo if name.chars().any(|c| c == '-' || c.is_uppercase()) => Cow::Owned(
+            Ecosystem::Cargo if name.contains('-') || may_change_case(name) => Cow::Owned(
                 name.chars()
                     .flat_map(char::to_lowercase)
                     .map(|c| if c == '-' { '_' } else { c })
@@ -313,11 +322,29 @@ mod tests {
                 "Newtonsoft.Json",
                 "Rand-Core",
                 "a-_b",
+                "ǅ",
                 "",
             ] {
                 let once = eco.normalize_package(name);
                 assert_eq!(eco.normalize_package(&once), once, "{eco:?} {name:?}");
             }
+        }
+    }
+
+    #[test]
+    fn titlecase_spellings_share_one_key() {
+        // `ǅ` is titlecase, so `char::is_uppercase` is false for it, and `ǆ` is its lowercase form.
+        for eco in [
+            Ecosystem::PyPI,
+            Ecosystem::Packagist,
+            Ecosystem::NuGet,
+            Ecosystem::Cargo,
+        ] {
+            assert_eq!(
+                eco.normalize_package("ǅ"),
+                eco.normalize_package("ǆ"),
+                "{eco:?}"
+            );
         }
     }
 

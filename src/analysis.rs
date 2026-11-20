@@ -265,21 +265,12 @@ pub fn analyze(
     }
 }
 
-/// Whether the cache holds an OSV answer or an OSV failure for one version of `dependency`.
-fn is_osv_answered(
-    cache: &Cache,
-    eco: Ecosystem,
-    dependency: &Dependency,
-    version: &str,
-    now: u64,
-) -> bool {
-    // The cache normalizes the name, so every spelling of one package shares the answer.
-    cache
-        .vulnerabilities(eco, &dependency.name, version, now)
-        .is_some()
-        || cache
-            .osv_failure(eco, &dependency.name, version, now)
-            .is_some()
+/// Whether the cache holds an OSV answer or an OSV failure for one version of `package`.
+///
+/// `package` is the normalized name: the cache normalizes it again, which borrows and copies nothing.
+fn is_osv_answered(cache: &Cache, eco: Ecosystem, package: &str, version: &str, now: u64) -> bool {
+    cache.vulnerabilities(eco, package, version, now).is_some()
+        || cache.osv_failure(eco, package, version, now).is_some()
 }
 
 /// How the checked version of one dependency stands before the OSV query.
@@ -328,7 +319,7 @@ fn resolve_checked_versions(
         .zip(&resolved)
         .filter(|(dependency, state)| {
             matches!(state, Some(CheckedVersion::Known(Some(version)))
-                if is_osv_answered(cache, eco, dependency, version, now))
+                if is_osv_answered(cache, eco, &eco.normalize_package(&dependency.name), version, now))
         })
         .count();
     let list_limit = budget
@@ -677,8 +668,8 @@ fn query_missing_vulnerabilities(
             .zip(checked_versions)
             .filter_map(|(dependency, checked_version)| {
                 let version = checked_version.as_deref()?;
-                is_osv_answered(cache, eco, dependency, version, now)
-                    .then(|| (eco.normalize_package(&dependency.name), version))
+                let package = eco.normalize_package(&dependency.name);
+                is_osv_answered(cache, eco, &package, version, now).then_some((package, version))
             })
             .collect();
         slice.max(answered.len())

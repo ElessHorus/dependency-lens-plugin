@@ -33,14 +33,17 @@ struct ReleaseFile {
 
 /// Returns `true` when `name` is already in PEP 503 form, without building the normalised copy.
 ///
-/// The form holds no uppercase letter, no `_` or `.`, and no run of `-`. The cache normalizes on
-/// every read, so this check keeps the common case free of allocation.
+/// The form holds no uppercase letter, no `_` or `.`, and no run of `-`. A name with a non-ASCII
+/// character always takes the slow path: `to_lowercase` maps letters that `is_uppercase` misses
+/// (titlecase ones), and PEP 508 names are ASCII anyway. The cache normalizes on every read, so
+/// this check keeps the common case free of allocation.
 pub fn is_normalized(name: &str) -> bool {
     let mut previous_is_hyphen = false;
-    for character in name.chars() {
-        let is_hyphen = character == '-';
-        if character.is_uppercase()
-            || matches!(character, '_' | '.')
+    for byte in name.bytes() {
+        let is_hyphen = byte == b'-';
+        if !byte.is_ascii()
+            || byte.is_ascii_uppercase()
+            || matches!(byte, b'_' | b'.')
             || (is_hyphen && previous_is_hyphen)
         {
             return false;
@@ -135,6 +138,9 @@ mod tests {
             "python.jose",
             "a-_b",
             "ÀB",
+            // Titlecase letters are not uppercase, yet `to_lowercase` maps them.
+            "ǅ",
+            "ᾈ",
             "",
         ] {
             assert_eq!(
