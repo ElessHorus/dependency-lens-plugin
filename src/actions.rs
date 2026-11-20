@@ -2,8 +2,8 @@
 //! vulnerabilities, or to the latest registry release.
 
 use crate::cache::Cache;
+use crate::enabled_manifest_ecosystem;
 use crate::fixes::{line_constraints, plan_fix, render_fix, shown_affected};
-use crate::is_manifest_in;
 use crate::model::{Dependency, Ecosystem};
 use crate::osv::{declared_version_for_osv, is_deferred};
 use crate::requirement::{checked_version_of, needs_list, satisfies_all};
@@ -34,15 +34,9 @@ pub fn code_actions(
     selection: Range,
     now: u64,
 ) -> Vec<CodeAction> {
-    if !is_manifest_in(doc_path, project_root) {
-        return Vec::new();
-    }
-    let Some(eco) = Ecosystem::detect(doc_path) else {
+    let Some(eco) = enabled_manifest_ecosystem(settings, doc_path, project_root) else {
         return Vec::new();
     };
-    if !settings.is_enabled(eco) {
-        return Vec::new();
-    }
     let ignored = settings.ignored_packages(eco);
     // One parse; the line test is a range check, so lines outside the selection build no action.
     let selected_lines = selection.start.line..=selection.end.line;

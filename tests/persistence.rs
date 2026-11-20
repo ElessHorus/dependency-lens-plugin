@@ -226,14 +226,16 @@ fn an_expired_disk_cache_is_shown_first_and_then_refreshed() {
 
     assert!(osv.requests.get() > 0, "the real lookup was tried");
     assert_eq!(after_texts(&host), [Some("⚠ 1 vulnerability".to_owned())]);
-    // The old data keeps the link to the package page.
-    assert!(hover_texts(&host)[0].contains("[Page on crates.io](https://crates.io/crates/serde)"));
+    // The old data keeps the advisory in the tooltip. The package link is not in the tooltip.
+    assert!(hover_texts(&host)[0].contains("Checked version"));
+    assert!(!hover_texts(&host)[0].contains("crates.io"));
 
     // Once the host answers, the normal pass replaces the old data.
     osv.is_cancelling.set(false);
     open_manifest(&host, &mut plugin, MANIFEST);
     assert_eq!(after_texts(&host), [Some("⚠ 2 vulnerabilities".to_owned())]);
-    assert!(hover_texts(&host)[0].contains("[Page on crates.io](https://crates.io/crates/serde)"));
+    assert!(hover_texts(&host)[0].contains("Checked version"));
+    assert!(!hover_texts(&host)[0].contains("crates.io"));
 }
 
 #[test]

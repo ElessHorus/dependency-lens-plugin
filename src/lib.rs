@@ -4,6 +4,7 @@ pub mod actions;
 pub mod analysis;
 pub mod cache;
 pub mod fixes;
+pub mod hover;
 pub mod http;
 pub mod model;
 pub mod osv;
@@ -25,10 +26,11 @@ use crate::osv::DEFAULT_DETAILS_PER_QUERY;
 use crate::settings::Settings;
 use crate::store::{HostStore, Store, block_key};
 use openidea_plugin::host::Task;
+use openidea_plugin::hover::{Hover, HoverProvider};
 use openidea_plugin::providers::{CodeAction, Document, Providers};
 use openidea_plugin::{
-    Context, Decoration, Diagnostic, Error, Event, EventKind, Invocation, LogLevel, Plugin, Range,
-    host, register_plugin,
+    Context, Decoration, Diagnostic, Error, Event, EventKind, Invocation, LogLevel, Plugin,
+    Position, Range, host, register_plugin,
 };
 use std::collections::HashSet;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -343,7 +345,7 @@ impl DependencyLens {
         if old.pending >= fresh_pending {
             return None;
         }
-        publish_analysis(eco, path, text, &old, self.settings.outdated_problems);
+        publish_analysis(path, text, &old, self.settings.outdated_problems);
         Some(old)
     }
 
@@ -416,7 +418,6 @@ impl DependencyLens {
             );
             let cache = &self.cache;
             publish_over_old_data(
-                eco,
                 path,
                 text,
                 &analysis,
@@ -499,14 +500,8 @@ fn should_continue(
 }
 
 /// Publishes the decorations and problems of one analysis of the manifest `text` at `path`.
-fn publish_analysis(
-    eco: Ecosystem,
-    path: &str,
-    text: &str,
-    analysis: &Analysis,
-    outdated_problems: bool,
-) {
-    let editor_decorations = publish::decorations(text, analysis, eco);
+fn publish_analysis(path: &str, text: &str, analysis: &Analysis, outdated_problems: bool) {
+    let editor_decorations = publish::decorations(text, analysis);
     let problems = publish::diagnostics(text, analysis, outdated_problems);
     publish_results(path, &editor_decorations, &problems);
 }
@@ -516,7 +511,6 @@ fn publish_analysis(
 /// An entry that still waits keeps what the old data showed for it until its answer comes.
 /// `has_answer` tells whether OSV already answered for an entry, whose advisories are then kept.
 fn publish_over_old_data(
-    eco: Ecosystem,
     path: &str,
     text: &str,
     analysis: &Analysis,
@@ -528,7 +522,6 @@ fn publish_over_old_data(
         .filter(|_| analysis.pending > 0)
         .map(|old| fill_pending_from_old(analysis, old, has_answer));
     publish_analysis(
-        eco,
         path,
         text,
         shown.as_ref().unwrap_or(analysis),
@@ -631,6 +624,20 @@ pub(crate) fn is_manifest(path: &str) -> bool {
 /// The root of the open project that holds `path`, when the host knows one.
 fn project_root_of(path: &str) -> Option<String> {
     host::project_of(path)?.root().ok()
+}
+
+/// The ecosystem of `path`, when the plugin analyzes that file: a manifest outside the skipped
+/// folders of the project at `project_root`, whose ecosystem is enabled. It does not ask the host.
+pub(crate) fn enabled_manifest_ecosystem(
+    settings: &Settings,
+    path: &str,
+    project_root: Option<&str>,
+) -> Option<Ecosystem> {
+    if !is_manifest_in(path, project_root) {
+        return None;
+    }
+    let eco = Ecosystem::detect(path)?;
+    settings.is_enabled(eco).then_some(eco)
 }
 
 /// Whether `path` is a manifest of the project at `project_root`. It does not ask the host.
@@ -884,7 +891,22 @@ impl Providers for DependencyLens {
     }
 }
 
-register_plugin!(DependencyLens, providers);
+impl HoverProvider for DependencyLens {
+    /// Links the package page of the dependency under the cursor. It reads no cache and makes no request.
+    fn hover(&mut self, doc: &Document, at: Position) -> Option<Hover> {
+        // The provider runs for every file, so the cheap file-name test comes before the host call.
+        Ecosystem::detect(&doc.path)?;
+        hover::package_link_hover(
+            &self.settings,
+            &doc.path,
+            project_root_of(&doc.path).as_deref(),
+            &doc.text,
+            at,
+        )
+    }
+}
+
+register_plugin!(DependencyLens, providers, hover);
 
 #[cfg(test)]
 mod loop_tests {
@@ -1220,6 +1242,27 @@ mod disk_cache_tests {
             .filter(|(level, _)| matches!(level, LogLevel::Warn))
             .count();
         assert_eq!(warnings, 1);
+    }
+}
+
+#[cfg(test)]
+mod manifest_ecosystem_tests {
+    use super::enabled_manifest_ecosystem;
+    use crate::model::Ecosystem;
+    use crate::settings::Settings;
+
+    #[test]
+    fn only_an_enabled_manifest_outside_skipped_folders_has_an_ecosystem() {
+        let mut settings = Settings::default();
+        let cargo = |settings: &Settings, path: &str| {
+            enabled_manifest_ecosystem(settings, path, Some("/p"))
+        };
+        assert_eq!(cargo(&settings, "/p/Cargo.toml"), Some(Ecosystem::Cargo));
+        // A folder that the plugin skips, and a file that is no manifest.
+        assert_eq!(cargo(&settings, "/p/target/Cargo.toml"), None);
+        assert_eq!(cargo(&settings, "/p/notes.txt"), None);
+        settings.enabled.remove(&Ecosystem::Cargo);
+        assert_eq!(cargo(&settings, "/p/Cargo.toml"), None);
     }
 }
 

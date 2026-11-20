@@ -2,6 +2,7 @@
 
 use dependency_lens::DependencyLens;
 use dependency_lens::publish::DECORATION_SET;
+use openidea_plugin::hover::HoverProvider;
 use openidea_plugin::mock::MockHost;
 use openidea_plugin::providers::{Document, Providers};
 use openidea_plugin::{
@@ -160,17 +161,54 @@ fn opening_manifest_shows_serde_advisory_only() {
 }
 
 #[test]
-fn the_hover_of_a_public_dependency_links_its_package_page() {
+fn the_ide_hover_links_the_package_page_of_the_dependency_under_the_cursor() {
+    let host = host_counting_fetches(Rc::new(Cell::new(0)));
+    let mut plugin = DependencyLens::default();
+    open_manifest(&host, &mut plugin);
+    let requests_after_open = host.requests().len();
+
+    let document = Document {
+        path: MANIFEST_PATH.to_owned(),
+        language: "toml".to_owned(),
+        version: 1,
+        text: MANIFEST.to_owned(),
+    };
+    let hover = HoverProvider::hover(&mut plugin, &document, Position::new(5, 10))
+        .expect("a hover on the version of serde");
+    assert_eq!(
+        hover.markdown,
+        "[Open serde on crates.io](https://crates.io/crates/serde)"
+    );
+    // The editor anchors the tooltip on this range, so it must be the version under the cursor.
+    assert_eq!(hover.range, Some(SERDE_VERSION_RANGE));
+    // A manifest in a skipped folder gets no link, through the real project-root lookup.
+    let skipped = Document {
+        path: "/p/node_modules/dep/Cargo.toml".to_owned(),
+        ..document.clone()
+    };
+    assert_eq!(
+        HoverProvider::hover(&mut plugin, &skipped, Position::new(5, 10)),
+        None
+    );
+    // Off the dependencies, the plugin adds nothing. It never reaches the network.
+    assert_eq!(
+        HoverProvider::hover(&mut plugin, &document, Position::new(1, 2)),
+        None
+    );
+    assert_eq!(host.requests().len(), requests_after_open);
+}
+
+#[test]
+fn the_decoration_hover_keeps_the_advisory_and_has_no_package_link() {
+    // The clickable link comes from the hover provider, since a decoration tooltip is plain text.
     let host = host_counting_fetches(Rc::new(Cell::new(0)));
     let mut plugin = DependencyLens::default();
     open_manifest(&host, &mut plugin);
 
     let decorations = decorations_of(&host, MANIFEST_PATH);
     let hover = decorations[0].hover.as_deref().unwrap_or_default();
-    assert!(
-        hover.contains("[Page on crates.io](https://crates.io/crates/serde)"),
-        "{hover}"
-    );
+    assert!(hover.contains(HIGH_ID), "{hover}");
+    assert!(!hover.contains("crates.io"), "{hover}");
 }
 
 #[test]

@@ -394,7 +394,8 @@ mod tests {
     fn parse_dispatches_npm_to_the_npm_parser() {
         let manifest = include_str!("../tests/fixtures/npm/package.json");
         let dependencies = Ecosystem::Npm.parse(manifest);
-        assert_eq!(dependencies.len(), 10);
+        // 10 entries in the fixture, minus 4 local, workspace, git and URL sources.
+        assert_eq!(dependencies.len(), 6);
         assert_eq!(dependencies, parsers::npm::parse(manifest));
     }
 
