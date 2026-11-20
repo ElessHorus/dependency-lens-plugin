@@ -11,7 +11,8 @@ use openidea_plugin::{Position, Range};
 /// The cursor must lie on the name or on the version of a dependency. The answer reads no cache
 /// and makes no request. It follows the path of the quick fixes: a file that is not a manifest, a
 /// disabled ecosystem and an ignored package give `None`. A private or local package is not in
-/// `Ecosystem::parse`, so it gets no link. A name that is unsafe for a URL gives `None` too.
+/// `Ecosystem::parse`, so it gets no link. The one exception is npm, whose local and URL specs
+/// the parser keeps: `names_a_registry_package` refuses them. A name that is unsafe for a URL gives `None` too.
 pub fn package_link_hover(
     settings: &Settings,
     doc_path: &str,
@@ -33,6 +34,9 @@ pub fn package_link_hover(
     let (dependency, hovered_range) = dependencies.iter().find_map(|dependency| {
         range_under_cursor(cursor_line, dependency, at).map(|range| (dependency, range))
     })?;
+    if !names_a_registry_package(eco, dependency) {
+        return None;
+    }
     // The ignore set is built only for a match, so a hover over plain text allocates nothing.
     if settings
         .ignored_packages(eco)
@@ -49,6 +53,16 @@ pub fn package_link_hover(
         eco.registry_label()
     );
     Some(Hover::new(text).range(hovered_range))
+}
+
+/// Whether `dependency` is a package of the public registry of `eco`.
+///
+/// The npm parser keeps `file:`, `link:`, `workspace:`, git, URL and `user/repo` specs, because
+/// `declared_version_for_osv` filters them later. A registry range never holds `:` or `/`, so
+/// either character marks a local or URL source, which gets no link (privacy invariant).
+/// The parsers of the other ecosystems already drop such sources.
+fn names_a_registry_package(eco: Ecosystem, dependency: &Dependency) -> bool {
+    eco != Ecosystem::Npm || !dependency.version.contains([':', '/'])
 }
 
 /// The range of the name or of the version of `dependency` that holds `at`, if any.
@@ -179,6 +193,41 @@ mod tests {
     #[test]
     fn a_file_that_is_not_a_manifest_has_no_link() {
         assert_eq!(hover_at("/p/notes.txt", CARGO, 5, 2), None);
+    }
+
+    #[test]
+    fn an_npm_dependency_that_is_not_from_the_registry_has_no_link() {
+        // `Ecosystem::Npm.parse` keeps these specs, so the hover itself must refuse them.
+        // Line 2 holds the registry package. Each other line holds one local or URL source.
+        let package_json = "{\n  \"dependencies\": {\n    \"left-pad\": \"^1.3.0\",\n    \"local\": \"file:../local\",\n    \"mono\": \"workspace:*\",\n    \"lnk\": \"link:../x\",\n    \"gh\": \"user/repo\",\n    \"git\": \"git+https://github.com/x/y.git\",\n    \"tar\": \"https://example.com/a.tgz\",\n    \"hub\": \"github:user/repo\"\n  }\n}\n";
+        let path = "/p/package.json";
+        assert_eq!(
+            hover_at(path, package_json, 2, 6).as_deref(),
+            Some("[Open left-pad on npm](https://www.npmjs.com/package/left-pad)")
+        );
+        for line in 3..=9 {
+            // Column 6 lies inside the name, and column 20 inside the version, of every line.
+            assert_eq!(
+                hover_at(path, package_json, line, 6),
+                None,
+                "name, line {line}"
+            );
+            assert_eq!(
+                hover_at(path, package_json, line, 20),
+                None,
+                "version, line {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pip_dependency_from_a_path_or_a_url_has_no_link() {
+        let requirements = "requests==2.0.0\n-e ./local\nlocalpkg @ file:///tmp/localpkg\nurlpkg @ https://example.com/urlpkg.zip\ngitpkg @ git+https://github.com/x/y.git\n";
+        let path = "/p/requirements.txt";
+        assert!(hover_at(path, requirements, 0, 3).is_some());
+        for line in 1..=4 {
+            assert_eq!(hover_at(path, requirements, line, 3), None, "line {line}");
+        }
     }
 
     #[test]
