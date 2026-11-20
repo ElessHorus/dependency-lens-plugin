@@ -723,7 +723,7 @@ mod tests {
         let owned =
             |texts: &[&str]| -> Vec<String> { texts.iter().map(|t| (*t).to_owned()).collect() };
         // (ecosystem, base, registry list, expected (text, is_prerelease))
-        let cases: [(Ecosystem, &str, Vec<String>, Vec<(&str, bool)>); 4] = [
+        let cases = [
             (
                 Ecosystem::PyPI,
                 "2.0.0",

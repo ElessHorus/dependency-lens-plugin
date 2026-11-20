@@ -154,27 +154,133 @@ pub fn plan_fix(
     }
 }
 
+/// The advisories that a user sees for one package version, with the count of the ones that wait.
+#[derive(Debug)]
+pub struct ShownAdvisories<'a> {
+    /// The id and the `affected` list of each advisory whose details are loaded and whose severity
+    /// reaches the minimum.
+    pub loaded: Vec<(&'a str, &'a [Affected])>,
+    /// The placeholder or deferred advisories whose details are not in the cache.
+    pub unloaded_count: usize,
+}
+
+/// The advisories that a user sees for one package version.
+///
+/// A placeholder or a deferred advisory takes its details from the cache, and counts as unloaded
+/// while they are missing. An advisory below `minimum_severity` is left out and not counted.
+pub fn shown_advisories<'a>(
+    cache: &'a Cache,
+    listed: &'a [Vulnerability],
+    minimum_severity: AdvisorySeverity,
+    now: u64,
+) -> ShownAdvisories<'a> {
+    let mut shown = ShownAdvisories {
+        loaded: Vec::new(),
+        unloaded_count: 0,
+    };
+    for vulnerability in listed {
+        let known = if is_placeholder(vulnerability) || is_deferred(vulnerability) {
+            let Some(details) = cache.advisory(&vulnerability.id, now) else {
+                shown.unloaded_count += 1;
+                continue;
+            };
+            details
+        } else {
+            vulnerability
+        };
+        if known.severity >= minimum_severity {
+            shown.loaded.push((
+                known.id.as_str(),
+                cache.affected(&known.id, now).unwrap_or_default(),
+            ));
+        }
+    }
+    shown
+}
+
 /// The `affected` lists of the advisories that a user sees for one package version.
 ///
-/// A placeholder or a deferred advisory takes its details from the cache, and is skipped while they
-/// are missing. An advisory below `minimum_severity` is left out. The result is a `Vec` because
-/// `plan_fix` takes a slice.
+/// See [`shown_advisories`]. The result is a `Vec` because `plan_fix` takes a slice.
 pub fn shown_affected<'a>(
     cache: &'a Cache,
-    listed: &[Vulnerability],
+    listed: &'a [Vulnerability],
     minimum_severity: AdvisorySeverity,
     now: u64,
 ) -> Vec<&'a [Affected]> {
-    listed
+    shown_advisories(cache, listed, minimum_severity, now)
+        .loaded
+        .into_iter()
+        .map(|(_, affected)| affected)
+        .collect()
+}
+
+/// For each of `candidates`, in order, the indices of the `advisories` that affect `current` and
+/// still affect the candidate.
+///
+/// The full OSV rule applies: a version is affected when it lies in a range or sits in the
+/// `versions` list. An advisory that does not affect `current` never gives an index. A `current`
+/// or a candidate that is not a version gives an empty list for that entry.
+///
+/// The result is a `Vec` of `Vec`s, not a lazy iterator: each ecosystem arm runs one generic
+/// helper whose parsed advisories borrow local state, so the lists are built before it returns.
+pub fn still_affecting(
+    eco: Ecosystem,
+    package: &str,
+    current: &str,
+    advisories: &[&[Affected]],
+    candidates: &[&str],
+) -> Vec<Vec<usize>> {
+    match eco {
+        Ecosystem::PyPI => {
+            still_affecting_of::<Pep440>(eco, package, current, advisories, candidates)
+        }
+        Ecosystem::RubyGems => {
+            still_affecting_of::<GemVersion>(eco, package, current, advisories, candidates)
+        }
+        Ecosystem::Pub => {
+            still_affecting_of::<PubVersion>(eco, package, current, advisories, candidates)
+        }
+        Ecosystem::Maven => {
+            still_affecting_of::<MavenVersion>(eco, package, current, advisories, candidates)
+        }
+        _ => still_affecting_of::<DottedVersion>(eco, package, current, advisories, candidates),
+    }
+}
+
+fn still_affecting_of<V: UpdateVersion>(
+    eco: Ecosystem,
+    package: &str,
+    current: &str,
+    advisories: &[&[Affected]],
+    candidates: &[&str],
+) -> Vec<Vec<usize>> {
+    let Some(current) = V::parse_version(current) else {
+        return vec![Vec::new(); candidates.len()];
+    };
+    // Each advisory is parsed once, whatever the number of candidates.
+    let mut listed = ListedVersions::default();
+    let scopes: Vec<AdvisoryScope<'_, V>> = advisories
         .iter()
-        .filter_map(|vulnerability| {
-            let known = if is_placeholder(vulnerability) || is_deferred(vulnerability) {
-                cache.advisory(&vulnerability.id, now)?
-            } else {
-                vulnerability
+        .map(|affected| AdvisoryScope::of(eco, package, affected, &mut listed))
+        .collect();
+    let current_probe = listed.probe(&current);
+    let open_advisories: Vec<(usize, &AdvisoryScope<'_, V>)> = scopes
+        .iter()
+        .enumerate()
+        .filter(|(_, advisory)| advisory.affects(&current_probe))
+        .collect();
+    candidates
+        .iter()
+        .map(|text| {
+            let Some(version) = V::parse_version(text) else {
+                return Vec::new();
             };
-            (known.severity >= minimum_severity)
-                .then(|| cache.affected(&known.id, now).unwrap_or_default())
+            let probe = listed.probe(&version);
+            open_advisories
+                .iter()
+                .filter(|(_, advisory)| advisory.affects(&probe))
+                .map(|(index, _)| *index)
+                .collect()
         })
         .collect()
 }
@@ -610,6 +716,105 @@ mod tests {
             ranges: ranges.iter().map(|events| range(events)).collect(),
             versions: Vec::new(),
         }]
+    }
+
+    #[test]
+    fn still_affecting_follows_every_interval_and_the_listed_versions() {
+        let first = affected(
+            "PyPI",
+            "requests",
+            &[&[("introduced", "0"), ("fixed", "2.5.0")]],
+        );
+        // Two intervals: a later release can fall in the second one.
+        let second = affected(
+            "PyPI",
+            "requests",
+            &[&[
+                ("introduced", "0"),
+                ("fixed", "2.9.0"),
+                ("introduced", "2.30.0"),
+                ("fixed", "2.31.0"),
+            ]],
+        );
+        // No range, only the versions that the advisory lists.
+        let listed = vec![Affected {
+            ecosystem: "PyPI".to_owned(),
+            name: "requests".to_owned(),
+            ranges: Vec::new(),
+            versions: vec!["2.0.0".to_owned(), "2.9.1".to_owned()],
+        }];
+        // Another package: it never gives a mark.
+        let other = affected(
+            "PyPI",
+            "other",
+            &[&[("introduced", "0"), ("fixed", "9.0.0")]],
+        );
+        let advisories: [&[Affected]; 4] = [&first, &second, &listed, &other];
+        let candidates = [
+            "3.0.0", "2.34.2", "2.30.1", "2.9.2", "2.9.1", "2.4.0", "bad",
+        ];
+        assert_eq!(
+            still_affecting(
+                Ecosystem::PyPI,
+                "requests",
+                "2.0.0",
+                &advisories,
+                &candidates
+            ),
+            vec![vec![], vec![], vec![1], vec![], vec![2], vec![0, 1], vec![]]
+        );
+        // A current version that is not a version gives no mark at all.
+        assert_eq!(
+            still_affecting(
+                Ecosystem::PyPI,
+                "requests",
+                "junk",
+                &advisories,
+                &candidates
+            ),
+            vec![Vec::<usize>::new(); candidates.len()]
+        );
+    }
+
+    #[test]
+    fn shown_advisories_counts_the_advisories_without_details() {
+        use crate::osv::deferred;
+        let now = 1_000;
+        let mut cache = Cache::new(3_600);
+        let details = |id: &str, severity| Vulnerability {
+            id: id.to_owned(),
+            severity,
+            summary: "Details".to_owned(),
+            url: None,
+        };
+        // A deferred advisory whose details are in the cache.
+        cache.put_advisory(details("GHSA-def", AdvisorySeverity::High), now);
+        cache.put_affected(
+            "GHSA-def",
+            affected(
+                "PyPI",
+                "requests",
+                &[&[("introduced", "0"), ("fixed", "2.0.0")]],
+            ),
+            now,
+        );
+        let listed = vec![
+            details("GHSA-ok", AdvisorySeverity::High),
+            deferred("GHSA-def"),
+            // A deferred advisory with no details in the cache.
+            deferred("GHSA-none"),
+            // Below the minimum severity: in neither count.
+            details("GHSA-low", AdvisorySeverity::Low),
+        ];
+        let shown = shown_advisories(&cache, &listed, AdvisorySeverity::Medium, now);
+        let ids: Vec<&str> = shown.loaded.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, ["GHSA-ok", "GHSA-def"]);
+        assert_eq!(shown.unloaded_count, 1);
+        // The old function keeps its result: the `affected` lists of the loaded advisories.
+        assert_eq!(
+            shown_affected(&cache, &listed, AdvisorySeverity::Medium, now).len(),
+            2
+        );
     }
 
     #[test]
