@@ -208,7 +208,9 @@ impl Ecosystem {
         }
     }
 
-    /// Returns the registry spelling of `name`. Borrows when nothing changes.
+    /// Returns the registry spelling of `name`, which is also the key of every cache table and the name sent to OSV.
+    /// Borrows when nothing changes. PyPI, Packagist, NuGet and Cargo are normalized; the others keep the written name.
+    /// The result is idempotent.
     pub fn normalize_package(self, name: &str) -> Cow<'_, str> {
         match self {
             Ecosystem::PyPI => {
@@ -223,6 +225,14 @@ impl Ecosystem {
             Ecosystem::Packagist | Ecosystem::NuGet if name.chars().any(char::is_uppercase) => {
                 Cow::Owned(name.to_lowercase())
             }
+            // crates.io ignores case and treats `-` as `_`; OSV accepts the same (measured 2026-11-20).
+            // The index rule maps each `-` to `_` one for one, so runs are not collapsed.
+            Ecosystem::Cargo if name.chars().any(|c| c == '-' || c.is_uppercase()) => Cow::Owned(
+                name.chars()
+                    .flat_map(char::to_lowercase)
+                    .map(|c| if c == '-' { '_' } else { c })
+                    .collect(),
+            ),
             _ => Cow::Borrowed(name),
         }
     }
@@ -271,11 +281,53 @@ mod tests {
     }
 
     #[test]
-    fn other_ecosystems_keep_package_names() {
+    fn case_sensitive_ecosystems_keep_package_names() {
         assert!(matches!(
-            Ecosystem::Cargo.normalize_package("Serde"),
+            Ecosystem::Npm.normalize_package("Serde"),
             Cow::Borrowed("Serde")
         ));
+    }
+
+    #[test]
+    fn cargo_normalizes_case_and_hyphens() {
+        for (written, expected) in [
+            ("Serde_Json", "serde_json"),
+            ("serde-json", "serde_json"),
+            ("SERDE-JSON", "serde_json"),
+            ("a-_b", "a__b"),
+        ] {
+            assert_eq!(Ecosystem::Cargo.normalize_package(written), expected);
+        }
+        assert!(matches!(
+            Ecosystem::Cargo.normalize_package("serde_json"),
+            Cow::Borrowed("serde_json")
+        ));
+    }
+
+    #[test]
+    fn normalizing_twice_changes_nothing() {
+        for eco in Ecosystem::ALL {
+            for name in [
+                "Requests",
+                "Python.Jose",
+                "Symfony/Http-Kernel",
+                "Newtonsoft.Json",
+                "Rand-Core",
+                "a-_b",
+                "",
+            ] {
+                let once = eco.normalize_package(name);
+                assert_eq!(eco.normalize_package(&once), once, "{eco:?} {name:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn package_link_of_a_cargo_crate_uses_the_normalized_name() {
+        assert_eq!(
+            Ecosystem::Cargo.package_page_url("Rand-Core").as_deref(),
+            Some("https://crates.io/crates/rand_core")
+        );
     }
 
     #[test]
