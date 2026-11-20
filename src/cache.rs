@@ -18,7 +18,7 @@ pub enum FailureKind {
 }
 
 /// The failure-cache key of one package version, so a failure of one version leaves the others alone.
-/// The package is the normalized name.
+/// The package name is normalized here, so every spelling of one package shares the key.
 fn osv_failure_key(eco: Ecosystem, package: &str, version: &str) -> String {
     format!("{}@{version}", eco.normalize_package(package))
 }
