@@ -1,8 +1,8 @@
 //! Parser for npm `package.json` dependency sections.
 //!
 //! npm aliases (`npm:` prefix) are skipped because they name another package.
-//! Other specs, such as `file:`, `workspace:` and URLs, are kept. They have no
-//! registry version, so `declared_version_for_osv` filters them out before any lookup.
+//! Specs that point to a local path, a workspace, a git repository or a URL are skipped
+//! too: they name no package of the registry, so no lookup and no link may use them.
 
 use super::json_spans::{JsonSection, parse_sections};
 use crate::model::Dependency;
@@ -31,10 +31,18 @@ const SECTIONS: [JsonSection; 4] = [
     },
 ];
 
+/// Whether `spec` points to a local path, a workspace, a git repository or a URL.
+///
+/// A registry range or dist-tag never holds `:` or `/`, so either character marks a source
+/// such as `file:../x`, `workspace:*`, `git+https://…`, `github:user/repo`, `user/repo` or `./x.tgz`.
+fn is_non_registry_source(spec: &str) -> bool {
+    spec.contains([':', '/'])
+}
+
 /// Parses the dependencies of a `package.json` manifest.
 pub fn parse(text: &str) -> Vec<Dependency> {
     parse_sections(text, &SECTIONS, |_name, version| {
-        version.starts_with("npm:")
+        version.starts_with("npm:") || is_non_registry_source(version)
     })
 }
 
@@ -72,15 +80,29 @@ mod tests {
                 ("left-pad", "^1.3.0", false, false),
                 ("@scope/pkg", "~2.1.0", false, false),
                 ("ünï", "1.0.0", false, false),
-                ("local", "file:../local", false, false),
-                ("mono", "workspace:*", false, false),
-                ("gh", "user/repo", false, false),
-                ("git", "git+https://github.com/x/y.git", false, false),
                 ("jest", "29.7.0", true, false),
                 ("react", ">=17 <19", false, true),
                 ("fsevents", "2.3.3", false, true),
             ]
         );
+    }
+
+    #[test]
+    fn omits_local_workspace_git_and_url_sources() {
+        // These specs name no registry package, so the plugin reads no name from them.
+        let dependencies = parse(FIXTURE);
+        for omitted in ["local", "mono", "gh", "git"] {
+            assert!(
+                dependencies
+                    .iter()
+                    .all(|dependency| dependency.name != omitted),
+                "{omitted} must not be returned"
+            );
+        }
+        let text = "{\"dependencies\": {\"a\": \"link:../a\", \"b\": \"portal:../b\", \"c\": \"github:u/c\", \"d\": \"https://x.test/d.tgz\", \"e\": \"./e.tgz\", \"f\": \"catalog:\", \"g\": \"latest\", \"h\": \"*\"}}";
+        let names: Vec<String> = parse(text).into_iter().map(|d| d.name).collect();
+        // A dist-tag and a wildcard still name a registry package.
+        assert_eq!(names, ["g", "h"]);
     }
 
     #[test]

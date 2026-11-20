@@ -626,6 +626,20 @@ fn project_root_of(path: &str) -> Option<String> {
     host::project_of(path)?.root().ok()
 }
 
+/// The ecosystem of `path`, when the plugin analyzes that file: a manifest outside the skipped
+/// folders of the project at `project_root`, whose ecosystem is enabled. It does not ask the host.
+pub(crate) fn enabled_manifest_ecosystem(
+    settings: &Settings,
+    path: &str,
+    project_root: Option<&str>,
+) -> Option<Ecosystem> {
+    if !is_manifest_in(path, project_root) {
+        return None;
+    }
+    let eco = Ecosystem::detect(path)?;
+    settings.is_enabled(eco).then_some(eco)
+}
+
 /// Whether `path` is a manifest of the project at `project_root`. It does not ask the host.
 pub(crate) fn is_manifest_in(path: &str, project_root: Option<&str>) -> bool {
     Ecosystem::detect(path).is_some() && !is_in_skipped_directory(path, project_root)
@@ -1228,6 +1242,27 @@ mod disk_cache_tests {
             .filter(|(level, _)| matches!(level, LogLevel::Warn))
             .count();
         assert_eq!(warnings, 1);
+    }
+}
+
+#[cfg(test)]
+mod manifest_ecosystem_tests {
+    use super::enabled_manifest_ecosystem;
+    use crate::model::Ecosystem;
+    use crate::settings::Settings;
+
+    #[test]
+    fn only_an_enabled_manifest_outside_skipped_folders_has_an_ecosystem() {
+        let mut settings = Settings::default();
+        let cargo = |settings: &Settings, path: &str| {
+            enabled_manifest_ecosystem(settings, path, Some("/p"))
+        };
+        assert_eq!(cargo(&settings, "/p/Cargo.toml"), Some(Ecosystem::Cargo));
+        // A folder that the plugin skips, and a file that is no manifest.
+        assert_eq!(cargo(&settings, "/p/target/Cargo.toml"), None);
+        assert_eq!(cargo(&settings, "/p/notes.txt"), None);
+        settings.enabled.remove(&Ecosystem::Cargo);
+        assert_eq!(cargo(&settings, "/p/Cargo.toml"), None);
     }
 }
 

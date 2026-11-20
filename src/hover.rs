@@ -1,6 +1,6 @@
 //! The IDE hover that links the package page of the dependency under the cursor.
 
-use crate::model::{Dependency, Ecosystem};
+use crate::model::Dependency;
 use crate::settings::Settings;
 use crate::text::to_range_in_line;
 use openidea_plugin::hover::Hover;
@@ -11,8 +11,7 @@ use openidea_plugin::{Position, Range};
 /// The cursor must lie on the name or on the version of a dependency. The answer reads no cache
 /// and makes no request. It follows the path of the quick fixes: a file that is not a manifest, a
 /// disabled ecosystem and an ignored package give `None`. A private or local package is not in
-/// `Ecosystem::parse`, so it gets no link. The one exception is npm, whose local and URL specs
-/// the parser keeps: `names_a_registry_package` refuses them. A name that is unsafe for a URL gives `None` too.
+/// `Ecosystem::parse`, so it gets no link. A name that is unsafe for a URL gives `None` too.
 pub fn package_link_hover(
     settings: &Settings,
     doc_path: &str,
@@ -20,13 +19,7 @@ pub fn package_link_hover(
     doc_text: &str,
     at: Position,
 ) -> Option<Hover> {
-    if !crate::is_manifest_in(doc_path, project_root) {
-        return None;
-    }
-    let eco = Ecosystem::detect(doc_path)?;
-    if !settings.is_enabled(eco) {
-        return None;
-    }
+    let eco = crate::enabled_manifest_ecosystem(settings, doc_path, project_root)?;
     // The cursor line is read once, so no span walks the text from its start again.
     let cursor_line = doc_text.lines().nth(at.line as usize)?;
     let dependencies = eco.parse(doc_text);
@@ -34,9 +27,6 @@ pub fn package_link_hover(
     let (dependency, hovered_range) = dependencies.iter().find_map(|dependency| {
         range_under_cursor(cursor_line, dependency, at).map(|range| (dependency, range))
     })?;
-    if !names_a_registry_package(eco, dependency) {
-        return None;
-    }
     // The ignore set is built only for a match, so a hover over plain text allocates nothing.
     if settings
         .ignored_packages(eco)
@@ -45,40 +35,46 @@ pub fn package_link_hover(
         return None;
     }
     let url = eco.package_page_url(&dependency.name)?;
-    // The link text names the package as the manifest writes it. `package_page_url` already
-    // checked the name against an allow-list, so the name cannot break the Markdown link.
+    // The link text names the package as the manifest writes it. `package_page_url` checked the
+    // normalized name against an allow-list, and normalization never removes a Markdown character,
+    // so the name cannot break the link. Emphasis characters are escaped, so they stay visible.
     let text = format!(
         "[Open {} on {}]({url})",
-        dependency.name,
+        escape_emphasis(&dependency.name),
         eco.registry_label()
     );
     Some(Hover::new(text).range(hovered_range))
 }
 
-/// Whether `dependency` is a package of the public registry of `eco`.
-///
-/// The npm parser keeps `file:`, `link:`, `workspace:`, git, URL and `user/repo` specs, because
-/// `declared_version_for_osv` filters them later. A registry range never holds `:` or `/`, so
-/// either character marks a local or URL source, which gets no link (privacy invariant).
-/// The parsers of the other ecosystems already drop such sources.
-fn names_a_registry_package(eco: Ecosystem, dependency: &Dependency) -> bool {
-    eco != Ecosystem::Npm || !dependency.version.contains([':', '/'])
+/// Escapes the characters of `name` that Markdown reads as emphasis, so a name such as `_priv_`
+/// keeps its underscores in the link text.
+fn escape_emphasis(name: &str) -> String {
+    let mut escaped = String::with_capacity(name.len());
+    for character in name.chars() {
+        if matches!(character, '_' | '~' | '*') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 /// The range of the name or of the version of `dependency` that holds `at`, if any.
 ///
-/// `cursor_line` is the text of line `at.line`. The end of a span is exclusive.
+/// `cursor_line` is the text of line `at.line`. The end of a span counts, because the editor
+/// rounds the mouse position to the nearest character boundary.
 fn range_under_cursor(cursor_line: &str, dependency: &Dependency, at: Position) -> Option<Range> {
     [dependency.name_span, dependency.version_span]
         .into_iter()
         .filter(|span| span.line == at.line)
         .filter_map(|span| to_range_in_line(cursor_line, span))
-        .find(|range| range.start.character <= at.character && at.character < range.end.character)
+        .find(|range| range.start.character <= at.character && at.character <= range.end.character)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Ecosystem;
 
     const CARGO: &str =
         "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.0\"\n";
@@ -116,6 +112,9 @@ mod tests {
             ("/p/Cargo.toml", CARGO, 5, 9, SERDE_LINK),
             ("/p/Cargo.toml", CARGO, 5, 10, SERDE_LINK),
             ("/p/Cargo.toml", CARGO, 5, 13, SERDE_LINK),
+            // The editor rounds the mouse to the nearest boundary, so the end of a span counts.
+            ("/p/Cargo.toml", CARGO, 5, 5, SERDE_LINK),
+            ("/p/Cargo.toml", CARGO, 5, 14, SERDE_LINK),
             ("/p/requirements.txt", PIP, 0, 3, REQUESTS_LINK),
         ];
         for (path, text, line, character, expected) in cases {
@@ -148,11 +147,11 @@ mod tests {
 
     #[test]
     fn a_cursor_outside_every_span_gives_nothing() {
-        // The end of a span is exclusive. Columns 5 to 8 lie between the name and the version.
+        // Columns 6 to 8 lie between the name and the version, and 15 is past the version.
         let cases = [
-            (CARGO, 5, 5),
+            (CARGO, 5, 6),
             (CARGO, 5, 8),
-            (CARGO, 5, 14),
+            (CARGO, 5, 15),
             (CARGO, 5, 40),
             (CARGO, 4, 3),
             (CARGO, 99, 0),
@@ -228,6 +227,81 @@ mod tests {
         for line in 1..=4 {
             assert_eq!(hover_at(path, requirements, line, 3), None, "line {line}");
         }
+    }
+
+    /// The UTF-16 column where `needle` starts in `line`, as the editor counts columns.
+    fn utf16_column_of(line: &str, needle: &str) -> u32 {
+        let byte_start = line.find(needle).expect("the needle is in the line");
+        u32::try_from(line[..byte_start].encode_utf16().count()).expect("a small column")
+    }
+
+    #[test]
+    fn crlf_line_ends_and_a_bom_do_not_shift_the_cursor() {
+        let crlf = CARGO.replace('\n', "\r\n");
+        assert_eq!(
+            hover_at("/p/Cargo.toml", &crlf, 5, 2).as_deref(),
+            Some(SERDE_LINK)
+        );
+        assert_eq!(
+            hover_at("/p/Cargo.toml", &crlf, 5, 10).as_deref(),
+            Some(SERDE_LINK)
+        );
+        // A BOM is one UTF-16 unit on line 0, so the name of the first requirement starts at 1.
+        let with_bom = format!("\u{feff}{PIP}");
+        assert_eq!(
+            hover_at("/p/requirements.txt", &with_bom, 0, 1).as_deref(),
+            Some(REQUESTS_LINK)
+        );
+        assert_eq!(hover_at("/p/requirements.txt", &with_bom, 0, 0), None);
+    }
+
+    #[test]
+    fn text_before_the_name_on_the_same_line_counts_in_utf16_units() {
+        // `é` is one UTF-16 unit and the emoji is two, but they take two and four bytes.
+        let line =
+            "{\"note\":\"é😀\",\"dependencies\":{\"left-pad\":\"^1.3.0\",\"react\":\"^18.0.0\"}}\n";
+        let path = "/p/package.json";
+        let left_pad = utf16_column_of(line, "left-pad");
+        let react = utf16_column_of(line, "react");
+        assert_eq!(
+            hover_at(path, line, 0, left_pad + 2).as_deref(),
+            Some("[Open left-pad on npm](https://www.npmjs.com/package/left-pad)")
+        );
+        // Two dependencies share the line: each cursor gets the dependency under it.
+        assert_eq!(
+            hover_at(path, line, 0, react + 2).as_deref(),
+            Some("[Open react on npm](https://www.npmjs.com/package/react)")
+        );
+        assert_eq!(hover_at(path, line, 0, left_pad - 3), None);
+    }
+
+    #[test]
+    fn a_parsed_name_that_is_unsafe_for_a_url_has_no_link() {
+        // The npm parser reads `ünï`, but the name is not ASCII, so `package_page_url` refuses it.
+        let package_json = "{\n  \"dependencies\": {\n    \"ünï\": \"1.0.0\"\n  }\n}\n";
+        assert_eq!(hover_at("/p/package.json", package_json, 2, 6), None);
+    }
+
+    #[test]
+    fn a_manifest_in_a_skipped_folder_has_no_link() {
+        let hover = |path: &str| {
+            package_link_hover(
+                &Settings::default(),
+                path,
+                Some("/p"),
+                CARGO,
+                Position::new(5, 2),
+            )
+        };
+        assert!(hover("/p/Cargo.toml").is_some());
+        assert_eq!(hover("/p/node_modules/dep/Cargo.toml"), None);
+    }
+
+    #[test]
+    fn emphasis_characters_of_a_name_are_escaped_in_the_link_text() {
+        assert_eq!(escape_emphasis("_priv_"), "\\_priv\\_");
+        assert_eq!(escape_emphasis("a~b*c"), "a\\~b\\*c");
+        assert_eq!(escape_emphasis("left-pad"), "left-pad");
     }
 
     #[test]

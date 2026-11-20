@@ -184,9 +184,9 @@ fn vulnerability_part(view: &AdvisoryView<'_>) -> Option<(String, Tone)> {
     Some((text, tone))
 }
 
-/// Builds the Markdown hover: one block per fact, joined by blank lines.
+/// Builds the tooltip text of an entry: one block per fact, joined by blank lines.
 ///
-/// The editor shows this text as a plain tooltip. The clickable link to the package page comes
+/// The blocks are written in Markdown, but the editor shows this text as a plain tooltip. The clickable link to the package page comes
 /// from the hover provider (`src/hover.rs`).
 fn hover_of(entry: &Entry) -> String {
     let version = entry

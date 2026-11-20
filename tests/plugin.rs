@@ -179,6 +179,17 @@ fn the_ide_hover_links_the_package_page_of_the_dependency_under_the_cursor() {
         hover.markdown,
         "[Open serde on crates.io](https://crates.io/crates/serde)"
     );
+    // The editor anchors the tooltip on this range, so it must be the version under the cursor.
+    assert_eq!(hover.range, Some(SERDE_VERSION_RANGE));
+    // A manifest in a skipped folder gets no link, through the real project-root lookup.
+    let skipped = Document {
+        path: "/p/node_modules/dep/Cargo.toml".to_owned(),
+        ..document.clone()
+    };
+    assert_eq!(
+        HoverProvider::hover(&mut plugin, &skipped, Position::new(5, 10)),
+        None
+    );
     // Off the dependencies, the plugin adds nothing. It never reaches the network.
     assert_eq!(
         HoverProvider::hover(&mut plugin, &document, Position::new(1, 2)),
