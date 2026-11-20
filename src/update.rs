@@ -718,10 +718,12 @@ mod tests {
             );
         }
     }
+
     #[test]
     fn newer_releases_keeps_registry_order_and_skips_junk() {
-        let owned =
-            |texts: &[&str]| -> Vec<String> { texts.iter().map(|t| (*t).to_owned()).collect() };
+        let owned = |texts: &[&str]| -> Vec<String> {
+            texts.iter().map(|text| (*text).to_owned()).collect()
+        };
         // (ecosystem, base, registry list, expected (text, is_prerelease))
         let cases = [
             (

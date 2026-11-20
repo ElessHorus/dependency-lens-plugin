@@ -2,7 +2,7 @@
 
 use crate::actions::checked_version_for;
 use crate::cache::Cache;
-use crate::fixes::{shown_advisories, still_affecting};
+use crate::fixes::{ShownAdvisories, shown_advisories, still_affecting};
 use crate::model::{Affected, Dependency, Ecosystem};
 use crate::settings::Settings;
 use crate::update::newer_releases;
@@ -77,22 +77,7 @@ pub fn version_history(
         if let (Some(known), Some(indices)) = (&advisories, still_affected.get(index))
             && !indices.is_empty()
         {
-            let mut mark = String::from("still affected: ");
-            for (position, advisory_index) in indices.iter().take(MAX_IDS).enumerate() {
-                if position > 0 {
-                    mark.push_str(", ");
-                }
-                // An id sits in a code span, so a backtick inside it must not close the span.
-                let _ = write!(
-                    mark,
-                    "`{}`",
-                    known.loaded[*advisory_index].0.replace('`', "'")
-                );
-            }
-            if indices.len() > MAX_IDS {
-                let _ = write!(mark, ", +{}", indices.len() - MAX_IDS);
-            }
-            add_mark(&mut marks, &mark);
+            add_mark(&mut marks, &still_affected_mark(known, indices));
         }
         if !marks.is_empty() {
             text.push_str(" — ");
@@ -102,21 +87,47 @@ pub fn version_history(
     if newer.len() > MAX_RELEASES {
         let _ = write!(text, "\n- … {} more", newer.len() - MAX_RELEASES);
     }
-    // A blank line ends the list, so a footer is not read as part of the last item.
     if let Some(known) = &advisories {
-        text.push_str("\n\nAdvisories of newer versions are not checked.");
-        match known.unloaded_count {
-            0 => {}
-            1 => text.push_str("\n\n1 advisory is not loaded, so it is not compared."),
-            count => {
-                let _ = write!(
-                    text,
-                    "\n\n{count} advisories are not loaded, so they are not compared."
-                );
-            }
-        }
+        push_advisory_footers(&mut text, known);
     }
     Some(text)
+}
+
+/// The mark that names the advisories of `indices` (positions in `advisories.loaded`) that still
+/// affect one release: the first `MAX_IDS` ids, then the count of the others.
+fn still_affected_mark(advisories: &ShownAdvisories, indices: &[usize]) -> String {
+    let mut mark = String::from("still affected: ");
+    for (position, advisory_index) in indices.iter().take(MAX_IDS).enumerate() {
+        if position > 0 {
+            mark.push_str(", ");
+        }
+        // An id sits in a code span, so a backtick inside it must not close the span.
+        let _ = write!(
+            mark,
+            "`{}`",
+            advisories.loaded[*advisory_index].0.replace('`', "'")
+        );
+    }
+    if indices.len() > MAX_IDS {
+        let _ = write!(mark, ", +{}", indices.len() - MAX_IDS);
+    }
+    mark
+}
+
+/// Appends the footers that tell the limits of the security marks to `text`.
+fn push_advisory_footers(text: &mut String, advisories: &ShownAdvisories) {
+    // A blank line ends the list, so a footer is not read as part of the last item.
+    text.push_str("\n\nAdvisories of newer versions are not checked.");
+    match advisories.unloaded_count {
+        0 => {}
+        1 => text.push_str("\n\n1 advisory is not loaded, so it is not compared."),
+        count => {
+            let _ = write!(
+                text,
+                "\n\n{count} advisories are not loaded, so they are not compared."
+            );
+        }
+    }
 }
 
 /// Appends `mark` to `marks`, after a separator when `marks` is not empty.
@@ -381,6 +392,26 @@ mod tests {
             text.contains("- `2.9.1` — allowed, still affected: `GHSA-b`"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn still_affected_mark_names_three_ids_then_counts_the_others() {
+        let ids = ["GHSA-1", "GHSA-`2", "GHSA-3", "GHSA-4"];
+        let advisories = ShownAdvisories {
+            loaded: ids.iter().map(|id| (*id, &[] as &[Affected])).collect(),
+            unloaded_count: 0,
+        };
+        let cases: [(&[usize], &str); 3] = [
+            (&[2], "still affected: `GHSA-3`"),
+            (&[0, 1, 2], "still affected: `GHSA-1`, `GHSA-'2`, `GHSA-3`"),
+            (
+                &[3, 2, 1, 0],
+                "still affected: `GHSA-4`, `GHSA-3`, `GHSA-'2`, +1",
+            ),
+        ];
+        for (indices, expected) in cases {
+            assert_eq!(still_affected_mark(&advisories, indices), expected);
+        }
     }
 
     #[test]

@@ -12,9 +12,10 @@ use openidea_plugin::{Position, Range};
 ///
 /// The cursor must lie on the name or on the version of a dependency. Under the link, the answer
 /// lists the releases newer than the checked version when the cache holds the registry list of the
-/// package. It only reads the cache and makes no request. It follows the path of the quick fixes: a file that is not a manifest, a
-/// disabled ecosystem and an ignored package give `None`. A private or local package is not in
-/// `Ecosystem::parse`, so it gets no link. A name that is unsafe for a URL gives `None` too.
+/// package. It only reads the cache and makes no request. It follows the path of the quick fixes:
+/// a file that is not a manifest, a disabled ecosystem and an ignored package give `None`. A
+/// private or local package is not in `Ecosystem::parse`, so it gets no link. A name that is
+/// unsafe for a URL gives `None` too.
 pub fn package_link_hover(
     settings: &Settings,
     cache: &Cache,
