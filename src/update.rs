@@ -200,6 +200,46 @@ fn is_outdated_of<V: UpdateVersion>(declared: &str, latest: &str) -> bool {
     !latest.is_prerelease_version() && latest > bound
 }
 
+/// One registry release that orders after a base version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Release<'a> {
+    /// The version text, as the registry writes it.
+    pub text: &'a str,
+    /// Whether the version is a pre-release.
+    pub is_prerelease: bool,
+}
+
+/// The entries of `versions` that order after `base`, in the order of `versions`.
+///
+/// A text that is not a version of the ecosystem is skipped. A `base` that is not a version gives
+/// no release. The list is not sorted again: the registry clients already rank it.
+pub fn newer_releases<'a>(eco: Ecosystem, base: &str, versions: &'a [String]) -> Vec<Release<'a>> {
+    match eco {
+        Ecosystem::PyPI => newer_releases_of::<Pep440>(base, versions),
+        Ecosystem::RubyGems => newer_releases_of::<GemVersion>(base, versions),
+        Ecosystem::Pub => newer_releases_of::<PubVersion>(base, versions),
+        Ecosystem::Maven => newer_releases_of::<MavenVersion>(base, versions),
+        _ => newer_releases_of::<DottedVersion>(base, versions),
+    }
+}
+
+/// One pass: `base` is parsed once and each listed text once.
+fn newer_releases_of<'a, V: UpdateVersion>(base: &str, versions: &'a [String]) -> Vec<Release<'a>> {
+    let Some(base) = V::parse_version(base) else {
+        return Vec::new();
+    };
+    versions
+        .iter()
+        .filter_map(|text| {
+            let version = V::parse_version(text)?;
+            (version > base).then(|| Release {
+                text,
+                is_prerelease: version.is_prerelease_version(),
+            })
+        })
+        .collect()
+}
+
 /// Splits a requirement into its leading operator run and the version text after it.
 pub(crate) fn split_operator(requirement: &str) -> (&str, &str) {
     // The operator bytes are ASCII, so the split always falls on a character boundary.
@@ -676,6 +716,47 @@ mod tests {
                 Some(expected),
                 "{declared} -> {latest}"
             );
+        }
+    }
+    #[test]
+    fn newer_releases_keeps_registry_order_and_skips_junk() {
+        let owned =
+            |texts: &[&str]| -> Vec<String> { texts.iter().map(|t| (*t).to_owned()).collect() };
+        // (ecosystem, base, registry list, expected (text, is_prerelease))
+        let cases: [(Ecosystem, &str, Vec<String>, Vec<(&str, bool)>); 4] = [
+            (
+                Ecosystem::PyPI,
+                "2.0.0",
+                owned(&[
+                    "3.0.0", "2.34.2", "2.9.2rc1", "2.9.2", "2.0.0", "1.9.0", "junk",
+                ]),
+                vec![
+                    ("3.0.0", false),
+                    ("2.34.2", false),
+                    ("2.9.2rc1", true),
+                    ("2.9.2", false),
+                ],
+            ),
+            (
+                Ecosystem::RubyGems,
+                "1.0.0",
+                owned(&["2.0.0.beta1", "1.0.1", "1.0.0"]),
+                vec![("2.0.0.beta1", true), ("1.0.1", false)],
+            ),
+            (
+                Ecosystem::NuGet,
+                "1.0.0",
+                owned(&["1.1.0-preview1", "1.0.0"]),
+                vec![("1.1.0-preview1", true)],
+            ),
+            (Ecosystem::PyPI, "not-a-version", owned(&["1.0.0"]), vec![]),
+        ];
+        for (eco, base, versions, expected) in cases {
+            let found: Vec<(&str, bool)> = newer_releases(eco, base, &versions)
+                .into_iter()
+                .map(|release| (release.text, release.is_prerelease))
+                .collect();
+            assert_eq!(found, expected, "{eco:?} after {base}");
         }
     }
 }
