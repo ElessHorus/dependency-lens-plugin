@@ -4,6 +4,7 @@ pub mod actions;
 pub mod analysis;
 pub mod cache;
 pub mod fixes;
+pub mod history;
 pub mod hover;
 pub mod http;
 pub mod model;
@@ -892,12 +893,20 @@ impl Providers for DependencyLens {
 }
 
 impl HoverProvider for DependencyLens {
-    /// Links the package page of the dependency under the cursor. It reads no cache and makes no request.
+    /// Links the package page of the dependency under the cursor and lists the releases newer than
+    /// its checked version. It reads the cache and makes no request.
     fn hover(&mut self, doc: &Document, at: Position) -> Option<Hover> {
         // The provider runs for every file, so the cheap file-name test comes before the host call.
-        Ecosystem::detect(&doc.path)?;
+        let eco = Ecosystem::detect(&doc.path)?;
+        // After an unload the cache is empty: read what the disk holds first, as the quick fix does.
+        // Only an enabled ecosystem with a registry has a list to show, so no other block is read.
+        if eco.offers_updates() && self.settings.is_enabled(eco) {
+            self.load_block(eco, &HostStore);
+        }
         hover::package_link_hover(
             &self.settings,
+            &self.cache,
+            now_secs(),
             &doc.path,
             project_root_of(&doc.path).as_deref(),
             &doc.text,
@@ -1057,6 +1066,32 @@ mod disk_cache_tests {
         plugin.save_blocks(&store);
         assert!(!plugin.cache.is_dirty(Ecosystem::PyPI));
         assert_eq!(store.keys(), ["cache/PyPI"]);
+    }
+
+    #[test]
+    fn a_hover_reads_the_disk_block_only_of_an_enabled_ecosystem_with_a_registry() {
+        let _host = MockHost::install();
+        let hover_over = |plugin: &mut DependencyLens, path: &str| {
+            let document = Document {
+                path: path.to_owned(),
+                language: "plaintext".to_owned(),
+                version: 1,
+                text: String::new(),
+            };
+            HoverProvider::hover(plugin, &document, Position::new(0, 0))
+        };
+        // Cargo has no registry list, so the hover has no use for its block.
+        let mut plugin = DependencyLens::default();
+        hover_over(&mut plugin, "/p/Cargo.toml");
+        assert!(!plugin.loaded_blocks.contains(&Ecosystem::Cargo));
+        // A disabled ecosystem gets no hover at all.
+        plugin.settings.enabled.remove(&Ecosystem::PyPI);
+        hover_over(&mut plugin, "/p/requirements.txt");
+        assert!(!plugin.loaded_blocks.contains(&Ecosystem::PyPI));
+        // An enabled ecosystem with a registry reads its block, once.
+        plugin.settings.enabled.insert(Ecosystem::PyPI);
+        hover_over(&mut plugin, "/p/requirements.txt");
+        assert!(plugin.loaded_blocks.contains(&Ecosystem::PyPI));
     }
 
     /// An entry for the first dependency of `requirements`, with `status`.

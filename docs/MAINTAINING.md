@@ -19,7 +19,7 @@ Run these checks in the real IDE, after building and linking the plugin (see the
    - Set `cacheTtlSeconds` to `0` and open it again, to compare with no cache.
    - Run "Dependency Lens: Clear cache". The next cold open is slow again.
 8. Check the lowest allowed version. Open a `requirements.txt` that holds `requests>1.12,<2.10`. After the check, the hover must show `Checked version: 2.0.0` and the line `Lowest version that the requirement allows (the manifest writes 1.12).` (the line appears when the version has advisories). `1.12` does not exist on PyPI, so the check must not use it.
-9. Check the package link. Open `dl-test-project/pubspec.yaml` and hover the name and the version of a dependency. Below the hover of the language server, a link such as `Open <package> on pub.dev` must show. Click it: the package page must open. A dependency with `path:` or a private `hosted:` source must have no link. The tooltip on the version text must hold no link.
+9. Check the package link. Open `dl-test-project/pubspec.yaml` and hover the name and the version of a dependency. Below the hover of the language server, a link such as `Open <package> on pub.dev` must show. Click it: the package page must open. A dependency with `path:` or a private `hosted:` source must have no link. The tooltip on the version text must hold no link. Hover a dependency of a `requirements.txt` with a range such as `requests>1.12,<2.10`, after its lookup ran. Below the link, a list `Versions after <version>:` must show. Each line must carry `allowed` or `outside your bounds`. A line must name `still affected: <ids>` when the checked version has an advisory that still affects it. A `Cargo.toml` dependency must show the link alone.
 
 ## Updating the pinned actions
 

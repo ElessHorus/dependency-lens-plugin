@@ -1,5 +1,7 @@
 //! The IDE hover that links the package page of the dependency under the cursor.
 
+use crate::cache::Cache;
+use crate::history::version_history;
 use crate::model::Dependency;
 use crate::settings::Settings;
 use crate::text::to_range_in_line;
@@ -8,12 +10,16 @@ use openidea_plugin::{Position, Range};
 
 /// The hover that links the package page of the dependency under the cursor.
 ///
-/// The cursor must lie on the name or on the version of a dependency. The answer reads no cache
-/// and makes no request. It follows the path of the quick fixes: a file that is not a manifest, a
-/// disabled ecosystem and an ignored package give `None`. A private or local package is not in
-/// `Ecosystem::parse`, so it gets no link. A name that is unsafe for a URL gives `None` too.
+/// The cursor must lie on the name or on the version of a dependency. Under the link, the answer
+/// lists the releases newer than the checked version when the cache holds the registry list of the
+/// package. It only reads the cache and makes no request. It follows the path of the quick fixes:
+/// a file that is not a manifest, a disabled ecosystem and an ignored package give `None`. A
+/// private or local package is not in `Ecosystem::parse`, so it gets no link. A name that is
+/// unsafe for a URL gives `None` too.
 pub fn package_link_hover(
     settings: &Settings,
+    cache: &Cache,
+    now: u64,
     doc_path: &str,
     project_root: Option<&str>,
     doc_text: &str,
@@ -38,11 +44,15 @@ pub fn package_link_hover(
     // The link text names the package as the manifest writes it. `package_page_url` checked the
     // normalized name against an allow-list, and normalization never removes a Markdown character,
     // so the name cannot break the link. Emphasis characters are escaped, so they stay visible.
-    let text = format!(
+    let mut text = format!(
         "[Open {} on {}]({url})",
         escape_emphasis(&dependency.name),
         eco.registry_label()
     );
+    if let Some(section) = version_history(eco, dependency, cache, settings, now) {
+        text.push_str("\n\n");
+        text.push_str(&section);
+    }
     Some(Hover::new(text).range(hovered_range))
 }
 
@@ -74,7 +84,9 @@ fn range_under_cursor(cursor_line: &str, dependency: &Dependency, at: Position) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Ecosystem;
+    use crate::model::{Ecosystem, VersionInfo};
+
+    const NOW: u64 = 1_000;
 
     const CARGO: &str =
         "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.0\"\n";
@@ -98,8 +110,79 @@ mod tests {
         line: u32,
         character: u32,
     ) -> Option<String> {
-        package_link_hover(settings, path, None, text, Position::new(line, character))
-            .map(|hover| hover.markdown)
+        package_link_hover(
+            settings,
+            &Cache::new(3_600),
+            NOW,
+            path,
+            None,
+            text,
+            Position::new(line, character),
+        )
+        .map(|hover| hover.markdown)
+    }
+
+    /// A cache that holds the registry list of `requests`, newest first.
+    fn cache_with_requests_list() -> Cache {
+        let mut cache = Cache::new(3_600);
+        let versions = [
+            "3.0.0", "2.34.2", "2.10.0", "2.9.2", "2.9.1", "2.9.0rc1", "2.0.0",
+        ];
+        let info = VersionInfo {
+            latest: Some("3.0.0".to_owned()),
+            versions: versions.iter().map(|text| (*text).to_owned()).collect(),
+        };
+        cache.put_version_info(Ecosystem::PyPI, "requests", info, NOW);
+        cache
+    }
+
+    const RANGE: &str = "requests>1.12,<2.10\n";
+    const RANGE_SECTION: &str = "Versions after 2.0.0:\n\
+- `3.0.0` — outside your bounds\n\
+- `2.34.2` — outside your bounds\n\
+- `2.10.0` — outside your bounds\n\
+- `2.9.2` — allowed, latest allowed\n\
+- `2.9.1` — allowed\n\
+- `2.9.0rc1` — allowed, pre-release\n\
+\n\
+Advisories of newer versions are not checked.\n\
+\n\
+The advisories of 2.0.0 are not known yet, so no release is compared with them.";
+
+    fn hover_with_cache(settings: &Settings, text: &str, line: u32) -> Option<String> {
+        package_link_hover(
+            settings,
+            &cache_with_requests_list(),
+            NOW,
+            "/p/requirements.txt",
+            None,
+            text,
+            Position::new(line, 2),
+        )
+        .map(|hover| hover.markdown)
+    }
+
+    #[test]
+    fn the_hover_adds_the_newer_releases_under_the_link() {
+        assert_eq!(
+            hover_with_cache(&Settings::default(), RANGE, 0),
+            Some(format!("{REQUESTS_LINK}\n\n{RANGE_SECTION}"))
+        );
+    }
+
+    #[test]
+    fn an_ignored_package_has_no_section() {
+        let settings = Settings {
+            ignore: vec!["requests".to_owned()],
+            ..Settings::default()
+        };
+        assert_eq!(hover_with_cache(&settings, RANGE, 0), None);
+    }
+
+    #[test]
+    fn a_package_of_a_private_index_has_no_section() {
+        let text = format!("--index-url https://pypi.example.com/simple\n{RANGE}");
+        assert_eq!(hover_with_cache(&Settings::default(), &text, 1), None);
     }
 
     #[test]
@@ -135,6 +218,8 @@ mod tests {
         for (character, expected) in [(0, name), (4, name), (9, version), (13, version)] {
             let hover = package_link_hover(
                 &Settings::default(),
+                &Cache::new(3_600),
+                NOW,
                 "/p/Cargo.toml",
                 None,
                 CARGO,
@@ -287,6 +372,8 @@ mod tests {
         let hover = |path: &str| {
             package_link_hover(
                 &Settings::default(),
+                &Cache::new(3_600),
+                NOW,
                 path,
                 Some("/p"),
                 CARGO,

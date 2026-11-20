@@ -1501,6 +1501,162 @@ fn a_range_with_no_allowed_fix_says_so_in_the_hover() {
     assert!(hover.contains("GHSA-late"), "{hover}");
 }
 
+/// A mock whose PyPI answer is `RANGE_PYPI_BODY` and whose OSV answer is one advisory, `GHSA-late`,
+/// fixed in 2.31.0.
+fn host_with_range_and_advisory() -> MockHost {
+    let host = MockHost::install().with_capabilities(&[
+        "events",
+        "project.read",
+        "editor.read",
+        "net:api.osv.dev",
+        "net:pypi.org",
+    ]);
+    host.set_project_root(Some("/p"));
+    host.on_fetch(|request| {
+        let body = if request.url.starts_with("https://pypi.org/pypi/") {
+            RANGE_PYPI_BODY.to_owned()
+        } else if request.url.ends_with(OSV_BATCH_SUFFIX) {
+            json!({ "results": [{ "vulns": [{ "id": "GHSA-late" }] }] }).to_string()
+        } else if request.url.starts_with(OSV_DETAIL_PREFIX) {
+            json!({
+                "id": "GHSA-late",
+                "summary": "An old flaw",
+                "database_specific": { "severity": "HIGH" },
+                "affected": [{
+                    "package": { "name": "requests", "ecosystem": "PyPI" },
+                    "ranges": [{
+                        "type": "ECOSYSTEM",
+                        "events": [{ "introduced": "0" }, { "fixed": "2.31.0" }]
+                    }]
+                }]
+            })
+            .to_string()
+        } else {
+            return Err(Error::Failed(format!("unexpected request {}", request.url)));
+        };
+        Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: body.into_bytes(),
+        })
+    });
+    host
+}
+
+fn requirements_document(text: &str) -> Document {
+    Document {
+        path: REQUIREMENTS_PATH.to_owned(),
+        language: "pip-requirements".to_owned(),
+        version: 1,
+        text: text.to_owned(),
+    }
+}
+
+#[test]
+fn the_hover_lists_the_newer_releases_with_their_marks() {
+    let host = host_with_range_and_advisory();
+    host.add_file("requirements.txt", RANGE_REQUIREMENTS);
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(REQUIREMENTS_PATH.to_owned())],
+        &host.invocation(),
+    );
+    let requests_after_open = host.requests().len();
+
+    let document = requirements_document(RANGE_REQUIREMENTS);
+    let hover = HoverProvider::hover(&mut plugin, &document, Position::new(0, 2))
+        .expect("a hover on the name of requests");
+    let expected = "[Open requests on PyPI](https://pypi.org/project/requests)\n\n\
+Versions after 2.0.0:\n\
+- `2.34.2` — outside your bounds\n\
+- `2.10.0` — outside your bounds, still affected: `GHSA-late`\n\
+- `2.9.2` — allowed, latest allowed, still affected: `GHSA-late`\n\
+\n\
+Advisories of newer versions are not checked.";
+    assert_eq!(hover.markdown, expected);
+    // The hover only reads the cache.
+    assert_eq!(host.requests().len(), requests_after_open);
+}
+
+#[test]
+fn a_private_or_ignored_requirement_has_no_hover_and_no_registry_request() {
+    let private = "--index-url https://pypi.example.com/simple\nrequests>1.12,<2.10\n";
+    for (text, line, ignored) in [(private, 1, false), (RANGE_REQUIREMENTS, 0, true)] {
+        let host = host_with_range_and_advisory();
+        host.add_file("requirements.txt", text);
+        if ignored {
+            host.set_setting("ignore", r#"["requests"]"#);
+        }
+        let mut plugin = DependencyLens::default();
+        // Activation reads the settings from the host, `ignore` included.
+        plugin.activate(&host.context(PLUGIN_ID)).unwrap();
+        plugin.handle_events(
+            &[Event::FileOpened(REQUIREMENTS_PATH.to_owned())],
+            &host.invocation(),
+        );
+        let document = requirements_document(text);
+        assert_eq!(
+            HoverProvider::hover(&mut plugin, &document, Position::new(line, 2)),
+            None,
+            "{text}"
+        );
+        assert!(
+            host.requests().is_empty(),
+            "no request may leave for a private or ignored package: {:?}",
+            host.requests()
+        );
+    }
+}
+
+#[test]
+fn a_path_gem_has_no_hover_and_no_registry_request_while_a_public_gem_has_the_list() {
+    let host = host_with_registry(
+        Rc::new(Cell::new(0)),
+        "net:rubygems.org",
+        "https://rubygems.org/api/v1/versions/",
+        RUBYGEMS_RAILS_BODY,
+    );
+    let gemfile = "gem 'rails', '~> 7.0.4'\ngem 'local', '~> 1.0', path: '../local'\n";
+    host.add_file("Gemfile", gemfile);
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(GEMFILE_PATH.to_owned())],
+        &host.invocation(),
+    );
+    let document = Document {
+        path: GEMFILE_PATH.to_owned(),
+        language: "ruby".to_owned(),
+        version: 1,
+        text: gemfile.to_owned(),
+    };
+
+    // The public gem is the control: it shows the list of its newer releases.
+    let hover = HoverProvider::hover(&mut plugin, &document, Position::new(0, 7))
+        .expect("a hover on the name of rails");
+    assert!(
+        hover.markdown.contains("Versions after 7.0.4:"),
+        "{}",
+        hover.markdown
+    );
+    assert!(
+        hover.markdown.contains("- `8.1.4.1` — outside your bounds"),
+        "{}",
+        hover.markdown
+    );
+    // The path gem has no hover, and its name never left the machine.
+    assert_eq!(
+        HoverProvider::hover(&mut plugin, &document, Position::new(1, 7)),
+        None
+    );
+    assert!(
+        host.requests()
+            .iter()
+            .all(|request| !request.url.contains("local")),
+        "{:?}",
+        host.requests()
+    );
+}
+
 const PYPI_PREFIX: &str = "https://pypi.org/pypi/";
 const PYPI_LATEST_BODY: &str =
     r#"{"info":{"version":"2.0"},"releases":{"2.0":[{"yanked":false}]}}"#;
