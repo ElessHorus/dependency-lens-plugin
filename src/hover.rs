@@ -1,6 +1,6 @@
 //! The IDE hover that links the package page of the dependency under the cursor.
 
-use crate::model::{Dependency, Ecosystem, Span};
+use crate::model::{Dependency, Ecosystem};
 use crate::settings::Settings;
 use crate::text::to_range_in_line;
 use openidea_plugin::hover::Hover;
@@ -26,10 +26,12 @@ pub fn package_link_hover(
     if !settings.is_enabled(eco) {
         return None;
     }
+    // The cursor line is read once, so no span walks the text from its start again.
+    let cursor_line = doc_text.lines().nth(at.line as usize)?;
     let dependencies = eco.parse(doc_text);
     // The hover names the span under the cursor: the editor anchors the tooltip on that range.
     let (dependency, hovered_range) = dependencies.iter().find_map(|dependency| {
-        range_under_cursor(doc_text, dependency, at).map(|range| (dependency, range))
+        range_under_cursor(cursor_line, dependency, at).map(|range| (dependency, range))
     })?;
     // The ignore set is built only for a match, so a hover over plain text allocates nothing.
     if settings
@@ -51,26 +53,18 @@ pub fn package_link_hover(
 
 /// The range of the name or of the version of `dependency` that holds `at`, if any.
 ///
-/// The end of a span is exclusive.
-fn range_under_cursor(doc_text: &str, dependency: &Dependency, at: Position) -> Option<Range> {
+/// `cursor_line` is the text of line `at.line`. The end of a span is exclusive.
+fn range_under_cursor(cursor_line: &str, dependency: &Dependency, at: Position) -> Option<Range> {
     [dependency.name_span, dependency.version_span]
         .into_iter()
         .filter(|span| span.line == at.line)
-        .filter_map(|span| range_of_span(doc_text, span))
+        .filter_map(|span| to_range_in_line(cursor_line, span))
         .find(|range| range.start.character <= at.character && at.character < range.end.character)
-}
-
-/// The UTF-16 range of `span`, read from its own line only (no walk when the line is far away).
-fn range_of_span(doc_text: &str, span: Span) -> Option<Range> {
-    to_range_in_line(doc_text.lines().nth(span.line as usize)?, span)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Ecosystem;
-    use crate::settings::Settings;
-    use openidea_plugin::{Position, Range};
 
     const CARGO: &str =
         "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1.0.0\"\n";
