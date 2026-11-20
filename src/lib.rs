@@ -893,12 +893,17 @@ impl Providers for DependencyLens {
 }
 
 impl HoverProvider for DependencyLens {
-    /// Links the package page of the dependency under the cursor. It reads no cache and makes no request.
+    /// Links the package page of the dependency under the cursor and lists the releases newer than
+    /// its checked version. It reads the cache and makes no request.
     fn hover(&mut self, doc: &Document, at: Position) -> Option<Hover> {
         // The provider runs for every file, so the cheap file-name test comes before the host call.
-        Ecosystem::detect(&doc.path)?;
+        let eco = Ecosystem::detect(&doc.path)?;
+        // After an unload the cache is empty: read what the disk holds first, as the quick fix does.
+        self.load_block(eco, &HostStore);
         hover::package_link_hover(
             &self.settings,
+            &self.cache,
+            now_secs(),
             &doc.path,
             project_root_of(&doc.path).as_deref(),
             &doc.text,
