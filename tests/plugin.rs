@@ -1608,6 +1608,55 @@ fn a_private_or_ignored_requirement_has_no_hover_and_no_registry_request() {
     }
 }
 
+#[test]
+fn a_path_gem_has_no_hover_and_no_registry_request_while_a_public_gem_has_the_list() {
+    let host = host_with_registry(
+        Rc::new(Cell::new(0)),
+        "net:rubygems.org",
+        "https://rubygems.org/api/v1/versions/",
+        RUBYGEMS_RAILS_BODY,
+    );
+    let gemfile = "gem 'rails', '~> 7.0.4'\ngem 'local', '~> 1.0', path: '../local'\n";
+    host.add_file("Gemfile", gemfile);
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(GEMFILE_PATH.to_owned())],
+        &host.invocation(),
+    );
+    let document = Document {
+        path: GEMFILE_PATH.to_owned(),
+        language: "ruby".to_owned(),
+        version: 1,
+        text: gemfile.to_owned(),
+    };
+
+    // The public gem is the control: it shows the list of its newer releases.
+    let hover = HoverProvider::hover(&mut plugin, &document, Position::new(0, 7))
+        .expect("a hover on the name of rails");
+    assert!(
+        hover.markdown.contains("Versions after 7.0.4:"),
+        "{}",
+        hover.markdown
+    );
+    assert!(
+        hover.markdown.contains("- `8.1.4.1` — outside your bounds"),
+        "{}",
+        hover.markdown
+    );
+    // The path gem has no hover, and its name never left the machine.
+    assert_eq!(
+        HoverProvider::hover(&mut plugin, &document, Position::new(1, 7)),
+        None
+    );
+    assert!(
+        host.requests()
+            .iter()
+            .all(|request| !request.url.contains("local")),
+        "{:?}",
+        host.requests()
+    );
+}
+
 const PYPI_PREFIX: &str = "https://pypi.org/pypi/";
 const PYPI_LATEST_BODY: &str =
     r#"{"info":{"version":"2.0"},"releases":{"2.0":[{"yanked":false}]}}"#;

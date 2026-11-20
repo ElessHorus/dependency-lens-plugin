@@ -899,7 +899,10 @@ impl HoverProvider for DependencyLens {
         // The provider runs for every file, so the cheap file-name test comes before the host call.
         let eco = Ecosystem::detect(&doc.path)?;
         // After an unload the cache is empty: read what the disk holds first, as the quick fix does.
-        self.load_block(eco, &HostStore);
+        // Only an enabled ecosystem with a registry has a list to show, so no other block is read.
+        if eco.offers_updates() && self.settings.is_enabled(eco) {
+            self.load_block(eco, &HostStore);
+        }
         hover::package_link_hover(
             &self.settings,
             &self.cache,
@@ -1063,6 +1066,32 @@ mod disk_cache_tests {
         plugin.save_blocks(&store);
         assert!(!plugin.cache.is_dirty(Ecosystem::PyPI));
         assert_eq!(store.keys(), ["cache/PyPI"]);
+    }
+
+    #[test]
+    fn a_hover_reads_the_disk_block_only_of_an_enabled_ecosystem_with_a_registry() {
+        let _host = MockHost::install();
+        let hover_over = |plugin: &mut DependencyLens, path: &str| {
+            let document = Document {
+                path: path.to_owned(),
+                language: "plaintext".to_owned(),
+                version: 1,
+                text: String::new(),
+            };
+            HoverProvider::hover(plugin, &document, Position::new(0, 0))
+        };
+        // Cargo has no registry list, so the hover has no use for its block.
+        let mut plugin = DependencyLens::default();
+        hover_over(&mut plugin, "/p/Cargo.toml");
+        assert!(!plugin.loaded_blocks.contains(&Ecosystem::Cargo));
+        // A disabled ecosystem gets no hover at all.
+        plugin.settings.enabled.remove(&Ecosystem::PyPI);
+        hover_over(&mut plugin, "/p/requirements.txt");
+        assert!(!plugin.loaded_blocks.contains(&Ecosystem::PyPI));
+        // An enabled ecosystem with a registry reads its block, once.
+        plugin.settings.enabled.insert(Ecosystem::PyPI);
+        hover_over(&mut plugin, "/p/requirements.txt");
+        assert!(plugin.loaded_blocks.contains(&Ecosystem::PyPI));
     }
 
     /// An entry for the first dependency of `requirements`, with `status`.

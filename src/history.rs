@@ -463,6 +463,61 @@ mod tests {
         }
     }
 
+    /// The section of `dep` for `eco`, with a registry list under `package`, vulnerabilities off.
+    fn history_of(eco: Ecosystem, dep: &Dependency, package: &str, versions: &[&str]) -> String {
+        let mut cache = Cache::new(3_600);
+        let info = VersionInfo {
+            latest: versions.first().map(|text| (*text).to_owned()),
+            versions: versions.iter().map(|text| (*text).to_owned()).collect(),
+        };
+        cache.put_version_info(eco, package, info, NOW);
+        version_history(eco, dep, &cache, &without_vulnerabilities(), NOW).expect("a section")
+    }
+
+    #[test]
+    fn packagist_and_pub_list_their_releases_with_bound_marks() {
+        let composer = Ecosystem::Packagist
+            .parse("{\"require\": {\"monolog/monolog\": \"^2.0\"}}\n")
+            .remove(0);
+        assert_eq!(
+            history_of(
+                Ecosystem::Packagist,
+                &composer,
+                "monolog/monolog",
+                &["3.0.0", "2.9.1", "2.1.0", "2.0.0", "1.0.0"]
+            ),
+            "Versions after 2.0.0:\n\
+- `3.0.0` — outside your bounds\n\
+- `2.9.1` — allowed, latest allowed\n\
+- `2.1.0` — allowed"
+        );
+        let pubspec = Ecosystem::Pub
+            .parse("name: demo\ndependencies:\n  http: ^1.0.0\n")
+            .remove(0);
+        assert_eq!(
+            history_of(
+                Ecosystem::Pub,
+                &pubspec,
+                "http",
+                &["2.0.0", "1.2.1", "1.1.0", "1.0.0"]
+            ),
+            "Versions after 1.0.0:\n\
+- `2.0.0` — outside your bounds\n\
+- `1.2.1` — allowed, latest allowed\n\
+- `1.1.0` — allowed"
+        );
+    }
+
+    #[test]
+    fn a_lower_bound_that_no_listed_version_fits_is_the_checked_version() {
+        // `>=2.5,<2.6` allows nothing in the list, so the checked version is the bound text `2.5`.
+        let dep = dependency("requests>=2.5,<2.6\n");
+        assert_eq!(
+            history_of(Ecosystem::PyPI, &dep, "requests", &["3.0.0", "2.0.0"]),
+            "Versions after 2.5:\n- `3.0.0` — outside your bounds"
+        );
+    }
+
     #[test]
     fn nothing_to_show_gives_none() {
         // No cached list.

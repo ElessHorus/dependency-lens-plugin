@@ -777,6 +777,35 @@ mod tests {
     }
 
     #[test]
+    fn still_affecting_orders_pre_release_spellings_before_their_release() {
+        // Two intervals: [0, 2.9.0) and [2.30.0, 2.31.0).
+        let advisory = affected(
+            "PyPI",
+            "requests",
+            &[&[
+                ("introduced", "0"),
+                ("fixed", "2.9.0"),
+                ("introduced", "2.30.0"),
+                ("fixed", "2.31.0"),
+            ]],
+        );
+        let advisories: [&[Affected]; 1] = [&advisory];
+        // `2.9.0rc1` comes before `2.9.0`, so it is still affected. `2.30.0rc1` comes before the
+        // second interval opens, so it is not.
+        let candidates = ["2.9.0rc1", "2.9.0", "2.30.0rc1", "2.30.0", "2.31.0rc1"];
+        assert_eq!(
+            still_affecting(
+                Ecosystem::PyPI,
+                "requests",
+                "2.0.0",
+                &advisories,
+                &candidates
+            ),
+            vec![vec![0], vec![], vec![], vec![0], vec![0]]
+        );
+    }
+
+    #[test]
     fn shown_advisories_counts_the_advisories_without_details() {
         use crate::osv::deferred;
         let now = 1_000;

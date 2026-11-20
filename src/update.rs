@@ -213,7 +213,8 @@ pub struct Release<'a> {
 ///
 /// A text that is not a version of the ecosystem is skipped. A `base` that is not a version gives
 /// `None`, not an empty list, so a caller never reads "nothing is newer" for an unreadable base.
-/// The list is not sorted again: the registry clients already rank it.
+/// The list is not sorted again: the registry clients rank it newest first, so the scan stops at
+/// the first release that is not newer than `base`.
 pub fn newer_releases<'a>(
     eco: Ecosystem,
     base: &str,
@@ -234,16 +235,21 @@ fn newer_releases_of<'a, V: UpdateVersion>(
     versions: &'a [String],
 ) -> Option<Vec<Release<'a>>> {
     let base = V::parse_version(base)?;
-    let releases = versions
-        .iter()
-        .filter_map(|text| {
-            let version = V::parse_version(text)?;
-            (version > base).then(|| Release {
-                text,
-                is_prerelease: version.is_prerelease_version(),
-            })
-        })
-        .collect();
+    let mut releases = Vec::new();
+    for text in versions {
+        let Some(version) = V::parse_version(text) else {
+            continue;
+        };
+        // The registry clients rank each list newest first with this same version type
+        // (`rank_with`), so the first release that is not newer ends the scan: no later text is parsed.
+        if version <= base {
+            break;
+        }
+        releases.push(Release {
+            text,
+            is_prerelease: version.is_prerelease_version(),
+        });
+    }
     Some(releases)
 }
 
@@ -724,6 +730,21 @@ mod tests {
                 "{declared} -> {latest}"
             );
         }
+    }
+
+    #[test]
+    fn newer_releases_stops_at_the_base_and_skips_junk_before_it() {
+        let versions: Vec<String> = ["3.0.0", "junk", "2.5.0", "2.0", "1.0.0"]
+            .iter()
+            .map(|text| (*text).to_owned())
+            .collect();
+        // `2.0` equals the base `2.0.0`, so it and everything after it are not newer.
+        let texts: Vec<&str> = newer_releases(Ecosystem::PyPI, "2.0.0", &versions)
+            .expect("a readable base")
+            .into_iter()
+            .map(|release| release.text)
+            .collect();
+        assert_eq!(texts, ["3.0.0", "2.5.0"]);
     }
 
     #[test]
