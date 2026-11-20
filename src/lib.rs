@@ -4,6 +4,7 @@ pub mod actions;
 pub mod analysis;
 pub mod cache;
 pub mod fixes;
+pub mod history;
 pub mod hover;
 pub mod http;
 pub mod model;

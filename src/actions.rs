@@ -93,7 +93,7 @@ struct ManifestText<'a> {
 
 /// The version that the analysis checked for `dep`: the lowest version of the cached registry
 /// list that its requirement allows, or the text of the lower bound without such a list.
-fn checked_version_for(
+pub(crate) fn checked_version_for(
     cache: &Cache,
     eco: Ecosystem,
     dep: &Dependency,
