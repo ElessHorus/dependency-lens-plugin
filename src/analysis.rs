@@ -273,16 +273,12 @@ fn is_osv_answered(
     version: &str,
     now: u64,
 ) -> bool {
+    // The cache normalizes the name, so every spelling of one package shares the answer.
     cache
         .vulnerabilities(eco, &dependency.name, version, now)
         .is_some()
         || cache
-            .failure(
-                FailureKind::Osv,
-                eco,
-                &osv_failure_key(&dependency.name, version),
-                now,
-            )
+            .osv_failure(eco, &dependency.name, version, now)
             .is_some()
 }
 
@@ -624,18 +620,7 @@ fn record_osv_failure(
         .entry(query.name.clone())
         .or_default()
         .insert(query.version.clone(), reason.to_owned());
-    cache.put_failure(
-        FailureKind::Osv,
-        eco,
-        &osv_failure_key(&query.name, &query.version),
-        reason.to_owned(),
-        now,
-    );
-}
-
-/// The failure-cache key of one package version, so a failure of one version leaves the others alone.
-fn osv_failure_key(name: &str, version: &str) -> String {
-    format!("{name}@{version}")
+    cache.put_osv_failure(eco, &query.name, &query.version, reason.to_owned(), now);
 }
 
 /// Reason stored when an OSV re-query loads no advisory detail.
@@ -687,20 +672,21 @@ fn query_missing_vulnerabilities(
     // How many package versions that OSV never answered for may be sent in this call: the slice
     // of the budget, or as many as the cache already answered, so the slice doubles at each call.
     let new_pair_limit = budget.first_osv_slice().map(|slice| {
-        let answered: HashSet<(&str, &str)> = deps
+        let answered: HashSet<(Cow<'_, str>, &str)> = deps
             .iter()
             .zip(checked_versions)
             .filter_map(|(dependency, checked_version)| {
                 let version = checked_version.as_deref()?;
                 is_osv_answered(cache, eco, dependency, version, now)
-                    .then_some((dependency.name.as_str(), version))
+                    .then(|| (eco.normalize_package(&dependency.name), version))
             })
             .collect();
         slice.max(answered.len())
     });
     let mut new_pairs_taken = 0;
-    // Borrowed pairs: duplicates are found without copying the names.
-    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    // Normalized names, so two spellings of one package are one pair. A name that is already
+    // normalized stays borrowed: duplicates are found without copying it.
+    let mut seen: HashSet<(Cow<'_, str>, &str)> = HashSet::new();
     let mut queries: Vec<OsvQuery> = Vec::new();
     // Unresolved placeholders of a cached pair before its re-query; `None` for a pair never queried.
     let mut unresolved_before: Vec<Option<usize>> = Vec::new();
@@ -708,22 +694,16 @@ fn query_missing_vulnerabilities(
         let Some(version) = checked_version.as_deref() else {
             continue;
         };
-        let unresolved = match cache.vulnerabilities(eco, &dependency.name, version, now) {
+        let package = eco.normalize_package(&dependency.name);
+        let unresolved = match cache.vulnerabilities(eco, &package, version, now) {
             Some(list) => match unresolved_count(list, cache, now, details_per_query) {
                 0 => continue,
                 count => Some(count),
             },
             None => None,
         };
-        if cache
-            .failure(
-                FailureKind::Osv,
-                eco,
-                &osv_failure_key(&dependency.name, version),
-                now,
-            )
-            .is_some()
-            || !seen.insert((dependency.name.as_str(), version))
+        if cache.osv_failure(eco, &package, version, now).is_some()
+            || !seen.insert((package.clone(), version))
         {
             continue;
         }
@@ -739,7 +719,7 @@ fn query_missing_vulnerabilities(
         }
         queries.push(OsvQuery {
             ecosystem: eco,
-            name: dependency.name.clone(),
+            name: package.into_owned(),
             version: version.to_owned(),
         });
         unresolved_before.push(unresolved);
@@ -791,6 +771,7 @@ fn query_missing_vulnerabilities(
 /// The cache stores nothing when `cacheTtlSeconds` is zero, so reading the answers back from the
 /// cache alone would hide every advisory and every OSV failure. Entries are built from this first.
 /// The maps are nested so a lookup borrows the name and the version instead of building a key.
+/// The names are the normalized ones (`Ecosystem::normalize_package`), as in the cache.
 #[derive(Default)]
 struct FreshOsv {
     /// Package name, then declared version, to the advisories OSV returned.
@@ -838,10 +819,12 @@ fn build_entry(
             fix_outside: None,
         };
     }
+    // `FreshOsv` is keyed by the normalized name, as the cache is.
+    let package = eco.normalize_package(&dependency.name);
     let answer = checked_version.as_deref().and_then(|version| {
         fresh
-            .vulnerabilities(&dependency.name, version)
-            .or_else(|| cache.vulnerabilities(eco, &dependency.name, version, now))
+            .vulnerabilities(&package, version)
+            .or_else(|| cache.vulnerabilities(eco, &package, version, now))
     });
     let has_answer = answer.is_some();
     let vulnerabilities = answer
@@ -861,14 +844,9 @@ fn build_entry(
         .collect();
     // An OSV failure belongs to one package version, so an entry without a checked version has none.
     let failure = checked_version.as_deref().and_then(|version| {
-        fresh.failure(&dependency.name, version).or_else(|| {
-            cache.failure(
-                FailureKind::Osv,
-                eco,
-                &osv_failure_key(&dependency.name, version),
-                now,
-            )
-        })
+        fresh
+            .failure(&package, version)
+            .or_else(|| cache.osv_failure(eco, &package, version, now))
     });
     // A checked version with neither an answer nor a failure was left for a later call.
     let waits_for_osv = checked_version.is_some() && !has_answer && failure.is_none();
@@ -1359,7 +1337,7 @@ mod tests {
     fn packagist_names_are_lowercased_and_looked_up_once_per_call() {
         let mut cache = Cache::new(TTL_SECS);
         let http = FakeHttp::new()
-            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("POST", BATCH_URL, 200, &batch_body(1))
             .route("GET", MONOLOG_URL, 200, MONOLOG_BODY);
         let analysis = analyze_composer(
             &mut cache,
@@ -1543,7 +1521,7 @@ mod tests {
     fn nuget_names_are_lowercased_and_looked_up_once_per_call() {
         let mut cache = Cache::new(TTL_SECS);
         let http = FakeHttp::new()
-            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("POST", BATCH_URL, 200, &batch_body(1))
             .route("GET", NEWTONSOFT_URL, 200, NEWTONSOFT_BODY);
         let analysis = analyze_csproj(
             &mut cache,
@@ -1810,7 +1788,7 @@ mod tests {
     fn package_names_are_normalised_and_looked_up_once_per_call() {
         let mut cache = Cache::new(TTL_SECS);
         let http = FakeHttp::new()
-            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("POST", BATCH_URL, 200, &batch_body(1))
             .route("GET", FLASK_LOGIN_URL, 200, LOGIN_BODY);
         let analysis = analyze_python(
             &mut cache,
@@ -1828,7 +1806,7 @@ mod tests {
     fn duplicate_lookups_stay_once_per_call_even_without_cache_storage() {
         let mut cache = Cache::new(0);
         let http = FakeHttp::new()
-            .route("POST", BATCH_URL, 200, &batch_body(2))
+            .route("POST", BATCH_URL, 200, &batch_body(1))
             .route("GET", FLASK_LOGIN_URL, 200, LOGIN_BODY);
         analyze_python(
             &mut cache,
@@ -2591,12 +2569,7 @@ mod tests {
         );
         assert!(
             cache
-                .failure(
-                    FailureKind::Osv,
-                    Ecosystem::Cargo,
-                    &osv_failure_key("serde", "1.0.0"),
-                    NOW
-                )
+                .osv_failure(Ecosystem::Cargo, "serde", "1.0.0", NOW)
                 .is_none()
         );
 
@@ -2652,14 +2625,120 @@ mod tests {
         assert!(!budget.is_cancelled());
         assert!(
             cache
-                .failure(
-                    FailureKind::Osv,
-                    Ecosystem::Cargo,
-                    &osv_failure_key("serde", "1.0.0"),
-                    NOW
-                )
+                .osv_failure(Ecosystem::Cargo, "serde", "1.0.0", NOW)
                 .is_some()
         );
+    }
+
+    /// The package names of every OSV batch that `http` received, in query order.
+    fn queried_names(http: &FakeHttp) -> Vec<String> {
+        let requests = http.requests();
+        http.request_bodies()
+            .into_iter()
+            .zip(requests)
+            .filter(|(_, (_, url))| url == BATCH_URL)
+            .flat_map(|(body, _)| {
+                let batch: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                batch["queries"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|query| query["package"]["name"].as_str().map(str::to_owned))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Runs `analyze` for `eco` over `dependencies` with an unlimited budget.
+    fn run_eco(
+        eco: Ecosystem,
+        dependencies: Vec<Dependency>,
+        cache: &mut Cache,
+        http: &FakeHttp,
+    ) -> Analysis {
+        let mut budget = Budget::new(usize::MAX, None);
+        analyze(
+            eco,
+            dependencies,
+            cache,
+            http,
+            &Settings::default(),
+            NOW,
+            &mut budget,
+        )
+    }
+
+    #[test]
+    fn two_spellings_in_one_manifest_send_one_osv_query() {
+        let manifest =
+            "[dependencies]\nrand_core = \"0.3.0\"\n[dev-dependencies]\nRand-Core = \"0.3.0\"\n";
+        let http = FakeHttp::new().route("POST", BATCH_URL, 200, r#"{"results":[{"vulns":[]}]}"#);
+        let mut cache = Cache::new(TTL_SECS);
+        let analysis = run(&mut cache, &http, &Settings::default(), NOW, manifest);
+        assert_eq!(queried_names(&http), ["rand_core"]);
+        assert_eq!(analysis.pending, 0);
+        assert_eq!(analysis.entries.len(), 2);
+        assert!(
+            analysis
+                .entries
+                .iter()
+                .all(|entry| entry.status == Status::NotChecked)
+        );
+    }
+
+    #[test]
+    fn a_packagist_name_with_an_uppercase_letter_reaches_osv_in_lowercase() {
+        // OSV is case-sensitive for Packagist: the written name finds no advisory.
+        let manifest = r#"{"require":{"Symfony/Http-Kernel":"4.0.0"}}"#;
+        let http = FakeHttp::new().route("POST", BATCH_URL, 200, r#"{"results":[{"vulns":[]}]}"#);
+        let mut cache = Cache::new(TTL_SECS);
+        run_eco(
+            Ecosystem::Packagist,
+            parsers::php::parse(manifest),
+            &mut cache,
+            &http,
+        );
+        assert_eq!(queried_names(&http), ["symfony/http-kernel"]);
+    }
+
+    #[test]
+    fn npm_keeps_the_written_case_in_the_osv_query() {
+        let manifest = r#"{"dependencies":{"Lodash":"4.17.0"}}"#;
+        let http = FakeHttp::new().route("POST", BATCH_URL, 200, r#"{"results":[{"vulns":[]}]}"#);
+        let mut cache = Cache::new(TTL_SECS);
+        run_eco(
+            Ecosystem::Npm,
+            parsers::npm::parse(manifest),
+            &mut cache,
+            &http,
+        );
+        assert_eq!(queried_names(&http), ["Lodash"]);
+    }
+
+    #[test]
+    fn a_second_spelling_reads_the_osv_failure_of_the_first() {
+        let http = FakeHttp::new().route("POST", BATCH_URL, 500, "");
+        let mut cache = Cache::new(TTL_SECS);
+        run(
+            &mut cache,
+            &http,
+            &Settings::default(),
+            NOW,
+            "[dependencies]\nRand-Core = \"0.3.0\"\n",
+        );
+        assert_eq!(http.count(BATCH_URL), 1);
+        let second = run(
+            &mut cache,
+            &http,
+            &Settings::default(),
+            NOW + 1,
+            "[dependencies]\nrand_core = \"0.3.0\"\n",
+        );
+        assert_eq!(http.count(BATCH_URL), 1);
+        assert!(matches!(
+            entry(&second, "rand_core").status,
+            Status::Unknown(_)
+        ));
     }
 
     /// A time far from zero, so that entries can be stored in the past.
