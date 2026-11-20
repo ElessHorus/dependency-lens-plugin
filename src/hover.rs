@@ -39,7 +39,14 @@ pub fn package_link_hover(
         return None;
     }
     let url = eco.package_page_url(&dependency.name)?;
-    Some(Hover::new(format!("[Page on {}]({url})", eco.registry_label())).range(hovered_range))
+    // The link text names the package as the manifest writes it. `package_page_url` already
+    // checked the name against an allow-list, so the name cannot break the Markdown link.
+    let text = format!(
+        "[Open {} on {}]({url})",
+        dependency.name,
+        eco.registry_label()
+    );
+    Some(Hover::new(text).range(hovered_range))
 }
 
 /// The range of the name or of the version of `dependency` that holds `at`, if any.
@@ -72,8 +79,8 @@ mod tests {
     const PIP_PRIVATE: &str = "--index-url https://pypi.example.com/simple\nrequests==2.0.0\n";
     const POM: &str = "<project>\n  <dependencies>\n    <dependency>\n      <groupId>org.apache.logging.log4j</groupId>\n      <artifactId>log4j-core</artifactId>\n      <version>2.14.1</version>\n    </dependency>\n  </dependencies>\n</project>\n";
 
-    const SERDE_LINK: &str = "[Page on crates.io](https://crates.io/crates/serde)";
-    const REQUESTS_LINK: &str = "[Page on PyPI](https://pypi.org/project/requests)";
+    const SERDE_LINK: &str = "[Open serde on crates.io](https://crates.io/crates/serde)";
+    const REQUESTS_LINK: &str = "[Open requests on PyPI](https://pypi.org/project/requests)";
 
     /// The markdown of the hover at `line`, `character`, with default settings.
     fn hover_at(path: &str, text: &str, line: u32, character: u32) -> Option<String> {
@@ -183,7 +190,7 @@ mod tests {
     #[test]
     fn the_name_line_and_the_version_line_of_a_pom_dependency_both_give_the_link() {
         // The artifact and the version sit on different lines of a pom.xml.
-        let link = "[Page on Maven Central](https://central.sonatype.com/artifact/org.apache.logging.log4j/log4j-core)";
+        let link = "[Open org.apache.logging.log4j:log4j-core on Maven Central](https://central.sonatype.com/artifact/org.apache.logging.log4j/log4j-core)";
         assert_eq!(hover_at("/p/pom.xml", POM, 4, 20).as_deref(), Some(link));
         assert_eq!(hover_at("/p/pom.xml", POM, 5, 16).as_deref(), Some(link));
         assert_eq!(hover_at("/p/pom.xml", POM, 6, 8), None);

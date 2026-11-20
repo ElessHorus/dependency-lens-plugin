@@ -177,7 +177,7 @@ fn the_ide_hover_links_the_package_page_of_the_dependency_under_the_cursor() {
         .expect("a hover on the version of serde");
     assert_eq!(
         hover.markdown,
-        "[Page on crates.io](https://crates.io/crates/serde)"
+        "[Open serde on crates.io](https://crates.io/crates/serde)"
     );
     // Off the dependencies, the plugin adds nothing. It never reaches the network.
     assert_eq!(
@@ -197,7 +197,7 @@ fn the_decoration_hover_keeps_the_advisory_and_has_no_package_link() {
     let decorations = decorations_of(&host, MANIFEST_PATH);
     let hover = decorations[0].hover.as_deref().unwrap_or_default();
     assert!(hover.contains(HIGH_ID), "{hover}");
-    assert!(!hover.contains("Page on"), "{hover}");
+    assert!(!hover.contains("crates.io"), "{hover}");
 }
 
 #[test]
