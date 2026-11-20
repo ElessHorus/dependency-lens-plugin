@@ -208,11 +208,28 @@ impl Cache {
         reason: String,
         now: u64,
     ) {
+        // The key of an OSV failure holds the package name: only `put_osv_failure` normalizes it.
+        debug_assert!(
+            kind != FailureKind::Osv,
+            "store an OSV failure with put_osv_failure"
+        );
+        self.store_failure(kind, eco, package, reason, now);
+    }
+
+    /// Stores a failure under `key`, which the caller has already built.
+    fn store_failure(
+        &mut self,
+        kind: FailureKind,
+        eco: Ecosystem,
+        key: &str,
+        reason: String,
+        now: u64,
+    ) {
         if !self.stores_entries() {
             return;
         }
         self.failures.entry((kind, eco)).or_default().insert(
-            package.to_owned(),
+            key.to_owned(),
             Entry {
                 value: reason,
                 stored_at: now,
@@ -242,7 +259,7 @@ impl Cache {
         now: u64,
     ) {
         let key = osv_failure_key(eco, package, version);
-        self.put_failure(FailureKind::Osv, eco, &key, reason, now);
+        self.store_failure(FailureKind::Osv, eco, &key, reason, now);
     }
 
     /// Returns the reason of a recent OSV failure of one package version.
@@ -568,18 +585,36 @@ mod tests {
     }
 
     #[test]
-    fn failures_are_keyed_by_kind() {
+    #[should_panic(expected = "put_osv_failure")]
+    fn the_generic_failure_store_refuses_the_osv_kind() {
+        // An OSV failure key holds the package, so it must be built by `put_osv_failure`, which normalizes.
         let mut cache = Cache::new(TTL_SECS);
         cache.put_failure(
             FailureKind::Osv,
+            Ecosystem::PyPI,
+            "Requests@1.0",
+            "boom".to_owned(),
+            START_SECS,
+        );
+    }
+
+    #[test]
+    fn failures_are_keyed_by_kind() {
+        let mut cache = Cache::new(TTL_SECS);
+        cache.put_osv_failure(
             Ecosystem::Cargo,
             "serde",
+            "1.0.0",
             "503".to_owned(),
             START_SECS,
         );
         assert_eq!(
             cache.failure(FailureKind::Registry, Ecosystem::Cargo, "serde", START_SECS),
             None
+        );
+        assert_eq!(
+            cache.osv_failure(Ecosystem::Cargo, "serde", "1.0.0", START_SECS),
+            Some("503")
         );
     }
 
@@ -601,10 +636,10 @@ mod tests {
         let mut cache = Cache::new(0);
         cache.put_version_info(Ecosystem::Cargo, "serde", sample_info(), START_SECS);
         cache.put_vulnerabilities(Ecosystem::Cargo, "serde", "1.0.0", Vec::new(), START_SECS);
-        cache.put_failure(
-            FailureKind::Osv,
+        cache.put_osv_failure(
             Ecosystem::Cargo,
             "serde",
+            "1.0.0",
             "503".to_owned(),
             START_SECS,
         );
@@ -618,7 +653,7 @@ mod tests {
             None
         );
         assert_eq!(
-            cache.failure(FailureKind::Osv, Ecosystem::Cargo, "serde", START_SECS),
+            cache.osv_failure(Ecosystem::Cargo, "serde", "1.0.0", START_SECS),
             None
         );
         assert_eq!(cache.advisory("GHSA-1", START_SECS), None);
@@ -765,10 +800,10 @@ mod tests {
         cache.put_advisory(sample_vulnerability("GHSA-1"), START_SECS);
         cache.put_affected("GHSA-1", Vec::new(), START_SECS);
         cache.put_revision("GHSA-1", "r1");
-        cache.put_failure(
-            FailureKind::Osv,
+        cache.put_osv_failure(
             Ecosystem::PyPI,
-            "requests@1.0.0",
+            "requests",
+            "1.0.0",
             "boom".to_owned(),
             START_SECS,
         );
@@ -790,12 +825,7 @@ mod tests {
         assert!(!cache.confirm_advisory("GHSA-1", Some("r1"), START_SECS));
         assert!(
             cache
-                .failure(
-                    FailureKind::Osv,
-                    Ecosystem::PyPI,
-                    "requests@1.0.0",
-                    START_SECS
-                )
+                .osv_failure(Ecosystem::PyPI, "requests", "1.0.0", START_SECS)
                 .is_none()
         );
         assert!(!cache.is_dirty(Ecosystem::PyPI));

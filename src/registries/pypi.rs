@@ -31,6 +31,25 @@ struct ReleaseFile {
     yanked: Option<bool>,
 }
 
+/// Returns `true` when `name` is already in PEP 503 form, without building the normalised copy.
+///
+/// The form holds no uppercase letter, no `_` or `.`, and no run of `-`. The cache normalizes on
+/// every read, so this check keeps the common case free of allocation.
+pub fn is_normalized(name: &str) -> bool {
+    let mut previous_is_hyphen = false;
+    for character in name.chars() {
+        let is_hyphen = character == '-';
+        if character.is_uppercase()
+            || matches!(character, '_' | '.')
+            || (is_hyphen && previous_is_hyphen)
+        {
+            return false;
+        }
+        previous_is_hyphen = is_hyphen;
+    }
+    true
+}
+
 /// Returns the PEP 503 normalised form of a project name: lowercase, with each run of `-`, `_` or `.` replaced by one `-`.
 pub fn normalize_name(name: &str) -> String {
     let mut normalized = String::with_capacity(name.len());
@@ -100,6 +119,30 @@ mod tests {
         assert_eq!(normalize_name("Flask"), "flask");
         assert_eq!(normalize_name("ruamel.yaml"), "ruamel-yaml");
         assert_eq!(normalize_name("Foo__Bar-baz"), "foo-bar-baz");
+    }
+
+    #[test]
+    fn is_normalized_agrees_with_normalize_name() {
+        for name in [
+            "flask",
+            "flask-login",
+            "Flask",
+            "foo_bar",
+            "a..b",
+            "a--b",
+            "a-b",
+            "-x-",
+            "python.jose",
+            "a-_b",
+            "ÀB",
+            "",
+        ] {
+            assert_eq!(
+                is_normalized(name),
+                normalize_name(name) == name,
+                "{name:?}"
+            );
+        }
     }
 
     #[test]

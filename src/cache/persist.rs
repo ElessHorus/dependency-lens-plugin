@@ -786,10 +786,10 @@ mod tests {
             "registry-boom".to_owned(),
             NOW,
         );
-        cache.put_failure(
-            FailureKind::Osv,
+        cache.put_osv_failure(
             Ecosystem::PyPI,
-            "requests@1.0.0",
+            PACKAGE,
+            VERSION,
             "osv-boom".to_owned(),
             NOW,
         );

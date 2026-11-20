@@ -169,9 +169,14 @@ fn is_maven_part(part: &str) -> bool {
 impl Ecosystem {
     /// Returns the URL of the package page on the public registry, or `None` for an unsafe name.
     ///
-    /// The URL needs no request. The name is normalized first, so it matches the registry spelling.
+    /// The URL needs no request. The name is normalized first, so it matches the registry spelling (Cargo keeps the written name).
     pub fn package_page_url(self, name: &str) -> Option<String> {
-        let package = self.normalize_package(name);
+        // crates.io accepts any spelling, so a Cargo link keeps the written name, which is the
+        // likeliest canonical one (`proc-macro2`, not `proc_macro2`).
+        let package = match self {
+            Ecosystem::Cargo => Cow::Borrowed(name),
+            _ => self.normalize_package(name),
+        };
         if !is_linkable_name(self, &package) {
             return None;
         }
@@ -213,14 +218,8 @@ impl Ecosystem {
     /// The result is idempotent.
     pub fn normalize_package(self, name: &str) -> Cow<'_, str> {
         match self {
-            Ecosystem::PyPI => {
-                let normalized = pypi::normalize_name(name);
-                if normalized == name {
-                    Cow::Borrowed(name)
-                } else {
-                    Cow::Owned(normalized)
-                }
-            }
+            Ecosystem::PyPI if pypi::is_normalized(name) => Cow::Borrowed(name),
+            Ecosystem::PyPI => Cow::Owned(pypi::normalize_name(name)),
             // Packagist and the NuGet flat container store names in lowercase. Only names with an uppercase letter need a copy.
             Ecosystem::Packagist | Ecosystem::NuGet if name.chars().any(char::is_uppercase) => {
                 Cow::Owned(name.to_lowercase())
@@ -323,11 +322,24 @@ mod tests {
     }
 
     #[test]
-    fn package_link_of_a_cargo_crate_uses_the_normalized_name() {
-        assert_eq!(
-            Ecosystem::Cargo.package_page_url("Rand-Core").as_deref(),
-            Some("https://crates.io/crates/rand_core")
-        );
+    fn a_cargo_link_keeps_the_written_name() {
+        // crates.io accepts any spelling, and the written one is the likeliest canonical name.
+        for name in ["Rand-Core", "tokio-util", "proc_macro2"] {
+            assert_eq!(
+                Ecosystem::Cargo.package_page_url(name).as_deref(),
+                Some(format!("https://crates.io/crates/{name}").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn a_normalized_pypi_name_is_not_copied() {
+        for name in ["flask-login", "python-jose", "a-b-c"] {
+            assert!(matches!(
+                Ecosystem::PyPI.normalize_package(name),
+                Cow::Borrowed(_)
+            ));
+        }
     }
 
     #[test]
