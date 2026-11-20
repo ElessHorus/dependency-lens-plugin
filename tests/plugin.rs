@@ -136,6 +136,47 @@ fn open_manifest(host: &MockHost, plugin: &mut DependencyLens) {
 }
 
 #[test]
+fn two_spellings_of_one_crate_make_one_osv_query() {
+    // `rand_core` and `Rand-Core` name one crate: OSV is asked once.
+    let query_names = Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+    let host = MockHost::install().with_capabilities(&[
+        "events",
+        "project.read",
+        "editor.read",
+        "net:api.osv.dev",
+    ]);
+    host.set_project_root(Some("/p"));
+    let seen_names = query_names.clone();
+    host.on_fetch(move |request| {
+        if request.url.ends_with(OSV_BATCH_SUFFIX) {
+            let body: Value = serde_json::from_slice(request.body.as_deref().unwrap_or_default())
+                .unwrap_or(Value::Null);
+            seen_names.borrow_mut().extend(
+                body["queries"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|query| query["package"]["name"].as_str().map(str::to_owned)),
+            );
+        }
+        answer_osv(request)
+    });
+    host.add_file(
+        "Cargo.toml",
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n\
+         [dependencies]\nrand_core = \"0.3.0\"\n\n\
+         [dev-dependencies]\nRand-Core = \"0.3.0\"\n",
+    );
+    let mut plugin = DependencyLens::default();
+    plugin.handle_events(
+        &[Event::FileOpened(MANIFEST_PATH.to_owned())],
+        &host.invocation(),
+    );
+
+    assert_eq!(*query_names.borrow(), ["rand_core"]);
+}
+
+#[test]
 fn opening_manifest_shows_serde_advisory_only() {
     let host = host_counting_fetches(Rc::new(Cell::new(0)));
     let mut plugin = DependencyLens::default();
