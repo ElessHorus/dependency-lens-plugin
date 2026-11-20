@@ -166,12 +166,26 @@ fn is_maven_part(part: &str) -> bool {
     is_bounded_run(part, 128, is_dotted_byte) && starts_alphanumeric(part)
 }
 
+/// Whether `to_lowercase` may change `name`: an ASCII capital, or any non-ASCII character.
+///
+/// `char::is_uppercase` is false for titlecase letters such as `ǅ`, which `to_lowercase` still
+/// maps, so a non-ASCII name always takes the copying path. Crate, package and gem names are ASCII.
+fn may_change_case(name: &str) -> bool {
+    name.bytes()
+        .any(|byte| byte.is_ascii_uppercase() || !byte.is_ascii())
+}
+
 impl Ecosystem {
     /// Returns the URL of the package page on the public registry, or `None` for an unsafe name.
     ///
-    /// The URL needs no request. The name is normalized first, so it matches the registry spelling.
+    /// The URL needs no request. The name is normalized first, so it matches the registry spelling (Cargo keeps the written name).
     pub fn package_page_url(self, name: &str) -> Option<String> {
-        let package = self.normalize_package(name);
+        // crates.io accepts any spelling, so a Cargo link keeps the written name, which is the
+        // likeliest canonical one (`proc-macro2`, not `proc_macro2`).
+        let package = match self {
+            Ecosystem::Cargo => Cow::Borrowed(name),
+            _ => self.normalize_package(name),
+        };
         if !is_linkable_name(self, &package) {
             return None;
         }
@@ -208,21 +222,25 @@ impl Ecosystem {
         }
     }
 
-    /// Returns the registry spelling of `name`. Borrows when nothing changes.
+    /// Returns the registry spelling of `name`, which is also the key of every cache table and the name sent to OSV.
+    /// Borrows when nothing changes. PyPI, Packagist, NuGet and Cargo are normalized; the others keep the written name.
+    /// The result is idempotent.
     pub fn normalize_package(self, name: &str) -> Cow<'_, str> {
         match self {
-            Ecosystem::PyPI => {
-                let normalized = pypi::normalize_name(name);
-                if normalized == name {
-                    Cow::Borrowed(name)
-                } else {
-                    Cow::Owned(normalized)
-                }
-            }
-            // Packagist and the NuGet flat container store names in lowercase. Only names with an uppercase letter need a copy.
-            Ecosystem::Packagist | Ecosystem::NuGet if name.chars().any(char::is_uppercase) => {
+            Ecosystem::PyPI if pypi::is_normalized(name) => Cow::Borrowed(name),
+            Ecosystem::PyPI => Cow::Owned(pypi::normalize_name(name)),
+            // Packagist and the NuGet flat container store names in lowercase. Only names with an uppercase or a non-ASCII letter need a copy.
+            Ecosystem::Packagist | Ecosystem::NuGet if may_change_case(name) => {
                 Cow::Owned(name.to_lowercase())
             }
+            // crates.io ignores case and treats `-` as `_`; OSV accepts the same (measured 2026-11-20).
+            // The index rule maps each `-` to `_` one for one, so runs are not collapsed.
+            Ecosystem::Cargo if name.contains('-') || may_change_case(name) => Cow::Owned(
+                name.chars()
+                    .flat_map(char::to_lowercase)
+                    .map(|c| if c == '-' { '_' } else { c })
+                    .collect(),
+            ),
             _ => Cow::Borrowed(name),
         }
     }
@@ -271,11 +289,84 @@ mod tests {
     }
 
     #[test]
-    fn other_ecosystems_keep_package_names() {
+    fn case_sensitive_ecosystems_keep_package_names() {
         assert!(matches!(
-            Ecosystem::Cargo.normalize_package("Serde"),
+            Ecosystem::Npm.normalize_package("Serde"),
             Cow::Borrowed("Serde")
         ));
+    }
+
+    #[test]
+    fn cargo_normalizes_case_and_hyphens() {
+        for (written, expected) in [
+            ("Serde_Json", "serde_json"),
+            ("serde-json", "serde_json"),
+            ("SERDE-JSON", "serde_json"),
+            ("a-_b", "a__b"),
+        ] {
+            assert_eq!(Ecosystem::Cargo.normalize_package(written), expected);
+        }
+        assert!(matches!(
+            Ecosystem::Cargo.normalize_package("serde_json"),
+            Cow::Borrowed("serde_json")
+        ));
+    }
+
+    #[test]
+    fn normalizing_twice_changes_nothing() {
+        for eco in Ecosystem::ALL {
+            for name in [
+                "Requests",
+                "Python.Jose",
+                "Symfony/Http-Kernel",
+                "Newtonsoft.Json",
+                "Rand-Core",
+                "a-_b",
+                "ǅ",
+                "",
+            ] {
+                let once = eco.normalize_package(name);
+                assert_eq!(eco.normalize_package(&once), once, "{eco:?} {name:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn titlecase_spellings_share_one_key() {
+        // `ǅ` is titlecase, so `char::is_uppercase` is false for it, and `ǆ` is its lowercase form.
+        for eco in [
+            Ecosystem::PyPI,
+            Ecosystem::Packagist,
+            Ecosystem::NuGet,
+            Ecosystem::Cargo,
+        ] {
+            assert_eq!(
+                eco.normalize_package("ǅ"),
+                eco.normalize_package("ǆ"),
+                "{eco:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cargo_link_keeps_the_written_name() {
+        // crates.io accepts any spelling, and the written one is the likeliest canonical name.
+        for name in ["Rand-Core", "tokio-util", "proc_macro2"] {
+            assert_eq!(
+                Ecosystem::Cargo.package_page_url(name).as_deref(),
+                Some(format!("https://crates.io/crates/{name}").as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn a_normalized_pypi_name_is_not_copied() {
+        for name in ["flask-login", "python-jose", "a-b-c"] {
+            assert!(matches!(
+                Ecosystem::PyPI.normalize_package(name),
+                Cow::Borrowed(_)
+            ));
+        }
     }
 
     #[test]

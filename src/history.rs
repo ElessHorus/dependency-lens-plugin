@@ -417,10 +417,11 @@ mod tests {
 
     #[test]
     fn a_name_spelled_differently_finds_the_registry_list_and_the_advisories() {
-        // The registry list is keyed by the normalized name, the vulnerability list by the written one.
+        // The registry list and the vulnerability list share the normalized key, so a dependency
+        // written `Requests` finds the list that was stored under `requests`.
         let mut cache = cache_with_list(&LIST);
         let listed = vec![advisory("GHSA-b")];
-        cache.put_vulnerabilities(Ecosystem::PyPI, "Requests", "2.0.0", listed, NOW);
+        cache.put_vulnerabilities(Ecosystem::PyPI, "requests", "2.0.0", listed, NOW);
         let affected = vec![Affected {
             ecosystem: "PyPI".to_owned(),
             name: "requests".to_owned(),

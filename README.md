@@ -132,7 +132,7 @@ The IDE unloads an idle plugin after about five minutes. So that the next open d
 
 ### Ignoring a package
 
-Add the package name to `ignore`, for example `["serde", "left-pad"]`. The name is compared after the normalisation of its ecosystem. For PyPI, names follow PEP 503: case and runs of `-`, `_` and `.` do not matter. For Composer and NuGet, case does not matter.
+Add the package name to `ignore`, for example `["serde", "left-pad"]`. The name is compared after the normalisation of its ecosystem. For PyPI, names follow PEP 503: case and runs of `-`, `_` and `.` do not matter. For Composer and NuGet, case does not matter. For Cargo, case does not matter and `-` equals `_`.
 
 ## Limitations
 

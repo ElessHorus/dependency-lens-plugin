@@ -786,10 +786,10 @@ mod tests {
             "registry-boom".to_owned(),
             NOW,
         );
-        cache.put_failure(
-            FailureKind::Osv,
+        cache.put_osv_failure(
             Ecosystem::PyPI,
-            "requests@1.0.0",
+            PACKAGE,
+            VERSION,
             "osv-boom".to_owned(),
             NOW,
         );
@@ -995,6 +995,23 @@ mod tests {
         // The damaged id becomes an anonymous entry. The valid one keeps its id and its link.
         assert_eq!(list[0], anonymous_deferred());
         assert_eq!(list[1], deferred("GHSA-ok"));
+    }
+
+    #[test]
+    fn a_block_with_an_unnormalized_key_loads_and_is_not_read_for_the_normalized_name() {
+        // Blocks written before A.4 can hold a list under the written name. It stays unreachable
+        // and leaves with the 7-day limit: for Packagist it may even hold a false empty answer.
+        let text = format!(
+            r#"{{"v":1,"lists":{{"Requests":{{"1.0.0":{{"at":{NOW},"total":0,"ids":[]}}}}}}}}"#
+        );
+        let mut cache = Cache::new(LONG_TTL_SECS);
+        cache.import_block(Ecosystem::PyPI, decode_block(&text).unwrap(), NOW);
+
+        assert!(
+            cache
+                .vulnerabilities(Ecosystem::PyPI, "requests", VERSION, NOW)
+                .is_none()
+        );
     }
 
     #[test]

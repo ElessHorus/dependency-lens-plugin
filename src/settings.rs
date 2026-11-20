@@ -204,6 +204,22 @@ mod tests {
     }
 
     #[test]
+    fn ignored_cargo_names_match_any_spelling() {
+        for entry in ["rand-core", "Rand_Core"] {
+            let settings = Settings {
+                ignore: vec![entry.to_owned()],
+                ..Settings::default()
+            };
+            assert!(
+                settings
+                    .ignored_packages(Ecosystem::Cargo)
+                    .contains("rand_core"),
+                "{entry}"
+            );
+        }
+    }
+
+    #[test]
     fn ignore_keeps_only_string_elements_of_an_array() {
         let mixed = settings_from(&[("ignore", r#"["serde", 3, "left-pad"]"#)]);
         assert_eq!(mixed.ignore, ["serde", "left-pad"]);
